@@ -1,0 +1,47 @@
+proxies: []
+use_proxy: false
+min_delay: 0.8
+max_delay: 2.5
+concurrency: 3
+download_root: "downloads"
+db_path: "data/wallpaper.db"
+challenge_url: "https://haowallpaper.com/link/pc/certify/challenge"
+probe_url: "https://haowallpaper.com/user/center"
+free_daily_limit: 10
+log_level: "INFO"
+
+uploads:
+  task_profile: "compressed_webp"
+  profiles:
+    - key: "compressed_webp"
+      name: "压缩图床"
+      enabled: true
+      base_url: "https://imgbed.example.com"
+      api_token: "replace-with-your-token"
+      channel: "telegram"
+      server_compress: true
+      image_processing:
+        enabled: true
+        telegram_only: false
+        format: "webp"
+        quality: 86
+        min_quality: 72
+        threshold_mb: 5
+        target_mb: 4
+        disable_above_mb: 10
+    - key: "original_lossless"
+      name: "原图图床"
+      enabled: false
+      base_url: "https://imgbed.example.com"
+      api_token: ""
+      channel: "huggingface"
+      server_compress: false
+      image_processing:
+        enabled: false
+        telegram_only: false
+        format: "original"
+        quality: 100
+        min_quality: 100
+        threshold_mb: 5
+        target_mb: 4
+        disable_above_mb: 10

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+backend_run.log
+data/server.log
+
+# Local runtime data
+data/
+downloads/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local config
+config.yaml
+
+# Editor and tooling
+.vscode/
+.playwright-mcp/
+.spec-workflow/
+AGENTS.md
+CLAUDE.md
+.DS_Store
+Thumbs.db

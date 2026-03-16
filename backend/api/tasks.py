@@ -1,0 +1,694 @@
+"""
+api/tasks.py — 任务管理 API
+
+端点：
+  GET    /api/tasks           列出所有任务
+  POST   /api/tasks           创建下载任务
+  GET    /api/tasks/{id}      任务详情
+  POST   /api/tasks/{id}/start   启动任务
+  POST   /api/tasks/{id}/pause   暂停任务
+  POST   /api/tasks/{id}/cancel  取消任务
+  DELETE /api/tasks/{id}      删除任务记录
+  GET    /api/tasks/{id}/logs SSE 实时日志流
+"""
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+from typing import Optional, AsyncIterator
+
+import httpx
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from backend.models.database import get_db, SessionLocal
+from backend.models.task import Task
+from backend.models.wallpaper import Wallpaper
+from backend.core.filters import FilterConfig, FilterEngine
+from backend.core.account_pool import AccountPool
+from backend.core.anti_detection import AntiDetection, HumanBehaviorController
+from backend.core.captcha_solver import AltchaSolver
+from backend.core.crawler import WallpaperCrawler
+from backend.core.downloader import Downloader
+from backend.core.dedup import DedupManager
+from backend.core.imgbed_uploader import ImgbedUploader
+from backend.core.site_auth import probe_login_status
+from backend.core.upload_record_helper import (
+    build_upload_record,
+    dump_upload_records,
+    find_reusable_upload_record,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# 运行中的任务 {task_id: asyncio.Task}
+_running_tasks: dict[int, asyncio.Task] = {}
+
+
+def _parse_file_mb_to_bytes(file_mb_str: str) -> Optional[int]:
+    """将 API 标注的大小字符串（如 '1.54 MB'、'863 KB'）解析为字节数"""
+    if not file_mb_str:
+        return None
+    s = file_mb_str.strip().upper()
+    try:
+        if "MB" in s:
+            return int(float(s.replace("MB", "").strip()) * 1024 * 1024)
+        if "KB" in s:
+            return int(float(s.replace("KB", "").strip()) * 1024)
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
+# ------------------------------------------------------------------ #
+#  Pydantic 模型
+# ------------------------------------------------------------------ #
+
+class CreateTaskRequest(BaseModel):
+    name: str = "新建任务"
+    wallpaper_type: str = "all"
+    screen_orientation: str = "all"
+    categories: list[str] = []
+    sort_by: str = "yesterday_hot"
+    min_width: Optional[int] = None
+    max_width: Optional[int] = None
+    min_height: Optional[int] = None
+    max_height: Optional[int] = None
+    color_themes: list[str] = []
+    min_hot_score: int = 0
+    tag_blacklist: list[str] = []
+    max_count: int = 100
+    concurrency: int = 3
+    vip_only: bool = False
+    use_proxy: bool = True
+    use_imgbed_upload: bool = False
+
+
+class UpdateTaskNameRequest(BaseModel):
+    name: str
+
+
+def _task_to_dict(t: Task) -> dict:
+    return {
+        "id": t.id,
+        "name": t.name,
+        "status": t.status,
+        "total_count": t.total_count,
+        "success_count": t.success_count,
+        "failed_count": t.failed_count,
+        "skip_count": t.skip_count,
+        "progress": round(t.progress, 1),
+        "config": t.config,
+        "error_msg": t.error_msg,
+        "started_at": t.started_at,
+        "finished_at": t.finished_at,
+        "created_at": t.created_at,
+    }
+
+
+# ------------------------------------------------------------------ #
+#  路由
+# ------------------------------------------------------------------ #
+
+@router.get("")
+async def list_tasks(db: Session = Depends(get_db)):
+    tasks = db.query(Task).order_by(Task.created_at.desc()).all()
+    return {"tasks": [_task_to_dict(t) for t in tasks]}
+
+
+@router.post("")
+async def create_task(body: CreateTaskRequest, db: Session = Depends(get_db)):
+    """创建任务（不立即启动）"""
+    cfg = FilterConfig(
+        wallpaper_type=body.wallpaper_type,
+        screen_orientation=body.screen_orientation,
+        categories=body.categories,
+        sort_by=body.sort_by,
+        min_width=body.min_width,
+        max_width=body.max_width,
+        min_height=body.min_height,
+        max_height=body.max_height,
+        color_themes=body.color_themes,
+        min_hot_score=body.min_hot_score,
+        tag_blacklist=body.tag_blacklist,
+        max_count=body.max_count,
+        concurrency=body.concurrency,
+        vip_only=body.vip_only,
+        use_proxy=body.use_proxy,
+    )
+    task = Task(name=body.name, status="pending", total_count=body.max_count)
+    task_config = cfg.to_dict()
+    task_config["use_imgbed_upload"] = body.use_imgbed_upload
+    task.config = task_config
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    logger.info(f"[Tasks] 创建任务 id={task.id} name={task.name!r}")
+    return {"success": True, "task": _task_to_dict(task)}
+
+
+@router.get("/{task_id}")
+async def get_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    return _task_to_dict(task)
+
+
+@router.post("/{task_id}/start")
+async def start_task(task_id: int, request: Request, db: Session = Depends(get_db)):
+    """启动任务"""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    if task.status == "running":
+        raise HTTPException(400, "任务已在运行中")
+    if task_id in _running_tasks and not _running_tasks[task_id].done():
+        raise HTTPException(400, "任务已在运行中")
+
+    task.status = "running"
+    task.started_at = datetime.now()
+    task.success_count = 0
+    task.failed_count = 0
+    task.skip_count = 0
+    task.progress = 0.0
+    db.commit()
+
+    # 获取全局组件（从 app.state 或新建）
+    anti = getattr(request.app.state, "anti", AntiDetection())
+    captcha = getattr(request.app.state, "captcha", AltchaSolver())
+    uploader = getattr(request.app.state, "imgbed", None)
+    human_ctrl = getattr(request.app.state, "human_ctrl", None)
+
+    async def run():
+        await _execute_task(task_id, anti, captcha, uploader, human_ctrl)
+
+    _running_tasks[task_id] = asyncio.create_task(run())
+    return {"success": True, "message": f"任务 {task_id} 已启动"}
+
+
+@router.post("/{task_id}/pause")
+async def pause_task(task_id: int, db: Session = Depends(get_db)):
+    """暂停任务"""
+    if task_id in _running_tasks:
+        _running_tasks[task_id].cancel()
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task:
+        task.status = "paused"
+        db.commit()
+    return {"success": True}
+
+
+@router.post("/{task_id}/cancel")
+async def cancel_task(task_id: int, db: Session = Depends(get_db)):
+    """取消任务"""
+    if task_id in _running_tasks:
+        _running_tasks[task_id].cancel()
+        del _running_tasks[task_id]
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task:
+        task.status = "cancelled"
+        task.finished_at = datetime.now()
+        db.commit()
+    return {"success": True}
+
+
+@router.patch("/{task_id}")
+async def rename_task(task_id: int, body: UpdateTaskNameRequest, db: Session = Depends(get_db)):
+    """重命名任务"""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "任务名称不能为空")
+    task.name = name
+    db.commit()
+    db.refresh(task)
+    return {"success": True, "task": _task_to_dict(task)}
+
+
+@router.delete("/{task_id}")
+async def delete_task(task_id: int, db: Session = Depends(get_db)):
+    """删除任务记录"""
+    if task_id in _running_tasks:
+        _running_tasks[task_id].cancel()
+        del _running_tasks[task_id]
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(404)
+    db.delete(task)
+    db.commit()
+    return {"success": True}
+
+
+@router.get("/{task_id}/logs")
+async def stream_logs(task_id: int):
+    """SSE 实时日志流"""
+    async def event_generator() -> AsyncIterator[str]:
+        last_pos = 0
+        consecutive_empty = 0
+        while True:
+            db = SessionLocal()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if not task:
+                    yield f"data: {json.dumps({'error': '任务不存在'})}\n\n"
+                    break
+
+                log = task.log_text or ""
+                if len(log) > last_pos:
+                    new_content = log[last_pos:]
+                    last_pos = len(log)
+                    consecutive_empty = 0
+                    for line in new_content.split("\n"):
+                        if line.strip():
+                            yield f"data: {json.dumps({'log': line})}\n\n"
+
+                if task.status in ("done", "failed", "cancelled"):
+                    yield f"data: {json.dumps({'status': task.status, 'done': True})}\n\n"
+                    break
+
+                consecutive_empty += 1
+            finally:
+                db.close()
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ------------------------------------------------------------------ #
+#  任务执行逻辑
+# ------------------------------------------------------------------ #
+
+async def _execute_task(
+    task_id: int,
+    anti: AntiDetection,
+    captcha: AltchaSolver,
+    uploader: Optional[ImgbedUploader] = None,
+    human_ctrl: Optional[HumanBehaviorController] = None,
+):
+    """后台协程：执行下载任务"""
+    db = SessionLocal()
+    # 任务级唯一共享 client：altcha session 需同一 client 复用，finally 中关闭
+    _shared_client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(30))
+    _shared_altcha_verified = False
+    _account_clients: dict[int, httpx.AsyncClient] = {}  # 保留兼容，finally 统一关闭
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return
+
+        cfg = FilterConfig.from_dict(task.config)
+        upload_enabled = task.config.get("use_imgbed_upload", True)
+        effective_uploader = uploader if upload_enabled else None
+
+        def log(msg: str):
+            task.append_log(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+            db.commit()
+
+        # ── 人性化每日限额检查 ───────────────────────────────────────────────
+        effective_max = cfg.max_count
+        if human_ctrl:
+            if human_ctrl.is_daily_limit_reached():
+                log(
+                    f"⚠️ 今日已达人性化下载上限 {human_ctrl.daily_limit} 张"
+                    f"（今日已下 {human_ctrl.downloaded_today} 张），任务跳过"
+                )
+                task.status = "done"
+                task.finished_at = datetime.now()
+                db.commit()
+                return
+            remaining = human_ctrl.remaining_today
+            effective_max = min(cfg.max_count, remaining)
+            log(
+                f"📊 今日上限 {human_ctrl.daily_limit} 张 | "
+                f"已下 {human_ctrl.downloaded_today} 张 | "
+                f"本次最多 {effective_max} 张"
+            )
+        # ────────────────────────────────────────────────────────────────────
+
+        pool = AccountPool(db=db, vip_only=cfg.vip_only)
+        crawler = WallpaperCrawler(anti_detection=anti, captcha_solver=captcha)
+        downloader = Downloader(anti_detection=anti, captcha_solver=captcha)
+        dedup = DedupManager(db=db)
+        filter_engine = FilterEngine(cfg)
+
+        log(f"任务启动: {task.name}")
+        if upload_enabled:
+            log("图床上传: 已启用")
+        else:
+            log("图床上传: 已关闭，仅保存到本地")
+
+        sem = asyncio.Semaphore(cfg.concurrency)
+
+        # 全任务唯一共享 client：altcha session 是 IP 级的，一次验证所有账号共用
+        # _shared_client / _shared_altcha_verified 已在函数顶部初始化
+        _altcha_lock = asyncio.Lock()
+
+        async def _ensure_altcha_ready(cookie: str) -> bool:
+            """确保共享 client 已通过 altcha 验证（全任务只验证一次）。
+            altcha challenge 有 IP 级频率限制，多账号轮询时不能每账号独立验证。
+            返回 True=已验证可用 skip_altcha，False=验证失败只能用 previewFileImg。
+            """
+            nonlocal _shared_altcha_verified
+            if _shared_altcha_verified:
+                return True
+            async with _altcha_lock:
+                if _shared_altcha_verified:  # double-check after lock
+                    return True
+                verified = await captcha.verify_download(_shared_client, cookie)
+                if verified:
+                    _shared_altcha_verified = True
+                    logger.info("[Task] altcha 验证成功（全任务复用）")
+                else:
+                    logger.warning("[Task] altcha 验证失败")
+                return _shared_altcha_verified
+
+        async def process_one(item: dict):
+            async with sem:
+                resource_id = item.get("resource_id", "")
+                if not resource_id:
+                    return
+
+                # ID 去重
+                if dedup.is_resource_downloaded(resource_id):
+                    task.skip_count += 1
+                    task.update_progress()
+                    db.commit()
+                    log(f"跳过(已存在): {resource_id}")
+                    return
+
+                # 筛选
+                passed, reason = filter_engine.match(item)
+                if not passed:
+                    task.skip_count += 1
+                    task.update_progress()
+                    db.commit()
+                    log(f"跳过(不符合筛选): {resource_id} — {reason}")
+                    return
+
+                # 人性化每日上限：任务执行中途达到上限时停止继续下载
+                if human_ctrl and human_ctrl.is_daily_limit_reached():
+                    task.skip_count += 1
+                    task.update_progress()
+                    db.commit()
+                    log(f"⚠️ 今日下载已达上限 {human_ctrl.daily_limit} 张，跳过: {resource_id}")
+                    return
+
+                # 获取账号
+                account = await pool.acquire()
+                if not account:
+                    task.failed_count += 1
+                    task.update_progress()
+                    db.commit()
+                    log(f"失败(无可用账号): {resource_id}")
+                    return
+
+                # 初始化在 try 外部，确保 except 块始终能访问到此变量
+                _is_original_dl = False
+
+                try:
+                    # 获取下载直链
+                    # 视频已在 iter_wallpapers 中预填 download_url（直接用）
+                    # 静态图 download_url 为空，走 fetch_detail 完成 altcha 验证 + getCompleteUrl
+                    if item.get("download_url"):
+                        detail = {
+                            "resource_id":  resource_id,
+                            "download_url": item["download_url"],
+                            "title":        item.get("title", ""),
+                            "width":        item.get("width"),
+                            "height":       item.get("height"),
+                            "is_original":  False,
+                        }
+                    else:
+                        altcha_ok = await _ensure_altcha_ready(account.cookie)
+                        detail = await crawler.fetch_detail(
+                            _shared_client, account.cookie, resource_id,
+                            file_id=item.get("file_id", ""),
+                            wallpaper_type_id=1 if item.get("wallpaper_type") == "static" else 3,
+                            skip_altcha=altcha_ok,
+                        )
+
+                    if not detail or not detail.get("download_url"):
+                        task.failed_count += 1
+                        task.update_progress()
+                        db.commit()
+                        log(f"失败(无下载地址): {resource_id}")
+                        # getCompleteUrl 未成功，网站未计费，consume_quota=False
+                        await pool.release(account, success=False, consume_quota=False)
+                        return
+
+                    # 构造可读文件名：标签_宽x高.扩展名（如：动漫_二次元_1600x1199.png）
+                    _tags = [t.strip() for t in item.get("tags", "").split(",") if t.strip()]
+                    _w, _h = item.get("width") or 0, item.get("height") or 0
+                    _dl_url = detail["download_url"]
+                    _url_ext = os.path.splitext(_dl_url.split("?")[0])[1].lstrip(".") or "jpg"
+                    # 判断是否为原图：getCompleteUrl 返回的 CDN 签名直链含 zfts.haowallpaper.com
+                    _is_original_dl = bool(detail.get("is_original"))
+                    if item.get("wallpaper_type") == "static" and not _is_original_dl:
+                        login_valid, login_msg = await probe_login_status(_shared_client, account.cookie)
+                        if login_valid is False:
+                            account.is_active = False
+                            db.commit()
+                            task.failed_count += 1
+                            task.update_progress()
+                            db.commit()
+                            log(f"澶辫触(账号登录态失效): {resource_id} | account={account.id} | {login_msg}")
+                            await pool.release(account, success=False, consume_quota=False)
+                            return
+                        if account.account_type == "vip":
+                            task.failed_count += 1
+                            task.update_progress()
+                            db.commit()
+                            log(f"澶辫触(VIP账号未拿到原图): {resource_id} | account={account.id}")
+                            await pool.release(account, success=False, consume_quota=False)
+                            return
+                    if _tags:
+                        _label = "_".join(_tags[:2])
+                        _fname = f"{_label}_{_w}x{_h}.{_url_ext}" if (_w and _h) else f"{_label}.{_url_ext}"
+                    else:
+                        _fname = None  # 无标签时由 downloader 从 URL 自动提取
+
+                    # 分类名称（如"动漫｜二次元"）：优先使用 API 映射名称，回退到第一个标签
+                    _category_name = item.get("category_name") or ""
+                    _category = _category_name or (_tags[0] if _tags else item.get("wallpaper_type", "misc"))
+
+                    # 色系 / 分类 UUID（存入 DB 便于精确筛选）
+                    _type_id    = item.get("type_id") or None
+                    _color_id   = item.get("color_id") or None
+                    _color_name = item.get("color_name") or None
+                    _favor_count = item.get("favor_count")
+
+                    # 下载文件
+                    local_path = await downloader.download(
+                        resource_id=resource_id,
+                        download_url=_dl_url,
+                        cookie=account.cookie,
+                        category=_category,
+                        filename=_fname,
+                        wallpaper_type=item.get("wallpaper_type", "static"),
+                    )
+
+                    if not local_path:
+                        task.failed_count += 1
+                        task.update_progress()
+                        db.commit()
+                        log(f"失败(下载失败): {resource_id}")
+                        # getCompleteUrl 已成功时网站已计费，需要消耗本地配额保持同步
+                        await pool.release(account, success=False, consume_quota=_is_original_dl)
+                        return
+
+                    # 计算 hash
+                    from backend.core.downloader import DOWNLOAD_ROOT
+                    abs_path = os.path.join(DOWNLOAD_ROOT, local_path)
+                    md5, sha256 = DedupManager.compute_hashes(abs_path)
+
+                    # 上传到图床（失败不影响下载流程）
+                    _imgbed_url = None
+                    _upload_records = None
+                    if effective_uploader:
+                        _reused_record = find_reusable_upload_record(
+                            db,
+                            profile_key=effective_uploader.profile_key,
+                            sha256=sha256,
+                            md5=md5,
+                        ) if effective_uploader.profile_key else None
+                        if _reused_record and _reused_record.get("url"):
+                            _imgbed_url = _reused_record["url"]
+                            _upload_records = dump_upload_records({
+                                effective_uploader.profile_key: _reused_record,
+                            })
+                            log(f"图床上传复用成功: {_imgbed_url}")
+                        else:
+                            _imgbed_url = await effective_uploader.upload(
+                                abs_path,
+                                width=item.get("width"),
+                                height=item.get("height"),
+                            )
+                            if _imgbed_url:
+                                if effective_uploader.profile_key:
+                                    _upload_records = dump_upload_records({
+                                        effective_uploader.profile_key: build_upload_record(
+                                            profile_key=effective_uploader.profile_key,
+                                            profile_name=effective_uploader.profile_name,
+                                            channel=effective_uploader.channel,
+                                            url=_imgbed_url,
+                                        )
+                                    })
+                                log(f"图床上传成功: {_imgbed_url}")
+                            else:
+                                log(f"图床上传失败（不影响本地存储）: {resource_id}")
+
+                    # 创建壁纸记录
+                    _actual_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else None
+                    _file_mb_str = item.get("file_mb", "")
+                    # 验证大小：将 API 标注大小与实际下载大小对比，辅助确认原图
+                    _expected_bytes = _parse_file_mb_to_bytes(_file_mb_str)
+                    if _expected_bytes and _actual_size:
+                        _ratio = abs(_actual_size - _expected_bytes) / _expected_bytes
+                        _size_match = _ratio < 0.15  # 15% 容差
+                    else:
+                        _size_match = None
+                    wallpaper = Wallpaper(
+                        resource_id=resource_id,
+                        account_id=account.id,
+                        title=detail.get("title") or item.get("title", ""),
+                        md5=md5,
+                        sha256=sha256,
+                        local_path=local_path,
+                        file_size=_actual_size,
+                        file_mb=_file_mb_str or None,
+                        is_original=_is_original_dl,
+                        width=detail.get("width") or item.get("width"),
+                        height=detail.get("height") or item.get("height"),
+                        wallpaper_type=item.get("wallpaper_type", "static"),
+                        # 分类：使用可读名称（"动漫｜二次元"）作为目录和显示名，回退到标签名
+                        category=_category,
+                        # 分类/色系 UUID：存储原始 API ID，用于精确过滤
+                        type_id=_type_id,
+                        color_id=_color_id,
+                        # 色系可读名（"偏蓝"），供画廊筛选
+                        color_theme=_color_name,
+                        tags=item.get("tags", ""),
+                        hot_score=item.get("hot_score"),
+                        favor_count=_favor_count,
+                        source_url=item.get("source_url", ""),
+                        download_url=detail["download_url"],
+                        imgbed_url=_imgbed_url,
+                        upload_records=_upload_records,
+                        status="done",
+                    )
+                    db.add(wallpaper)
+                    db.flush()
+
+                    # Hash 去重检查
+                    dup = dedup.check_file_duplicate(abs_path)
+                    if dup and dup.id != wallpaper.id:
+                        dedup.handle_duplicate_file(wallpaper, dup, abs_path)
+                        task.skip_count += 1
+                        log(f"重复(hash相同): {resource_id}")
+                    else:
+                        task.success_count += 1
+                        _size_info = ""
+                        if _file_mb_str and _actual_size:
+                            _actual_mb = _actual_size / (1024 * 1024)
+                            _size_info = f" | API标注={_file_mb_str} 实际={_actual_mb:.2f}MB"
+                            if _size_match is not None:
+                                _size_info += " ✓匹配" if _size_match else " ✗不匹配"
+                        _quality = "原图" if _is_original_dl else "预览图"
+                        log(f"成功({_quality}): {resource_id} → {local_path}{_size_info}")
+
+                    db.commit()
+                    task.update_progress()
+                    db.commit()
+                    # 仅原图（getCompleteUrl）消耗配额；previewFileImg 回退不计入每日限额
+                    await pool.release(account, success=True, consume_quota=_is_original_dl)
+
+                    # 人性化行为：记录下载 + 分层延迟（模拟用户浏览节奏）
+                    # pool.release 在前：账号尽早归还，不因延迟占用
+                    if human_ctrl:
+                        human_ctrl.record_download()
+                        await human_ctrl.post_download_delay(task.success_count)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    task.failed_count += 1
+                    task.update_progress()
+                    db.commit()
+                    log(f"异常 {resource_id}: {e}")
+                    # 仅当已拿到原图签名 URL 时消耗配额（网站已计费）
+                    await pool.release(account, success=False, consume_quota=_is_original_dl)
+
+        # 迭代爬取并并发下载
+        worker_tasks = []
+        account_for_crawl = await pool.acquire()
+        if not account_for_crawl:
+            task.status = "failed"
+            task.error_msg = "无可用账号"
+            task.finished_at = datetime.now()
+            db.commit()
+            return
+
+        try:
+            async for item in crawler.iter_wallpapers(
+                cookie=account_for_crawl.cookie,
+                category=cfg.categories[0] if cfg.categories else "",
+                sort_by=cfg.sort_by,
+                wallpaper_type=cfg.wallpaper_type,
+                color_theme=cfg.color_themes[0] if cfg.color_themes else "",
+                max_count=effective_max,
+            ):
+                if task.status != "running":
+                    break
+                worker_tasks.append(asyncio.create_task(process_one(item)))
+
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+        finally:
+            # 爬取列表只读数据，不消耗下载配额
+            await pool.release(account_for_crawl, consume_quota=False)
+
+        task.status = "done"
+        task.finished_at = datetime.now()
+        task.progress = 100.0
+        log(f"任务完成: 成功={task.success_count} 失败={task.failed_count} 跳过={task.skip_count}")
+        db.commit()
+
+    except asyncio.CancelledError:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task and task.status == "running":
+            task.status = "paused"
+            db.commit()
+    except Exception as e:
+        logger.exception(f"[Tasks] 任务 {task_id} 执行异常: {e}")
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task:
+            task.status = "failed"
+            task.error_msg = str(e)
+            task.finished_at = datetime.now()
+            db.commit()
+    finally:
+        # 关闭任务级共享 client
+        try:
+            await _shared_client.aclose()
+        except Exception:
+            pass
+        try:
+            for _c in _account_clients.values():
+                await _c.aclose()
+        except Exception:
+            pass
+        db.close()
