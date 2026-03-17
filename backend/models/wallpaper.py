@@ -77,6 +77,12 @@ class Wallpaper(Base):
     # 是否被标记为重复文件
     is_duplicate = Column(Boolean, nullable=False, default=False)
 
+    # 视频时长（秒，仅 wallpaper_type=dynamic 有效；通过 ffprobe 提取，未安装时为 None）
+    video_duration = Column(Float, nullable=True)
+
+    # 转换后文件的相对路径（相对于 downloads/ 目录），None 表示未转换
+    converted_path = Column(String(512), nullable=True)
+
     # 热度/排序分（从网站抓取）
     hot_score = Column(Integer, nullable=True)
 

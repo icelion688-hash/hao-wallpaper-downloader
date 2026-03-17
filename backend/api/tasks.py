@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import os
+import random
+import subprocess
 from datetime import datetime
 from typing import Optional, AsyncIterator
 
@@ -37,6 +39,8 @@ from backend.core.crawler import WallpaperCrawler
 from backend.core.downloader import Downloader
 from backend.core.dedup import DedupManager
 from backend.core.imgbed_uploader import ImgbedUploader
+from backend.config import load_config
+from backend.core.media_converter import MediaConverter, VideoConvertConfig, ImageConvertConfig
 from backend.core.site_auth import probe_login_status
 from backend.core.upload_record_helper import (
     build_upload_record,
@@ -49,6 +53,40 @@ router = APIRouter()
 
 # 运行中的任务 {task_id: asyncio.Task}
 _running_tasks: dict[int, asyncio.Task] = {}
+
+
+def _probe_video_duration(path: str) -> Optional[float]:
+    """
+    提取视频时长（秒）。
+    优先用 ffprobe（本地安装时最快）；未安装则回退到 imageio-ffmpeg（pip 包，已内置）。
+    两者均不可用时静默返回 None，不影响下载流程。
+    """
+    # ── 1. ffprobe（已安装时优先）────────────────────────
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for stream in json.loads(result.stdout).get("streams", []):
+                dur = stream.get("duration")
+                if dur:
+                    return round(float(dur), 2)
+    except FileNotFoundError:
+        pass  # ffprobe 未安装，走 imageio 回退
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    # ── 2. imageio-ffmpeg 回退（无需系统 ffprobe）────────
+    try:
+        from backend.core.media_converter import MediaConverter
+        dur = MediaConverter().get_video_duration(path)
+        if dur:
+            return dur
+    except Exception:
+        pass
+
+    return None
 
 
 def _parse_file_mb_to_bytes(file_mb_str: str) -> Optional[int]:
@@ -304,7 +342,14 @@ async def _execute_task(
     # 任务级唯一共享 client：altcha session 需同一 client 复用，finally 中关闭
     _shared_client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(30))
     _shared_altcha_verified = False
+    # 用列表以便嵌套闭包直接修改（无需 nonlocal）
+    # 站点每次 altcha 验证仅允许 2 次 getCompleteUrl，满 2 次须重新验证
+    _altcha_use_count = [0]
     _account_clients: dict[int, httpx.AsyncClient] = {}  # 保留兼容，finally 统一关闭
+
+    # 任务级 Session Profile：整个任务使用同一 UA/sec-ch-ua/平台，保持浏览器指纹一致性
+    _session_profile = anti.pick_session_profile()
+
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
@@ -317,6 +362,10 @@ async def _execute_task(
         def log(msg: str):
             task.append_log(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
             db.commit()
+
+        # ── 活跃时段感知 ─────────────────────────────────────────────────────
+        if human_ctrl and not human_ctrl.is_active_hour():
+            log("提示: 当前处于非活跃时段（23:00-08:00），延迟将适当加长以模拟真实浏览节奏")
 
         # ── 人性化每日限额检查 ───────────────────────────────────────────────
         effective_max = cfg.max_count
@@ -346,19 +395,22 @@ async def _execute_task(
         filter_engine = FilterEngine(cfg)
 
         log(f"任务启动: {task.name}")
+        logger.info("[Task] Session Profile UA: %s", _session_profile["ua"][:60])
         if upload_enabled:
             log("图床上传: 已启用")
         else:
             log("图床上传: 已关闭，仅保存到本地")
 
         sem = asyncio.Semaphore(cfg.concurrency)
+        # 动态视频单张 50-100 MB，并发下载占用大量带宽，独立限制最多 2 个并发
+        sem_dynamic = asyncio.Semaphore(max(1, min(cfg.concurrency, 2)))
 
         # 全任务唯一共享 client：altcha session 是 IP 级的，一次验证所有账号共用
         # _shared_client / _shared_altcha_verified 已在函数顶部初始化
         _altcha_lock = asyncio.Lock()
 
         async def _ensure_altcha_ready(cookie: str) -> bool:
-            """确保共享 client 已通过 altcha 验证（全任务只验证一次）。
+            """确保共享 client 已通过 altcha 验证。
             altcha challenge 有 IP 级频率限制，多账号轮询时不能每账号独立验证。
             返回 True=已验证可用 skip_altcha，False=验证失败只能用 previewFileImg。
             """
@@ -368,16 +420,34 @@ async def _execute_task(
             async with _altcha_lock:
                 if _shared_altcha_verified:  # double-check after lock
                     return True
-                verified = await captcha.verify_download(_shared_client, cookie)
+                verified = await captcha.verify_download(
+                    _shared_client, cookie, ua=_session_profile["ua"]
+                )
                 if verified:
                     _shared_altcha_verified = True
-                    logger.info("[Task] altcha 验证成功（全任务复用）")
+                    _altcha_use_count[0] = 0
+                    logger.info("[Task] altcha 验证成功")
+                    # 验证成功后稍作等待：模拟浏览器处理 altcha 响应后才发起下载请求
+                    # 避免 verify→getCompleteUrl 时序过于精确被 WAF 识别为自动化
+                    await asyncio.sleep(random.uniform(0.8, 2.0))
                 else:
                     logger.warning("[Task] altcha 验证失败")
                 return _shared_altcha_verified
 
+        async def invalidate_altcha() -> None:
+            """重置 altcha 会话，下次 _ensure_altcha_ready 将强制重新验证。
+            用于：① 成功下载 2 次原图后主动轮换；② getCompleteUrl 返回 305 时兜底重试。
+            """
+            nonlocal _shared_altcha_verified
+            async with _altcha_lock:
+                _shared_altcha_verified = False
+                _altcha_use_count[0] = 0
+            logger.info("[Task] altcha session 已重置，下次将重新验证")
+
         async def process_one(item: dict):
-            async with sem:
+            _is_dynamic = item.get("wallpaper_type") == "dynamic"
+            _active_sem = sem_dynamic if _is_dynamic else sem
+            async with _active_sem:
                 resource_id = item.get("resource_id", "")
                 if not resource_id:
                     return
@@ -439,6 +509,7 @@ async def _execute_task(
                             file_id=item.get("file_id", ""),
                             wallpaper_type_id=1 if item.get("wallpaper_type") == "static" else 3,
                             skip_altcha=altcha_ok,
+                            session_profile=_session_profile,
                         )
 
                     if not detail or not detail.get("download_url"):
@@ -450,13 +521,46 @@ async def _execute_task(
                         await pool.release(account, success=False, consume_quota=False)
                         return
 
+                    # 动态视频：提前记录预估大小，帮助用户感知耗时
+                    if item.get("wallpaper_type") == "dynamic":
+                        _est_size = item.get("file_mb", "")
+                        log(f"动态图开始下载: {resource_id}"
+                            + (f" | API预估大小: {_est_size}" if _est_size else ""))
+
                     # 构造可读文件名：标签_宽x高.扩展名（如：动漫_二次元_1600x1199.png）
                     _tags = [t.strip() for t in item.get("tags", "").split(",") if t.strip()]
                     _w, _h = item.get("width") or 0, item.get("height") or 0
                     _dl_url = detail["download_url"]
-                    _url_ext = os.path.splitext(_dl_url.split("?")[0])[1].lstrip(".") or "jpg"
+                    _url_ext = os.path.splitext(_dl_url.split("?")[0])[1].lstrip(".")
+                    if not _url_ext:
+                        # getVideoReduce URL 路径无扩展名，按类型设默认值
+                        _url_ext = "mp4" if item.get("wallpaper_type") == "dynamic" else "jpg"
                     # 判断是否为原图：getCompleteUrl 返回的 CDN 签名直链含 zfts.haowallpaper.com
                     _is_original_dl = bool(detail.get("is_original"))
+                    # VIP 未拿到原图时，先重置 altcha 重试一次（静态图 + 动态图均适用）
+                    # 站点每次 altcha 验证仅允许 2 次 getCompleteUrl（305/3004），重验可恢复
+                    _wtype = item.get("wallpaper_type", "static")
+                    _wtype_id = 3 if _wtype == "dynamic" else 1
+                    if _wtype in ("static", "dynamic") and not _is_original_dl and account.account_type == "vip":
+                        log(f"VIP 未获原图（可能 altcha session 耗尽），重置重试: {resource_id}")
+                        await invalidate_altcha()
+                        altcha_ok_retry = await _ensure_altcha_ready(account.cookie)
+                        detail_retry = await crawler.fetch_detail(
+                            _shared_client, account.cookie, resource_id,
+                            file_id=item.get("file_id", ""),
+                            wallpaper_type_id=_wtype_id,
+                            skip_altcha=altcha_ok_retry,
+                            session_profile=_session_profile,
+                        )
+                        if detail_retry and detail_retry.get("is_original"):
+                            detail = detail_retry
+                            _is_original_dl = True
+                            _dl_url = detail["download_url"]
+                            _url_ext = os.path.splitext(_dl_url.split("?")[0])[1].lstrip(".")
+                            if not _url_ext:
+                                _url_ext = "mp4" if _wtype == "dynamic" else "jpg"
+                            log(f"altcha 重验后成功获原图: {resource_id}")
+
                     if item.get("wallpaper_type") == "static" and not _is_original_dl:
                         login_valid, login_msg = await probe_login_status(_shared_client, account.cookie)
                         if login_valid is False:
@@ -465,14 +569,14 @@ async def _execute_task(
                             task.failed_count += 1
                             task.update_progress()
                             db.commit()
-                            log(f"澶辫触(账号登录态失效): {resource_id} | account={account.id} | {login_msg}")
+                            log(f"失败(账号登录态失效): {resource_id} | account={account.id} | {login_msg}")
                             await pool.release(account, success=False, consume_quota=False)
                             return
                         if account.account_type == "vip":
                             task.failed_count += 1
                             task.update_progress()
                             db.commit()
-                            log(f"澶辫触(VIP账号未拿到原图): {resource_id} | account={account.id}")
+                            log(f"失败(VIP重试后仍未拿到原图): {resource_id} | account={account.id}")
                             await pool.release(account, success=False, consume_quota=False)
                             return
                     if _tags:
@@ -499,6 +603,7 @@ async def _execute_task(
                         category=_category,
                         filename=_fname,
                         wallpaper_type=item.get("wallpaper_type", "static"),
+                        session_profile=_session_profile,
                     )
 
                     if not local_path:
@@ -514,6 +619,11 @@ async def _execute_task(
                     from backend.core.downloader import DOWNLOAD_ROOT
                     abs_path = os.path.join(DOWNLOAD_ROOT, local_path)
                     md5, sha256 = DedupManager.compute_hashes(abs_path)
+
+                    # 视频时长提取（需要 ffprobe；未安装时静默跳过）
+                    _video_duration = None
+                    if item.get("wallpaper_type") == "dynamic":
+                        _video_duration = _probe_video_duration(abs_path)
 
                     # 上传到图床（失败不影响下载流程）
                     _imgbed_url = None
@@ -536,6 +646,9 @@ async def _execute_task(
                                 abs_path,
                                 width=item.get("width"),
                                 height=item.get("height"),
+                                wallpaper_type=item.get("wallpaper_type", "static"),
+                                category=_category or "",
+                                is_original=_is_original_dl,
                             )
                             if _imgbed_url:
                                 if effective_uploader.profile_key:
@@ -586,6 +699,7 @@ async def _execute_task(
                         favor_count=_favor_count,
                         source_url=item.get("source_url", ""),
                         download_url=detail["download_url"],
+                        video_duration=_video_duration,
                         imgbed_url=_imgbed_url,
                         upload_records=_upload_records,
                         status="done",
@@ -610,17 +724,60 @@ async def _execute_task(
                         _quality = "原图" if _is_original_dl else "预览图"
                         log(f"成功({_quality}): {resource_id} → {local_path}{_size_info}")
 
+                        # ── 自动格式转换 ──────────────────────────────────────
+                        _media_cfg = load_config().get("media_convert", {})
+                        if _media_cfg.get("auto_convert", False):
+                            _is_video = item.get("wallpaper_type") == "dynamic"
+                            _conv_key = "video" if _is_video else "image"
+                            _conv_dict = dict(_media_cfg.get(_conv_key, {}))
+                            if _conv_dict.get("enabled", False):
+                                try:
+                                    if _is_video:
+                                        _mc = MediaConverter(video_config=VideoConvertConfig.from_dict(_conv_dict))
+                                        _convert_fn = lambda p=abs_path: _mc.convert_video(p)
+                                    else:
+                                        _mc = MediaConverter(image_config=ImageConvertConfig.from_dict(_conv_dict))
+                                        _convert_fn = lambda p=abs_path: _mc.convert_image(p)
+                                    _converted_abs = await asyncio.get_event_loop().run_in_executor(None, _convert_fn)
+                                    if _converted_abs:
+                                        _conv_rel = os.path.relpath(_converted_abs, DOWNLOAD_ROOT).replace("\\", "/")
+                                        wallpaper.converted_path = _conv_rel
+                                        log(f"格式转换成功: {_conv_rel}")
+                                        if _conv_dict.get("delete_original", False):
+                                            try:
+                                                os.remove(abs_path)
+                                                wallpaper.local_path = _conv_rel
+                                                log(f"已删除原文件: {local_path}")
+                                            except OSError as _oe:
+                                                log(f"删除原文件失败: {_oe}")
+                                    else:
+                                        log(f"格式转换失败（见日志）: {resource_id}")
+                                except Exception as _conv_err:
+                                    log(f"格式转换异常: {_conv_err}")
+
                     db.commit()
                     task.update_progress()
                     db.commit()
                     # 仅原图（getCompleteUrl）消耗配额；previewFileImg 回退不计入每日限额
                     await pool.release(account, success=True, consume_quota=_is_original_dl)
 
+                    # altcha 主动轮换：每成功下载 2 张原图后提前重置 session，
+                    # 避免第 3 次 getCompleteUrl 遭遇 305/3004 限流
+                    if _is_original_dl:
+                        async with _altcha_lock:
+                            _altcha_use_count[0] += 1
+                            _should_reset = _altcha_use_count[0] >= 2
+                        if _should_reset:
+                            await invalidate_altcha()
+
                     # 人性化行为：记录下载 + 分层延迟（模拟用户浏览节奏）
                     # pool.release 在前：账号尽早归还，不因延迟占用
                     if human_ctrl:
                         human_ctrl.record_download()
-                        await human_ctrl.post_download_delay(task.success_count)
+                        _continue = await human_ctrl.post_download_delay(task.success_count)
+                        if not _continue:
+                            # 层 4 会话结束模拟：长时间暂停后本次迭代继续（下载已完成，只是等待）
+                            log("会话结束模拟完毕，恢复下载")
 
                 except asyncio.CancelledError:
                     raise
@@ -650,6 +807,7 @@ async def _execute_task(
                 wallpaper_type=cfg.wallpaper_type,
                 color_theme=cfg.color_themes[0] if cfg.color_themes else "",
                 max_count=effective_max,
+                session_profile=_session_profile,
             ):
                 if task.status != "running":
                     break

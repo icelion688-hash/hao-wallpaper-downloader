@@ -1,9 +1,9 @@
 """
-anti_detection.py — 代理池 + UA 轮换 + 请求限速
+anti_detection.py — 代理池 + 浏览器指纹一致性 + 请求限速
 
 功能：
   1. 随机选择代理（支持 HTTP/SOCKS5）
-  2. UA 池随机轮换
+  2. 浏览器 Session Profile —— 同一任务内 UA / sec-ch-ua / 平台 / 语言保持一致
   3. 请求间隔随机延迟，模拟人工操作节奏
   4. 提供统一的 httpx.AsyncClient 工厂方法
 """
@@ -15,21 +15,75 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from typing import AsyncIterator, Optional
+
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# User-Agent 池（Chrome + Edge 主流版本）
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+# ── 浏览器 Session Profile 池 ──────────────────────────────────────────────────
+# 每个 profile 内所有字段保持真实浏览器的一致性：
+# UA 版本、sec-ch-ua 品牌、sec-ch-ua-platform、Accept-Language 全部匹配。
+# 任务开始时选定一个 profile，整个任务期间不再切换，避免同会话内 UA 跳变被检测。
+_BROWSER_PROFILES = [
+    # Chrome 130 / Windows
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "sec_ch_ua_platform": '"Windows"',
+        "accept_lang": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+    # Chrome 131 / Windows
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_platform": '"Windows"',
+        "accept_lang": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+    # Chrome 132 / Windows
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
+        "sec_ch_ua_platform": '"Windows"',
+        "accept_lang": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+    # Chrome 133 / Windows
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+        "sec_ch_ua_platform": '"Windows"',
+        "accept_lang": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+    # Chrome 131 / macOS
+    {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_platform": '"macOS"',
+        "accept_lang": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+    # Chrome 132 / macOS
+    {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
+        "sec_ch_ua_platform": '"macOS"',
+        "accept_lang": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+    # Edge 131 / Windows
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "sec_ch_ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_platform": '"Windows"',
+        "accept_lang": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+    # Edge 132 / Windows
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
+        "sec_ch_ua": '"Not A(Brand";v="8", "Chromium";v="132", "Microsoft Edge";v="132"',
+        "sec_ch_ua_platform": '"Windows"',
+        "accept_lang": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
 ]
 
 # 默认请求延迟范围（秒）
@@ -61,6 +115,24 @@ class AntiDetection:
         self._proxy_failures: dict[str, int] = {}  # 代理失败计数
 
     # ------------------------------------------------------------------ #
+    #  Session Profile（任务级浏览器指纹一致性）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def pick_session_profile() -> dict:
+        """
+        为一个下载任务选定一个浏览器 Session Profile。
+
+        同一任务内所有请求（列表/详情/下载/altcha）均使用同一 profile，
+        确保 UA / sec-ch-ua / 平台信息在整个会话中保持一致，
+        避免因 UA 跳变触发 WAF 行为分析规则。
+
+        Returns:
+            profile dict，包含 ua / sec_ch_ua / sec_ch_ua_platform / accept_lang
+        """
+        return random.choice(_BROWSER_PROFILES)
+
+    # ------------------------------------------------------------------ #
     #  httpx.AsyncClient 工厂
     # ------------------------------------------------------------------ #
 
@@ -69,20 +141,23 @@ class AntiDetection:
         self,
         cookie: str,
         timeout: int = 30,
+        profile: Optional[dict] = None,
     ) -> AsyncIterator[httpx.AsyncClient]:
         """
         构建带代理和 UA 的 httpx.AsyncClient 上下文管理器
 
-        用法：
-            async with anti.build_client(cookie) as client:
-                resp = await client.get(url)
+        Args:
+            cookie:  账号 cookie
+            timeout: 超时秒数
+            profile: Session Profile（None 时随机选一个）
         """
         proxy = self._pick_proxy() if self.use_proxy and self.proxies else None
+        _profile = profile or self.pick_session_profile()
 
         client_kwargs = {
             "follow_redirects": True,
             "timeout": httpx.Timeout(timeout),
-            "headers": self.build_headers(cookie),
+            "headers": self.build_headers(cookie, profile=_profile),
         }
         if proxy:
             client_kwargs["proxy"] = proxy
@@ -99,22 +174,33 @@ class AntiDetection:
         cookie: str,
         referer: str = "https://haowallpaper.com/",
         extra: Optional[dict] = None,
+        profile: Optional[dict] = None,
     ) -> dict:
-        """构建模拟浏览器的请求头"""
+        """
+        构建模拟浏览器的请求头。
+
+        Args:
+            cookie:  账号 cookie
+            referer: Referer 地址
+            extra:   额外请求头（会覆盖默认值）
+            profile: Session Profile；None 时从池中随机选一个。
+                     对于同一任务应传入同一 profile，保持会话一致性。
+        """
+        _profile = profile or self.pick_session_profile()
         headers = {
             "Cookie": cookie,
-            "User-Agent": self._pick_ua(),
+            "User-Agent": _profile["ua"],
             "Referer": referer,
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Language": _profile["accept_lang"],
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua": _profile["sec_ch_ua"],
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-platform": _profile["sec_ch_ua_platform"],
         }
         if extra:
             headers.update(extra)
@@ -129,10 +215,24 @@ class AntiDetection:
         min_s: Optional[float] = None,
         max_s: Optional[float] = None,
     ) -> None:
-        """随机等待，模拟人工操作间隔"""
+        """随机等待，模拟人工操作间隔（页面翻页等场景）"""
         lo = min_s if min_s is not None else self.min_delay
         hi = max_s if max_s is not None else self.max_delay
         delay = random.uniform(lo, hi)
+        await asyncio.sleep(delay)
+
+    async def pre_request_delay(
+        self,
+        min_s: float = 0.2,
+        max_s: float = 0.9,
+    ) -> None:
+        """
+        API 调用前的轻量延迟，模拟浏览器渲染/JS 处理耗时。
+
+        适用于 getCompleteUrl、altcha verify 等关键 API 调用前，
+        避免请求时序过于精确（毫秒级触发）被 WAF 检测为自动化行为。
+        """
+        delay = random.uniform(min_s, max_s)
         await asyncio.sleep(delay)
 
     # ------------------------------------------------------------------ #
@@ -174,10 +274,6 @@ class AntiDetection:
     #  内部工具
     # ------------------------------------------------------------------ #
 
-    def _pick_ua(self) -> str:
-        """随机选择 User-Agent"""
-        return random.choice(USER_AGENTS)
-
     def _pick_proxy(self) -> Optional[str]:
         """随机选择一个健康代理"""
         healthy = [
@@ -201,23 +297,21 @@ class HumanBehaviorController:
        基于「日期字符串 MD5 哈希」生成 [DAILY_MIN, DAILY_MAX] 内的整数，
        同一天内多次重启结果完全一致，持久化到 data/human_behavior.json。
 
-    2. 下载节奏（三层延迟）
-       层 1 — 基础浏览延迟（每张必有）：3–10 秒
+    2. 下载节奏（四层延迟）
+       层 1 — 基础浏览延迟（每张必有）：
+               活跃时段(8-23点) 3–8 秒，非活跃时段 5–15 秒
                模拟人看图 / 考虑是否下载的停留时间。
        层 2 — 批次疲劳休息（每 8–15 张触发一次）：60–180 秒
                触发阈值随已下载数动态变化，避免固定周期被识别。
        层 3 — 随机长休息（约 3% 概率）：5–15 分钟
                模拟用户中途离开去做其他事情。
+       层 4 — 会话结束模拟（满 10 张后约 5% 概率）：20–90 分钟
+               模拟用户关闭浏览器、离开较长时间后再回来。
+               触发后记录日志，调用方应暂停本轮任务。
 
-    使用方式
-    ─────────
-    # 在 _execute_task 开头检查每日上限：
-    if human_ctrl.is_daily_limit_reached():
-        return  # 今日不再下载
-
-    # 每次成功下载后调用（在 pool.release 之后）：
-    human_ctrl.record_download()
-    await human_ctrl.post_download_delay(task.success_count)
+    3. 活跃时段感知
+       is_active_hour() 在 08:00–23:00 返回 True，
+       非活跃时段自动加长层 1 延迟（模拟深夜偶尔浏览节奏）。
     """
 
     DAILY_MIN = 25   # 每日下载上限的下界
@@ -245,6 +339,36 @@ class HumanBehaviorController:
                 json.dump(self._state, f, ensure_ascii=False, indent=2)
         except Exception as exc:
             logger.warning("[Human] 状态保存失败: %s", exc)
+
+    # ── 活跃时段感知 ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_active_hour(
+        tz: str = "Asia/Shanghai",
+        start: int = 8,
+        end: int = 23,
+    ) -> bool:
+        """
+        判断当前是否处于活跃时段（默认上海时间 08:00–23:00）。
+
+        Args:
+            tz:    时区名称，如 "Asia/Shanghai"（默认）或 "UTC"
+            start: 活跃时段开始小时（含，0-23）
+            end:   活跃时段结束小时（不含，0-23）；支持跨午夜，如 start=22, end=6
+
+        活跃时段延迟较短，模拟白天正常浏览节奏；
+        非活跃时段（深夜/凌晨）延迟较长，模拟偶发使用行为。
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(tz))
+        except Exception:
+            now = datetime.now()
+        hour = now.hour
+        if start <= end:
+            return start <= hour < end
+        # 跨午夜：如 22–6 表示 22:00 到次日 05:59
+        return hour >= start or hour < end
 
     # ── 每日上限 ─────────────────────────────────────────────────────────────
 
@@ -290,28 +414,50 @@ class HumanBehaviorController:
 
     # ── 节奏控制 ─────────────────────────────────────────────────────────────
 
-    async def post_download_delay(self, success_count: int) -> None:
+    async def post_download_delay(self, success_count: int) -> bool:
         """
         每次成功下载后的等待，模拟人查看壁纸的行为节奏。
 
         Args:
             success_count: 当前任务已成功下载的总数（用于触发批次休息）
-        """
-        # 层 1：基础浏览延迟（每张必有）
-        base = random.uniform(3.0, 10.0)
-        await asyncio.sleep(base)
 
-        # 层 2：批次疲劳休息
+        Returns:
+            True  — 正常延迟后继续
+            False — 触发层 4 会话结束模拟，调用方应终止本轮任务（长时间挂起）
+        """
+        # 层 4：会话结束模拟（满 10 张后 5% 概率，仅在活跃时段触发）
+        # 模拟用户关闭标签页、去做别的事，稍后重开的行为
+        if success_count >= 10 and random.random() < 0.05:
+            rest = random.uniform(20 * 60, 90 * 60)  # 20–90 分钟
+            logger.info(
+                "[Human] 层4-会话结束模拟，暂停 %.0f 分钟（模拟用户关闭浏览器）",
+                rest / 60,
+            )
+            await asyncio.sleep(rest)
+            return False
+
+        # 层 2：批次疲劳休息（优先级高于层 3，触发后跳过层 1/3）
         # 触发阈值在 8–15 之间随 success_count 动态变化，避免固定周期
         burst_size = 8 + (success_count % 8)  # 8 ~ 15
         if success_count > 0 and success_count % burst_size == 0:
             rest = random.uniform(60.0, 180.0)
             logger.info("[Human] 已下载 %d 张，批次休息 %.0f 秒", success_count, rest)
             await asyncio.sleep(rest)
-            return  # 已经有长休息，不再叠加层 3
+            return True
 
         # 层 3：随机长休息（~3% 概率，模拟用户去做其他事）
         if random.random() < 0.03:
             rest = random.uniform(300.0, 900.0)
             logger.info("[Human] 随机长休息 %.0f 秒（模拟用户离开）", rest)
             await asyncio.sleep(rest)
+            return True
+
+        # 层 1：基础浏览延迟（每张必有），活跃时段较短，非活跃时段较长
+        # 使用上海时区判断，确保与目标网站用户时区一致
+        if self.is_active_hour("Asia/Shanghai", 8, 23):
+            base = random.uniform(3.0, 8.0)   # 白天：3–8 秒
+        else:
+            base = random.uniform(5.0, 15.0)  # 深夜：5–15 秒
+        await asyncio.sleep(base)
+
+        return True

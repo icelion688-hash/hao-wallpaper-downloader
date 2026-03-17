@@ -58,6 +58,8 @@ def _migrate_db():
         "ALTER TABLE accounts ADD COLUMN last_verify_msg VARCHAR(255)",
         "ALTER TABLE accounts ADD COLUMN last_verify_auth_valid BOOLEAN",
         "ALTER TABLE accounts ADD COLUMN last_verify_can_original BOOLEAN",
+        "ALTER TABLE wallpapers ADD COLUMN video_duration REAL",
+        "ALTER TABLE wallpapers ADD COLUMN converted_path VARCHAR(512)",
     ]
     with engine.connect() as conn:
         for sql in migrations:

@@ -41,6 +41,11 @@ def build_uploader_from_profile(profile: Optional[dict]) -> Optional[ImgbedUploa
         image_processing=profile.get("image_processing", {}),
         profile_key=profile.get("key", ""),
         profile_name=profile.get("name", profile.get("key", "upload")),
+        folder_landscape=profile.get("folder_landscape", ""),
+        folder_portrait=profile.get("folder_portrait", ""),
+        folder_dynamic=profile.get("folder_dynamic", ""),
+        folder_pattern=profile.get("folder_pattern", ""),
+        upload_filter=profile.get("upload_filter", {}),
     )
 
 

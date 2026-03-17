@@ -1,9 +1,10 @@
 """
-api/gallery.py - 下载画廊与手动上传 API。
+api/gallery.py - 下载画廊、手动上传与批量格式转换 API。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from backend.config import load_config
 from backend.core.dedup import DedupManager
 from backend.core.downloader import DOWNLOAD_ROOT
 from backend.core.upload_profiles import build_uploader_by_key, list_upload_profiles
@@ -27,6 +29,21 @@ from backend.models.wallpaper import Wallpaper
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# 全局转换信号量：防止批量转换任务并发过多占满 CPU/内存
+# 实际上限从 config media_convert.max_concurrent 读取，首次请求时懒初始化
+_convert_sem: Optional[asyncio.Semaphore] = None
+_convert_sem_size: int = 0
+
+
+def _get_convert_sem() -> asyncio.Semaphore:
+    global _convert_sem, _convert_sem_size
+    from backend.config import load_config as _lc
+    size = int(_lc().get("media_convert", {}).get("max_concurrent", 1))
+    if _convert_sem is None or _convert_sem_size != size:
+        _convert_sem = asyncio.Semaphore(size)
+        _convert_sem_size = size
+    return _convert_sem
 
 
 def _apply_filters(
@@ -107,6 +124,12 @@ def _w_to_dict(w: Wallpaper) -> dict:
         "downloaded_at": w.downloaded_at,
         "imgbed_url": w.imgbed_url,
         "upload_records": parse_upload_records(w.upload_records),
+        "video_duration": w.video_duration,
+        "converted_path": w.converted_path,
+        "converted_url": (
+            f"/downloads/{w.converted_path.replace(chr(92), '/')}"
+            if w.converted_path else None
+        ),
     }
 
 
@@ -302,6 +325,9 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
             abs_path,
             width=wallpaper.width,
             height=wallpaper.height,
+            wallpaper_type=wallpaper.wallpaper_type or "static",
+            category=wallpaper.category or "",
+            is_original=bool(wallpaper.is_original),
         )
         if not url:
             failed_items.append({"id": wallpaper.id, "reason": "上传失败"})
@@ -403,3 +429,137 @@ async def clean_duplicates(dry_run: bool = False, db: Session = Depends(get_db))
     dedup = DedupManager(db)
     count = dedup.clean_duplicates(dry_run=dry_run)
     return {"cleaned": count, "dry_run": dry_run}
+
+
+# ── 批量格式转换 ─────────────────────────────────────────
+
+class BatchConvertRequest(BaseModel):
+    scope: str = "selected"                # "selected" | "all" | "dynamic" | "static"
+    wallpaper_ids: list[int] = Field(default_factory=list)
+    # 使用全局 media_convert 配置；以下字段可覆盖
+    output_format: Optional[str] = None    # 覆盖输出格式
+    delete_original: Optional[bool] = None # 覆盖是否删除原文件
+
+
+def _do_convert_wallpaper(
+    wallpaper_id: int,
+    abs_path: str,
+    wallpaper_type: str,
+    media_cfg: dict,
+    delete_original_override: Optional[bool],
+    output_format_override: Optional[str],
+    timeout_seconds_override: Optional[int] = None,
+) -> dict:
+    """
+    同步转换单张壁纸（在线程池中执行）。
+    返回 {"id": ..., "status": "ok"|"skip"|"fail", "converted_path": ...}
+    """
+    from backend.core.media_converter import MediaConverter, VideoConvertConfig, ImageConvertConfig
+
+    is_video = wallpaper_type == "dynamic"
+    cfg_key = "video" if is_video else "image"
+    cfg_dict = dict(media_cfg.get(cfg_key, {}))
+    cfg_dict["enabled"] = True  # 手动触发时强制 enabled
+    if output_format_override is not None:
+        cfg_dict["output_format"] = output_format_override
+    if delete_original_override is not None:
+        cfg_dict["delete_original"] = delete_original_override
+    if timeout_seconds_override is not None:
+        cfg_dict["timeout_seconds"] = timeout_seconds_override
+
+    if is_video:
+        mc = MediaConverter(video_config=VideoConvertConfig.from_dict(cfg_dict))
+        converted_abs = mc.convert_video(abs_path)
+    else:
+        mc = MediaConverter(image_config=ImageConvertConfig.from_dict(cfg_dict))
+        converted_abs = mc.convert_image(abs_path)
+
+    if not converted_abs:
+        return {"id": wallpaper_id, "status": "fail", "converted_path": None}
+
+    converted_rel = os.path.relpath(converted_abs, DOWNLOAD_ROOT).replace("\\", "/")
+    deleted_original = False
+    if cfg_dict.get("delete_original") and os.path.abspath(abs_path) != os.path.abspath(converted_abs):
+        try:
+            os.remove(abs_path)
+            deleted_original = True
+        except OSError:
+            pass
+
+    return {
+        "id": wallpaper_id,
+        "status": "ok",
+        "converted_path": converted_rel,
+        "deleted_original": deleted_original,
+    }
+
+
+@router.post("/convert/batch")
+async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depends(get_db)):
+    """批量格式转换（在线程池中执行，不阻塞事件循环）"""
+    media_cfg = load_config().get("media_convert", {})
+
+    # 构建壁纸列表
+    if body.scope == "selected":
+        if not body.wallpaper_ids:
+            raise HTTPException(400, "请选择要转换的壁纸")
+        wallpapers = db.query(Wallpaper).filter(
+            Wallpaper.id.in_(body.wallpaper_ids), Wallpaper.status == "done"
+        ).all()
+    elif body.scope == "dynamic":
+        wallpapers = db.query(Wallpaper).filter(
+            Wallpaper.status == "done", Wallpaper.wallpaper_type == "dynamic"
+        ).all()
+    elif body.scope == "static":
+        wallpapers = db.query(Wallpaper).filter(
+            Wallpaper.status == "done", Wallpaper.wallpaper_type == "static"
+        ).all()
+    elif body.scope == "all":
+        wallpapers = db.query(Wallpaper).filter(Wallpaper.status == "done").all()
+    else:
+        raise HTTPException(400, f"无效的 scope: {body.scope!r}")
+
+    loop = asyncio.get_event_loop()
+    success_items, failed_items, skipped_items = [], [], []
+    sem = _get_convert_sem()
+
+    for w in wallpapers:
+        if not w.local_path:
+            skipped_items.append({"id": w.id, "reason": "缺少本地路径"})
+            continue
+        abs_path = os.path.join(DOWNLOAD_ROOT, w.local_path)
+        if not os.path.exists(abs_path):
+            skipped_items.append({"id": w.id, "reason": "本地文件不存在"})
+            continue
+
+        async with sem:  # 限制并发转换数，防止 CPU/内存过载
+            result = await loop.run_in_executor(
+                None,
+                _do_convert_wallpaper,
+                w.id, abs_path, w.wallpaper_type or "static",
+                media_cfg,
+                body.delete_original,
+                body.output_format,
+            )
+
+        if result["status"] == "ok":
+            w.converted_path = result["converted_path"]
+            if result.get("deleted_original"):
+                w.local_path = result["converted_path"]
+            success_items.append(result)
+        elif result["status"] == "skip":
+            skipped_items.append({"id": w.id, "reason": "跳过"})
+        else:
+            failed_items.append({"id": w.id, "reason": "转换失败"})
+
+    db.commit()
+
+    return {
+        "success": True,
+        "total": len(wallpapers),
+        "success_count": len(success_items),
+        "failed_count": len(failed_items),
+        "skipped_count": len(skipped_items),
+        "items": success_items,
+        "failed_items": failed_items,
+    }

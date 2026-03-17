@@ -74,6 +74,20 @@ export const settingsApi = {
   setImgbed: (data) => http.put('/settings/imgbed', data),
   getUploads: () => http.get('/settings/uploads'),
   setUploads: (data) => http.put('/settings/uploads', data),
+  getMediaConvert: () => http.get('/settings/media-convert'),
+  setMediaConvert: (data) => http.put('/settings/media-convert', data),
+  getSystemInfo: () => http.get('/settings/system-info'),
+}
+
+export const convertApi = {
+  batchConvert: (data) => http.post('/gallery/convert/batch', data, { timeout: 0 }),
+}
+
+export const autopilotApi = {
+  status: () => http.get('/autopilot/status'),
+  start: (data) => http.post('/autopilot/start', data),
+  stop: () => http.post('/autopilot/stop'),
+  saveConfig: (data) => http.put('/autopilot/config', data),
 }
 
 export const healthCheck = () => http.get('/health')

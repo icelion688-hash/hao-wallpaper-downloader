@@ -6,6 +6,8 @@ imgbed_uploader.py - 通用图床上传器。
 2. `image_processing.format=webp` 时，本地预处理会转 WebP
 3. `image_processing.format=original` 时，保持原始格式直接上传
 4. 当原图大于 `disable_above_mb` 时，跳过本地预处理
+5. 支持按横/竖/动态图分别配置上传目录，支持路径模板变量
+6. 支持上传过滤：最小宽/高、仅上传原图
 """
 
 from __future__ import annotations
@@ -15,14 +17,26 @@ import io
 import logging
 import mimetypes
 import os
+import re
 import tempfile
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional
 
 import httpx
 from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
+
+
+# ── 路径模板变量说明 ────────────────────────────────────────────────────────
+# {type}      壁纸类型（static / dynamic）
+# {category}  分类名称（动漫｜二次元 / 风景 …）；含特殊字符会被清理为文件系统安全字符串
+# {year}      当前年份（4 位）
+# {month}     当前月份（2 位，01-12）
+# {date}      当前日期（8 位，20250317）
+# 示例：bg/{type}/{year}/{month}  →  bg/static/2025/03
+# ────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass(slots=True)
@@ -51,9 +65,56 @@ class ImageProcessingConfig:
         )
 
 
+@dataclass(slots=True)
+class UploadFilterConfig:
+    """上传过滤器：不满足条件的图片跳过上传"""
+    min_width: Optional[int] = None    # 最小宽度（像素），None 表示不限
+    min_height: Optional[int] = None   # 最小高度（像素），None 表示不限
+    only_original: bool = False        # True 时仅上传通过 getCompleteUrl 的原图
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "UploadFilterConfig":
+        payload = data or {}
+        return cls(
+            min_width=int(payload["min_width"]) if payload.get("min_width") else None,
+            min_height=int(payload["min_height"]) if payload.get("min_height") else None,
+            only_original=bool(payload.get("only_original", False)),
+        )
+
+    def check(
+        self,
+        width: Optional[int],
+        height: Optional[int],
+        is_original: bool = False,
+    ) -> tuple[bool, str]:
+        """
+        返回 (pass, reason)。
+        pass=True 表示允许上传；pass=False 附带跳过原因。
+        """
+        if self.only_original and not is_original:
+            return False, "非原图，跳过上传（only_original=true）"
+        if self.min_width and width and width < self.min_width:
+            return False, f"宽度 {width} < 最小宽度 {self.min_width}"
+        if self.min_height and height and height < self.min_height:
+            return False, f"高度 {height} < 最小高度 {self.min_height}"
+        return True, ""
+
+
+# 文件系统不安全字符正则（用于清理 category 中的特殊字符）
+_UNSAFE_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+
+def _safe_path_segment(value: str) -> str:
+    """将字符串转为文件系统安全的路径段（保留中文、字母、数字、连字符、下划线）"""
+    cleaned = _UNSAFE_CHARS.sub("_", value).strip()
+    return cleaned or "unknown"
+
+
 class ImgbedUploader:
-    FOLDER_PC = "bg/pc"
-    FOLDER_MB = "bg/mb"
+    # 默认目录（向后兼容）
+    _DEFAULT_LANDSCAPE = "bg/pc"
+    _DEFAULT_PORTRAIT  = "bg/mb"
+    _DEFAULT_DYNAMIC   = "bg/dynamic"
 
     # 上传最大重试次数（首次 + 1 次重试）
     _MAX_RETRIES = 2
@@ -69,6 +130,13 @@ class ImgbedUploader:
         image_processing: Optional[dict] = None,
         profile_key: Optional[str] = None,
         profile_name: Optional[str] = None,
+        # ── 目录配置 ──────────────────────────────────────────────────────
+        folder_landscape: str = "",   # 横图目录，空 = 使用默认
+        folder_portrait: str = "",    # 竖图目录，空 = 使用默认
+        folder_dynamic: str = "",     # 动态图目录，空 = 使用默认
+        folder_pattern: str = "",     # 路径模板（非空时优先，支持变量）
+        # ── 上传过滤 ──────────────────────────────────────────────────────
+        upload_filter: Optional[dict] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_token = api_token
@@ -77,6 +145,13 @@ class ImgbedUploader:
         self.image_processing = ImageProcessingConfig.from_dict(image_processing)
         self.profile_key = profile_key or ""
         self.profile_name = profile_name or self.profile_key or "upload"
+        # 目录配置
+        self.folder_landscape = folder_landscape or self._DEFAULT_LANDSCAPE
+        self.folder_portrait  = folder_portrait  or self._DEFAULT_PORTRAIT
+        self.folder_dynamic   = folder_dynamic   or self._DEFAULT_DYNAMIC
+        self.folder_pattern   = folder_pattern   or ""
+        # 上传过滤
+        self.upload_filter = UploadFilterConfig.from_dict(upload_filter)
         # 持久 HTTP client：复用连接池，避免每次上传重新握手
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -92,22 +167,71 @@ class ImgbedUploader:
             await self._client.aclose()
         self._client = None
 
-    def _determine_folder(self, width: Optional[int], height: Optional[int]) -> str:
+    @staticmethod
+    def _resolve_pattern(
+        pattern: str,
+        wallpaper_type: str,
+        category: str,
+    ) -> str:
+        """
+        将路径模板中的变量替换为实际值。
+        支持：{type} {category} {year} {month} {date}
+        """
+        now = datetime.now()
+        safe_category = _safe_path_segment(category) if category else "uncategorized"
+        return (
+            pattern
+            .replace("{type}", wallpaper_type or "static")
+            .replace("{category}", safe_category)
+            .replace("{year}", now.strftime("%Y"))
+            .replace("{month}", now.strftime("%m"))
+            .replace("{date}", now.strftime("%Y%m%d"))
+        )
+
+    def _determine_folder(
+        self,
+        width: Optional[int],
+        height: Optional[int],
+        wallpaper_type: str = "static",
+        category: str = "",
+    ) -> str:
+        """
+        确定上传目录。优先级：
+        1. folder_pattern（非空时用模板替换）
+        2. 按类型/方向分目录：
+           - wallpaper_type == "dynamic" → folder_dynamic
+           - height > width（竖图）→ folder_portrait
+           - 其他（横图/方图）→ folder_landscape
+        """
+        if self.folder_pattern:
+            return self._resolve_pattern(self.folder_pattern, wallpaper_type, category)
+
+        if wallpaper_type == "dynamic":
+            return self.folder_dynamic
         if width and height and height > width:
-            return self.FOLDER_MB
-        return self.FOLDER_PC
+            return self.folder_portrait
+        return self.folder_landscape
 
     async def upload(
         self,
         local_path: str,
         width: Optional[int] = None,
         height: Optional[int] = None,
+        wallpaper_type: str = "static",
+        category: str = "",
+        is_original: bool = False,
     ) -> Optional[str]:
         if not os.path.exists(local_path):
             logger.warning("[Imgbed] file not found: %s", local_path)
             return None
 
-        folder = self._determine_folder(width, height)
+        # 上传过滤检查
+        ok, reason = self.upload_filter.check(width, height, is_original)
+        if not ok:
+            logger.info("[Imgbed] 跳过上传 file=%s reason=%s", os.path.basename(local_path), reason)
+            return None
+
+        folder = self._determine_folder(width, height, wallpaper_type, category)
         upload_url = f"{self.base_url}/upload"
         params = {
             "uploadChannel": self.channel,

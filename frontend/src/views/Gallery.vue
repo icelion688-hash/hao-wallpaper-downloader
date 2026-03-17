@@ -216,14 +216,64 @@
             <label class="select-box">
               <input type="checkbox" :checked="selectedIds.includes(w.id)" @change="toggleSelect(w.id)" />
             </label>
-            <img v-if="w.file_url" :src="encodeFileUrl(w.file_url)" class="gallery-img" loading="lazy"
-              @error="e => e.currentTarget.style.display='none'" />
-            <div class="img-placeholder" :class="{ 'img-placeholder--hidden': w.file_url }">
-              <span>{{ w.wallpaper_type === 'dynamic' ? '▶' : '○' }}</span>
-            </div>
+
+            <!-- 动态视频 -->
+            <template v-if="w.wallpaper_type === 'dynamic'">
+              <!-- 已转换为动态 WebP/GIF：直接 <img> 自动循环，无需 JS -->
+              <img
+                v-if="w.converted_url"
+                class="gallery-img"
+                :src="encodeFileUrl(w.converted_url)"
+                loading="lazy"
+                :title="`已转换: ${w.converted_path}`"
+                @error="e => e.currentTarget.style.display='none'"
+              />
+              <!-- 未转换：原始 MP4，悬停时播放 -->
+              <video
+                v-else-if="w.file_url"
+                class="gallery-img"
+                :src="encodeFileUrl(w.file_url)"
+                preload="none"
+                muted loop playsinline
+                @mouseenter="e => e.target.play()"
+                @mouseleave="e => { e.target.pause(); e.target.currentTime = 0 }"
+              />
+              <!-- 悬停提示遮罩（转换后不显示）-->
+              <div
+                v-if="!w.converted_url"
+                class="video-hint-mask"
+                :class="{ 'video-hint-mask--has-file': !!w.file_url }"
+              >
+                <span class="video-play-icon">▶</span>
+                <span class="video-hint-text" v-if="w.file_url">悬停播放</span>
+                <span class="video-duration" v-if="w.video_duration">{{ fmtDuration(w.video_duration) }}</span>
+              </div>
+              <!-- 已转换标记 -->
+              <div v-if="w.converted_url" class="converted-badge">WebP</div>
+            </template>
+
+            <!-- 静态图 -->
+            <template v-else>
+              <!-- 优先显示转换后图片 -->
+              <img
+                v-if="w.converted_url || w.file_url"
+                :src="encodeFileUrl(w.converted_url || w.file_url)"
+                class="gallery-img"
+                loading="lazy"
+                @error="e => e.currentTarget.style.display='none'"
+              />
+              <div class="img-placeholder" :class="{ 'img-placeholder--hidden': w.converted_url || w.file_url }">
+                <span>○</span>
+              </div>
+              <div v-if="w.converted_url" class="converted-badge">WebP</div>
+            </template>
+
             <div class="img-overlay">
               <span class="res-badge font-mono">{{ w.resolution }}</span>
-              <button class="btn btn--sm btn--danger del-btn" @click="deleteWallpaper(w.id)">删除</button>
+              <div class="overlay-actions">
+                <button class="btn btn--sm convert-btn" @click.stop="convertOne(w)" title="转换格式">⇄</button>
+                <button class="btn btn--sm btn--danger del-btn" @click.stop="deleteWallpaper(w.id)">删除</button>
+              </div>
             </div>
           </div>
 
@@ -244,13 +294,14 @@
               <span class="tag tag--err" v-if="w.is_duplicate">重复</span>
             </div>
 
-            <!-- 统计行：分辨率 · 大小 · 下载量 · 收藏量 -->
+            <!-- 统计行：分辨率 · 大小 · 时长 · 下载量 · 收藏量 -->
             <div class="stats-row">
               <span v-if="w.resolution" class="stat">{{ w.resolution }}</span>
               <span v-if="w.file_size" class="stat stat--size">{{ formatBytes(w.file_size) }}</span>
               <span v-if="w.file_mb && w.file_size" class="stat stat--api" :title="`API标注大小: ${w.file_mb}`">
                 API {{ w.file_mb }}
               </span>
+              <span v-if="w.video_duration" class="stat stat--dur">⏱ {{ fmtDuration(w.video_duration) }}</span>
               <span v-if="w.hot_score" class="stat stat--down">↓{{ formatCount(w.hot_score) }}</span>
               <span v-if="w.favor_count" class="stat stat--fav">♥{{ formatCount(w.favor_count) }}</span>
             </div>
@@ -277,7 +328,7 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { galleryApi } from '../api'
+import { galleryApi, convertApi } from '../api'
 
 // ── 元数据（来自 API，用于色系颜色渲染）──────────
 const metaColorMap = ref({})   // colorName → hex
@@ -330,6 +381,13 @@ function formatCount(n) {
   if (n >= 10000) return (n / 10000).toFixed(1) + 'w'
   if (n >= 1000)  return (n / 1000).toFixed(1) + 'k'
   return String(n)
+}
+
+function fmtDuration(secs) {
+  if (!secs) return ''
+  const s = Math.round(secs)
+  const m = Math.floor(s / 60), r = s % 60
+  return m > 0 ? `${m}:${String(r).padStart(2, '0')}` : `${r}s`
 }
 
 function formatBytes(bytes) {
@@ -442,6 +500,33 @@ function toggleSelectCurrentPage(checked) {
   } else {
     const pageIds = new Set(wallpapers.value.map(w => w.id))
     selectedIds.value = selectedIds.value.filter(id => !pageIds.has(id))
+  }
+}
+
+// ── 格式转换 ───────────────────────────────────────
+const converting = ref(false)
+
+async function convertOne(w) {
+  converting.value = true
+  try {
+    const res = await convertApi.batchConvert({ scope: 'selected', wallpaper_ids: [w.id] })
+    if (res.success_count > 0) {
+      const item = res.items?.[0]
+      if (item?.converted_path) {
+        w.converted_path = item.converted_path
+        w.converted_url = `/downloads/${item.converted_path}`
+        if (item.deleted_original) {
+          w.local_path = item.converted_path
+          w.file_url = `/downloads/${item.converted_path}`
+        }
+      }
+    } else {
+      alert('转换失败，请检查是否已安装 imageio-ffmpeg 并确认格式转换已在配置中启用。')
+    }
+  } catch (e) {
+    alert(`转换失败: ${e.message}`)
+  } finally {
+    converting.value = false
   }
 }
 
@@ -670,6 +755,26 @@ onMounted(() => {
 }
 .img-placeholder--hidden { display: none; }
 
+/* 视频悬停提示遮罩 */
+.video-hint-mask {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 4px;
+  background: rgba(0, 0, 0, .35);
+  pointer-events: none;
+  transition: opacity .2s;
+}
+.video-hint-mask--has-file .video-play-icon { font-size: 28px; color: rgba(255,255,255,.9); }
+.video-hint-text { font-size: 10px; color: rgba(255,255,255,.7); font-family: var(--font-ui); }
+.video-duration {
+  position: absolute; bottom: 6px; right: 8px;
+  font-size: 10px; font-family: var(--font-ui);
+  color: #fff; background: rgba(0,0,0,.6);
+  padding: 1px 5px; border-radius: 3px;
+}
+/* 悬停时隐藏提示（视频正在播放） */
+.gallery-item:hover .video-hint-mask { opacity: 0; }
+
 .img-overlay {
   position: absolute; inset: 0; background: rgba(0,0,0,.5);
   display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between;
@@ -682,12 +787,24 @@ onMounted(() => {
   padding: 2px 6px; border-radius: 4px;
 }
 
+.overlay-actions { display: flex; gap: 4px; align-items: center; }
+.convert-btn { font-size: 11px; padding: 3px 8px; color: #a78bfa; border-color: rgba(167,139,250,.4); }
+.convert-btn:hover { background: rgba(167,139,250,.15); border-color: #a78bfa; color: #a78bfa; }
+
 .select-box {
   position: absolute; top: 6px; left: 6px; z-index: 2; cursor: pointer;
 }
 .select-box input { accent-color: var(--accent); width: 14px; height: 14px; }
 
 .del-btn { font-size: 11px; padding: 3px 8px; }
+
+/* 已转换徽章 */
+.converted-badge {
+  position: absolute; top: 6px; right: 6px; z-index: 1;
+  font-size: 9px; font-family: var(--font-ui); font-weight: 700;
+  padding: 1px 5px; border-radius: 3px;
+  background: rgba(167,139,250,.85); color: #fff; letter-spacing: .05em;
+}
 
 /* 元信息区 */
 .gallery-meta { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
@@ -719,6 +836,7 @@ onMounted(() => {
 .stat--api  { color: var(--text-3); font-style: italic; }
 .stat--down { color: var(--accent); opacity: .85; }
 .stat--fav  { color: #e95d8a; opacity: .9; }
+.stat--dur  { color: #a78bfa; }
 
 /* 上传徽章 */
 .upload-badges { display: flex; flex-wrap: wrap; gap: 4px; }

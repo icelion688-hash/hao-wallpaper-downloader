@@ -49,6 +49,7 @@ class AltchaSolver:
         client: httpx.AsyncClient,
         cookie: str,
         extra_headers: Optional[dict] = None,
+        ua: Optional[str] = None,
     ) -> Optional[str]:
         """
         完整求解流程：获取 challenge → 计算 PoW → 返回 altcha 字段值
@@ -57,12 +58,13 @@ class AltchaSolver:
             client:        复用的 httpx.AsyncClient（带 cookie 和代理配置）
             cookie:        当前账号的 cookie 字符串
             extra_headers: 额外请求头
+            ua:            User-Agent 字符串（传入任务级 session profile UA 保持一致性）
 
         Returns:
             base64 编码的 solution 字符串，提交时作为 "altcha" 字段值
             失败时返回 None
         """
-        headers = self._build_headers(cookie, extra_headers)
+        headers = self._build_headers(cookie, extra_headers, ua=ua)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -94,6 +96,7 @@ class AltchaSolver:
         self,
         client: httpx.AsyncClient,
         cookie: str,
+        ua: Optional[str] = None,
     ) -> bool:
         """
         完整验证流程：获取 challenge → 计算 PoW → POST /certify/verify
@@ -101,15 +104,18 @@ class AltchaSolver:
         验证成功后，同一 client 会话即可调用 getCompleteUrl 获取原图直链。
         必须与后续 getCompleteUrl 请求使用同一个 httpx.AsyncClient 实例。
 
+        Args:
+            ua: User-Agent 字符串（传入任务级 session profile UA 保持一致性）
+
         Returns:
             True 表示验证成功，False 表示失败
         """
-        solution = await self.solve(client, cookie)
+        solution = await self.solve(client, cookie, ua=ua)
         if not solution:
             logger.error("[Altcha] verify_download: PoW 求解失败")
             return False
 
-        headers = self._build_headers(cookie)
+        headers = self._build_headers(cookie, ua=ua)
         try:
             resp = await client.post(
                 VERIFY_URL,
@@ -219,17 +225,33 @@ class AltchaSolver:
         return base64.b64encode(payload.encode("utf-8")).decode("utf-8")
 
     @staticmethod
-    def _build_headers(cookie: str, extra: Optional[dict] = None) -> dict:
-        """构建请求头"""
+    def _build_headers(
+        cookie: str,
+        extra: Optional[dict] = None,
+        ua: Optional[str] = None,
+    ) -> dict:
+        """
+        构建 altcha 请求头。
+
+        Args:
+            ua: 外部传入的 User-Agent（任务级 session profile），
+                None 时使用内置默认 UA（Chrome 133）。
+        """
+        _ua = ua or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/133.0.0.0 Safari/537.36"
+        )
         headers = {
             "Cookie": cookie,
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": _ua,
             "Referer": "https://haowallpaper.com/",
-            "Accept": "application/json, */*;q=0.8",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
         if extra:
             headers.update(extra)

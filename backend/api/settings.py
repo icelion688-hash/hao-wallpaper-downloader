@@ -1,8 +1,8 @@
 """
-api/settings.py - 全局上传设置 API。
+api/settings.py - 全局上传 + 媒体转换设置 API。
 """
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -70,6 +70,53 @@ async def get_imgbed_settings_compat():
     task_key = uploads.get("task_profile")
     profile = next((item for item in uploads.get("profiles", []) if item.get("key") == task_key), {})
     return profile
+
+
+class VideoConvertPayload(BaseModel):
+    enabled: bool = False
+    output_format: str = "webp"
+    fps: int = Field(default=10, ge=1, le=60)
+    max_frames: int = Field(default=120, ge=10, le=600)
+    width: int = Field(default=0, ge=0)
+    max_width: int = Field(default=1280, ge=0)
+    quality: int = Field(default=80, ge=1, le=100)
+    delete_original: bool = False
+    timeout_seconds: int = Field(default=300, ge=30, le=3600)
+    cpu_nice: int = Field(default=5, ge=0, le=19)
+
+
+class ImageConvertPayload(BaseModel):
+    enabled: bool = False
+    output_format: str = "webp"
+    quality: int = Field(default=85, ge=1, le=100)
+    delete_original: bool = False
+    timeout_seconds: int = Field(default=120, ge=10, le=600)
+    cpu_nice: int = Field(default=5, ge=0, le=19)
+
+
+class MediaConvertPayload(BaseModel):
+    auto_convert: bool = False
+    max_concurrent: int = Field(default=1, ge=1, le=4)
+    video: VideoConvertPayload = VideoConvertPayload()
+    image: ImageConvertPayload = ImageConvertPayload()
+
+
+@router.get("/media-convert")
+async def get_media_convert_settings():
+    return load_config().get("media_convert", MediaConvertPayload().model_dump())
+
+
+@router.put("/media-convert")
+async def save_media_convert_settings(body: MediaConvertPayload):
+    cfg = update_config({"media_convert": body.model_dump()})
+    return {"success": True, "media_convert": cfg.get("media_convert", {})}
+
+
+@router.get("/system-info")
+async def get_system_info():
+    """返回服务器资源概况与推荐转换配置（不含敏感信息）"""
+    from backend.core.media_converter import MediaConverter
+    return MediaConverter.system_info()
 
 
 @router.put("/imgbed")

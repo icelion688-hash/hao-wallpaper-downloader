@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, unquote
@@ -27,11 +28,19 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOWNLOAD_ROOT = os.path.join(BASE_DIR, "downloads")
 
-# 每个分片大小（断点续传）
-CHUNK_SIZE = 64 * 1024  # 64 KB
+# 分片大小
+CHUNK_SIZE = 64 * 1024   # 64 KB（静态图）
+CHUNK_SIZE_VIDEO = 256 * 1024  # 256 KB（动态视频，减少 write 调用次数）
 
 # 最大重试次数
 MAX_RETRIES = 3
+
+# 下载进度日志间隔（仅大文件）
+_LOG_PROGRESS_INTERVAL = 20 * 1024 * 1024   # 每 20 MB 打印一次
+_LOG_PROGRESS_MIN_SIZE = 10 * 1024 * 1024   # 文件 > 10 MB 才启用进度日志
+
+# 磁盘空间警戒线（低于此值时跳过大文件下载）
+_DISK_WARN_FREE_BYTES = 300 * 1024 * 1024   # 300 MB
 
 
 class Downloader:
@@ -60,6 +69,7 @@ class Downloader:
         category: str = "uncategorized",
         filename: Optional[str] = None,
         wallpaper_type: str = "static",
+        session_profile: Optional[dict] = None,
     ) -> Optional[str]:
         """
         下载单张壁纸
@@ -87,7 +97,10 @@ class Downloader:
         save_dir = os.path.join(self.download_root, category or "uncategorized")
         os.makedirs(save_dir, exist_ok=True)
 
-        filename = filename or self._extract_filename(download_url, resource_id)
+        filename = filename or self._extract_filename(
+            download_url, resource_id,
+            default_ext="mp4" if wallpaper_type == "dynamic" else "jpg",
+        )
         # 过滤文件名中的非法字符（Windows 兼容）
         filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
         # 同名冲突处理：若已有同名文件但属于不同资源，自动追加计数后缀
@@ -100,6 +113,19 @@ class Downloader:
             rel = os.path.relpath(local_path, self.download_root)
             return rel
 
+        # 磁盘空间预检（动态视频文件通常 50-100 MB，提前检查避免下载中途磁盘满）
+        if wallpaper_type == "dynamic":
+            try:
+                free_bytes = shutil.disk_usage(self.download_root).free
+                if free_bytes < _DISK_WARN_FREE_BYTES:
+                    logger.warning(
+                        "[Downloader] 磁盘剩余空间不足 (%.1f MB)，跳过动态图下载: %s",
+                        free_bytes / (1024 * 1024), resource_id,
+                    )
+                    return None
+            except OSError:
+                pass  # 无法获取磁盘信息时继续下载
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 result = await self._download_with_resume(
@@ -107,6 +133,8 @@ class Downloader:
                     url=download_url,
                     local_path=local_path,
                     cookie=cookie,
+                    session_profile=session_profile,
+                    wallpaper_type=wallpaper_type,
                 )
                 if result:
                     rel = os.path.relpath(local_path, self.download_root)
@@ -134,6 +162,8 @@ class Downloader:
         url: str,
         local_path: str,
         cookie: str,
+        session_profile: Optional[dict] = None,
+        wallpaper_type: str = "static",
     ) -> bool:
         """
         支持 Range 断点续传的下载实现
@@ -148,24 +178,30 @@ class Downloader:
         headers = self.anti.build_headers(
             cookie,
             referer=f"https://haowallpaper.com/wallpaper/{resource_id}",
+            profile=session_profile,
         )
 
         # CDN 签名直链（down.haowallpaper.com）鉴权已内嵌于 URL 签名，无需额外验证
         # previewFileImg / getVideoReduce 等接口鉴权依赖 cookie（已在 headers 中）
-        # 两种情况均不需要在此处重做 altcha 验证
 
         # Range 续传头
         if existing_size > 0:
             headers["Range"] = f"bytes={existing_size}-"
             logger.debug(f"[Downloader] {resource_id} 断点续传，已有 {existing_size} bytes")
 
-        async with self.anti.build_client(cookie) as client:
+        # 动态视频体积大（50-100 MB），使用更长的超时防止慢速 CDN 断链
+        _is_video = wallpaper_type == "dynamic"
+        _timeout = httpx.Timeout(
+            connect=15,
+            read=300 if _is_video else 60,   # 视频 5 分钟，静态图 1 分钟
+            write=10, pool=15,
+        )
+        _chunk_size = CHUNK_SIZE_VIDEO if _is_video else CHUNK_SIZE
+
+        async with self.anti.build_client(cookie, profile=session_profile) as client:
             try:
                 async with client.stream(
-                    "GET",
-                    url,
-                    headers=headers,
-                    timeout=httpx.Timeout(connect=10, read=60, write=10, pool=10),
+                    "GET", url, headers=headers, timeout=_timeout,
                 ) as resp:
                     # 206 Partial Content = 服务端支持续传
                     # 200 OK = 服务端不支持续传，从头开始
@@ -183,10 +219,22 @@ class Downloader:
                     mode = "ab" if existing_size > 0 else "wb"
 
                     downloaded = existing_size
+                    _next_log_at = existing_size + _LOG_PROGRESS_INTERVAL  # 下次进度日志的阈值
+
                     with open(tmp_path, mode) as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                        async for chunk in resp.aiter_bytes(chunk_size=_chunk_size):
                             f.write(chunk)
                             downloaded += len(chunk)
+
+                            # 大文件进度日志（每 20 MB 打印一次）
+                            if total >= _LOG_PROGRESS_MIN_SIZE and downloaded >= _next_log_at:
+                                pct = downloaded / total * 100 if total else 0
+                                logger.info(
+                                    "[Downloader] %s 下载进度: %.1f%% (%s / %s)",
+                                    resource_id, pct,
+                                    _fmt_bytes(downloaded), _fmt_bytes(total),
+                                )
+                                _next_log_at += _LOG_PROGRESS_INTERVAL
 
                     # 校验文件大小
                     if total > 0 and downloaded < total * 0.99:
@@ -201,7 +249,10 @@ class Downloader:
                     return True
 
             except httpx.TimeoutException:
-                logger.warning(f"[Downloader] {resource_id} 下载超时")
+                logger.warning(
+                    f"[Downloader] {resource_id} 下载超时 "
+                    f"(已下载 {_fmt_bytes(downloaded)} / {_fmt_bytes(total)})"
+                )
                 return False
             except httpx.HTTPStatusError as e:
                 logger.error(
@@ -214,8 +265,8 @@ class Downloader:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _extract_filename(url: str, fallback_id: str) -> str:
-        """从 URL 提取文件名，失败时用 resource_id 作为文件名"""
+    def _extract_filename(url: str, fallback_id: str, default_ext: str = "jpg") -> str:
+        """从 URL 提取文件名，失败时用 resource_id + default_ext 作为文件名"""
         try:
             path = urlparse(url).path
             name = os.path.basename(unquote(path))
@@ -224,7 +275,7 @@ class Downloader:
                 return name
         except Exception:
             pass
-        return f"{fallback_id}.jpg"
+        return f"{fallback_id}.{default_ext}"
 
     @staticmethod
     def _resolve_collision(save_dir: str, filename: str) -> str:
@@ -249,3 +300,14 @@ class Downloader:
         path = os.path.join(download_root, safe)
         os.makedirs(path, exist_ok=True)
         return path
+
+
+def _fmt_bytes(n: int) -> str:
+    """将字节数格式化为可读字符串，用于进度日志"""
+    if n >= 1024 * 1024 * 1024:
+        return f"{n / (1024**3):.1f} GB"
+    if n >= 1024 * 1024:
+        return f"{n / (1024**2):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"

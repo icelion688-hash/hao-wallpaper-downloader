@@ -20,6 +20,20 @@ uploads:
       api_token: "replace-with-your-token"
       channel: "telegram"
       server_compress: true
+      # 目录配置：横图/竖图/动态图分别存放的目录
+      # 留空时使用默认值（bg/pc、bg/mb、bg/dynamic）
+      folder_landscape: "bg/pc"
+      folder_portrait: "bg/mb"
+      folder_dynamic: "bg/dynamic"
+      # 路径模板：非空时优先于上方固定目录，支持变量：
+      # {type}={static|dynamic}  {category}=分类名  {year}  {month}  {date}
+      # 示例："bg/{type}/{year}/{month}"  →  "bg/static/2025/03"
+      folder_pattern: ""
+      # 上传过滤：不满足条件的图片跳过上传
+      upload_filter:
+        min_width: null        # 最小宽度（像素），null 表示不限
+        min_height: null       # 最小高度（像素），null 表示不限
+        only_original: false   # true 时仅上传原图（非预览图）
       image_processing:
         enabled: true
         telegram_only: false
@@ -36,6 +50,14 @@ uploads:
       api_token: ""
       channel: "huggingface"
       server_compress: false
+      folder_landscape: "bg/pc"
+      folder_portrait: "bg/mb"
+      folder_dynamic: "bg/dynamic"
+      folder_pattern: ""
+      upload_filter:
+        min_width: null
+        min_height: null
+        only_original: true    # 原图配置默认只上传原图
       image_processing:
         enabled: false
         telegram_only: false
@@ -45,3 +67,31 @@ uploads:
         threshold_mb: 5
         target_mb: 4
         disable_above_mb: 10
+
+# ── 媒体格式转换 ───────────────────────────────────────────────────────────
+# 下载完成后自动转换格式；也可在画廊手动批量转换
+# 视频转换需要 imageio-ffmpeg（pip 包，首次使用时自动下载约 60MB ffmpeg 二进制）
+# 静态图转换仅需 Pillow（已内置）
+media_convert:
+  auto_convert: false      # true = 下载时自动触发转换（建议先测试后再开启）
+  max_concurrent: 1        # 同时运行的转换任务数（低配机建议 1）
+
+  video:                   # MP4 → 动态 WebP / GIF
+    enabled: false
+    output_format: "webp"  # "webp" | "gif"（WebP 体积更小，浏览器直接以 <img> 自动循环播放）
+    fps: 10                # 输出帧率（降低帧率可显著减小体积）
+    max_frames: 120        # 最多提取帧数（实际值由可用内存自动压缩）
+    width: 0               # 输出宽度（0 = 使用 max_width 自动裁剪）
+    max_width: 1280        # 帧宽硬上限（4K→1280px 内存从 24MB/帧降至 2.8MB/帧）
+    quality: 80            # WebP 质量（1-100）
+    delete_original: false # true = 转换成功后删除原 MP4
+    timeout_seconds: 300   # 单文件超时（秒），超时后软取消保留已采集帧
+    cpu_nice: 5            # CPU 调度降权（0=不降，5=后台，19=最低；仅 Linux）
+
+  image:                   # PNG/JPEG → WebP / JPG / PNG
+    enabled: false
+    output_format: "webp"  # "webp" | "jpg" | "png"
+    quality: 85            # JPEG/WebP 质量（1-100）
+    delete_original: false # true = 转换成功后删除原文件
+    timeout_seconds: 120   # 单文件超时（秒）
+    cpu_nice: 5            # CPU 调度降权

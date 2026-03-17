@@ -14,10 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend.api import accounts, gallery, schedule, settings, stats, tasks
+from backend.api import accounts, autopilot, gallery, schedule, settings, stats, tasks
 from backend.config import load_config
 from backend.core.account_pool import AccountPool
 from backend.core.anti_detection import AntiDetection, HumanBehaviorController
+from backend.core.autopilot_engine import AutoPilotEngine
 from backend.core.captcha_solver import AltchaSolver
 from backend.core.filters import FilterConfig
 from backend.core.imgbed_uploader import ImgbedUploader
@@ -57,6 +58,7 @@ account_pool: AccountPool | None = None
 captcha_solver: AltchaSolver | None = None
 imgbed_uploader: ImgbedUploader | None = None
 human_behavior: HumanBehaviorController | None = None
+autopilot_engine: AutoPilotEngine | None = None
 _reset_task: asyncio.Task | None = None
 _scheduler_task: asyncio.Task | None = None
 
@@ -124,7 +126,7 @@ async def _scheduler_loop(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global anti_detection, account_pool, captcha_solver, imgbed_uploader, human_behavior, _reset_task, _scheduler_task
+    global anti_detection, account_pool, captcha_solver, imgbed_uploader, human_behavior, autopilot_engine, _reset_task, _scheduler_task
 
     logger.info("=== HaoWallpaper Downloader 启动 ===")
     init_db()
@@ -157,11 +159,15 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     account_pool = AccountPool(db=db)
 
+    # AutoPilot 引擎（单例，配置持久化到 data/autopilot.json）
+    autopilot_engine = AutoPilotEngine(data_dir=data_dir)
+
     app.state.anti = anti_detection
     app.state.pool = account_pool
     app.state.captcha = captcha_solver
     app.state.imgbed = imgbed_uploader
     app.state.human_ctrl = human_behavior
+    app.state.autopilot = autopilot_engine
     app.state.db = db
 
     _reset_task = asyncio.create_task(account_pool.daily_reset_loop())
@@ -176,6 +182,8 @@ async def lifespan(app: FastAPI):
         _reset_task.cancel()
     if _scheduler_task:
         _scheduler_task.cancel()
+    if autopilot_engine:
+        await autopilot_engine.stop()
     if imgbed_uploader:
         await imgbed_uploader.aclose()
     db.close()
@@ -203,6 +211,7 @@ app.add_middleware(
 
 app.include_router(accounts.router, prefix="/api/accounts", tags=["账号管理"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["任务管理"])
+app.include_router(autopilot.router, prefix="/api/autopilot", tags=["自动驾驶"])
 app.include_router(gallery.router, prefix="/api/gallery", tags=["下载画廊"])
 app.include_router(stats.router, prefix="/api/stats", tags=["系统监控"])
 app.include_router(schedule.router, prefix="/api/schedule", tags=["定时计划"])

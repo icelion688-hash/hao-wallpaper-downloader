@@ -6,14 +6,18 @@ const Gallery = () => import('../views/Gallery.vue')
 const Upload = () => import('../views/Upload.vue')
 const Filters = () => import('../views/Filters.vue')
 const Stats = () => import('../views/Stats.vue')
+const AutoPilot = () => import('../views/AutoPilot.vue')
+const Convert = () => import('../views/Convert.vue')
 
 const routes = [
   { path: '/', redirect: '/stats' },
+  { path: '/autopilot', component: AutoPilot, meta: { title: '自动驾驶' } },
   { path: '/accounts', component: Accounts, meta: { title: '账号管理' } },
   { path: '/tasks', component: Tasks, meta: { title: '任务中心' } },
   { path: '/filters', component: Filters, meta: { title: '筛选配置' } },
   { path: '/gallery', component: Gallery, meta: { title: '下载画廊' } },
   { path: '/upload', component: Upload, meta: { title: '图床上传' } },
+  { path: '/convert', component: Convert, meta: { title: '格式转换' } },
   { path: '/stats', component: Stats, meta: { title: '系统监控' } },
 ]
 

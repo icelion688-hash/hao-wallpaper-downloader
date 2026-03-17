@@ -107,6 +107,7 @@ class WallpaperCrawler:
         color_theme: str = "",
         max_count: int = 100,
         page_size: int = 20,
+        session_profile: Optional[dict] = None,
     ) -> AsyncIterator[dict]:
         """
         异步迭代器：逐页爬取壁纸列表，每次 yield 一条壁纸基本信息。
@@ -123,7 +124,7 @@ class WallpaperCrawler:
         total_yielded = 0
         page = 1
 
-        async with self.anti.build_client(cookie) as client:
+        async with self.anti.build_client(cookie, profile=session_profile) as client:
             while total_yielded < max_count:
                 batch = await self._fetch_list_page(
                     client=client,
@@ -134,6 +135,7 @@ class WallpaperCrawler:
                     color_theme=color_theme,
                     page=page,
                     page_size=min(page_size, max_count - total_yielded),
+                    session_profile=session_profile,
                 )
 
                 if not batch:
@@ -165,6 +167,7 @@ class WallpaperCrawler:
         color_theme: str,
         page: int,
         page_size: int,
+        session_profile: Optional[dict] = None,
     ) -> list[dict]:
         """爬取单页列表，返回规范化后的壁纸信息列表"""
         params: dict = {
@@ -181,7 +184,7 @@ class WallpaperCrawler:
 
         enc_data = _encrypt_params(params)
         url = f"{BASE_URL}{LIST_API}"
-        headers = self.anti.build_headers(cookie)
+        headers = self.anti.build_headers(cookie, profile=session_profile)
 
         try:
             resp = await client.get(
@@ -219,6 +222,7 @@ class WallpaperCrawler:
         file_id: str = "",
         wallpaper_type_id: int = 1,
         skip_altcha: bool = False,
+        session_profile: Optional[dict] = None,
     ) -> Optional[dict]:
         """
         构造/获取壁纸下载直链。
@@ -239,9 +243,19 @@ class WallpaperCrawler:
         Returns:
             包含 download_url 的字典，或 None
         """
-        # 视频直接用 getVideoReduce，无需验证
+        # 视频：优先走 altcha + getCompleteUrl 获取原始高质量 MP4
+        # 若验证失败，回退到 getVideoReduce（低质量压缩版）
         if wallpaper_type_id not in STATIC_TYPES:
+            complete = await self._fetch_complete_url(
+                client, cookie, resource_id,
+                skip_altcha=skip_altcha,
+                session_profile=session_profile,
+            )
+            if complete:
+                return complete
+            # 回退：getVideoReduce（约 50-100 KB 压缩预览版）
             if file_id:
+                logger.warning("[Crawler] 动态图回退至 getVideoReduce: %s", resource_id)
                 return {
                     "resource_id": resource_id,
                     "download_url": f"{BASE_URL}{VIDEO_URL}/{file_id}",
@@ -250,7 +264,11 @@ class WallpaperCrawler:
             return None
 
         # 静态图：优先走 altcha + getCompleteUrl 获取原图
-        complete = await self._fetch_complete_url(client, cookie, resource_id, skip_altcha=skip_altcha)
+        complete = await self._fetch_complete_url(
+            client, cookie, resource_id,
+            skip_altcha=skip_altcha,
+            session_profile=session_profile,
+        )
         if complete:
             return complete
 
@@ -271,6 +289,7 @@ class WallpaperCrawler:
         cookie: str,
         resource_id: str,
         skip_altcha: bool = False,
+        session_profile: Optional[dict] = None,
     ) -> Optional[dict]:
         """
         altcha 人机验证 → getCompleteUrl 获取原图签名直链。
@@ -307,7 +326,10 @@ class WallpaperCrawler:
                 return None
 
         # Step 2: getCompleteUrl（验证后立即调用，签名 URL 很快过期）
-        headers = self.anti.build_headers(cookie)
+        # 轻量延迟：模拟 JS 处理 altcha 结果后发起后续请求的时序，避免毫秒级触发
+        await self.anti.pre_request_delay(0.5, 1.8)
+
+        headers = self.anti.build_headers(cookie, profile=session_profile)
         headers["token"] = token
         headers["Cache-Control"] = "no-cache"
         url = f"{BASE_URL}{COMPLETE_URL}/{resource_id}"
@@ -340,12 +362,9 @@ class WallpaperCrawler:
         file_id = str(raw.get("fileId") or "")
         wtype   = int(raw.get("type") or 1)
 
-        # 静态图留空，由 fetch_detail 走 altcha+getCompleteUrl 获取原图直链
-        # 视频直接构造 getVideoReduce URL（无需验证）
-        if wtype in STATIC_TYPES:
-            download_url = ""
-        else:
-            download_url = f"{BASE_URL}{VIDEO_URL}/{file_id}" if file_id else ""
+        # 静态图和动态图均留空，统一由 fetch_detail 走 altcha+getCompleteUrl
+        # 动态图 getCompleteUrl 失败时回退 getVideoReduce（在 fetch_detail 内处理）
+        download_url = ""
 
         # 分类 / 色系：保留原始 UUID + 映射为可读名称
         type_id  = str(raw.get("typeId")  or "")

@@ -57,12 +57,14 @@ const serverOk = ref(true)
 let healthTimer = null
 
 const navItems = [
-  { path: '/stats',    icon: '▣', label: '系统监控' },
-  { path: '/accounts', icon: '◉', label: '账号管理' },
-  { path: '/tasks',    icon: '▶', label: '任务中心' },
-  { path: '/filters',  icon: '◈', label: '筛选配置' },
-  { path: '/gallery',  icon: '⊞', label: '下载画廊' },
-  { path: '/upload',   icon: '↑', label: '图床上传' },
+  { path: '/stats',      icon: '▣', label: '系统监控' },
+  { path: '/autopilot',  icon: '◎', label: '自动驾驶' },
+  { path: '/accounts',   icon: '◉', label: '账号管理' },
+  { path: '/tasks',      icon: '▶', label: '任务中心' },
+  { path: '/filters',    icon: '◈', label: '筛选配置' },
+  { path: '/gallery',    icon: '⊞', label: '下载画廊' },
+  { path: '/upload',     icon: '↑', label: '图床上传' },
+  { path: '/convert',   icon: '⇄', label: '格式转换' },
 ]
 
 async function checkHealth() {

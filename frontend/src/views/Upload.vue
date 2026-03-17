@@ -117,6 +117,72 @@
                 <input class="input" type="number" step="0.1" v-model.number="activeProfile.image_processing.target_mb" />
               </div>
             </div>
+
+            <!-- 目录配置 -->
+            <div class="sub-section">
+              <div class="sub-section__title">上传目录配置</div>
+
+              <!-- 路径模板 -->
+              <div class="form-row form-row--full">
+                <label>
+                  路径模板
+                  <span class="label-hint">（非空时优先，支持变量）</span>
+                </label>
+                <input class="input" v-model="activeProfile.folder_pattern"
+                  placeholder="留空则按下方固定目录，例：bg/{type}/{year}/{month}" />
+              </div>
+              <div class="var-hint">
+                可用变量：
+                <code>{type}</code> 类型(static/dynamic) &nbsp;
+                <code>{category}</code> 分类名 &nbsp;
+                <code>{year}</code> 年份 &nbsp;
+                <code>{month}</code> 月份(01-12) &nbsp;
+                <code>{date}</code> 日期(20250317)
+              </div>
+
+              <!-- 固定目录（folder_pattern 为空时生效） -->
+              <div class="field-grid dir-grid">
+                <div class="form-row">
+                  <label>横图目录</label>
+                  <input class="input" v-model="activeProfile.folder_landscape" placeholder="bg/pc" />
+                </div>
+                <div class="form-row">
+                  <label>竖图目录</label>
+                  <input class="input" v-model="activeProfile.folder_portrait" placeholder="bg/mb" />
+                </div>
+                <div class="form-row">
+                  <label>动态图目录</label>
+                  <input class="input" v-model="activeProfile.folder_dynamic" placeholder="bg/dynamic" />
+                </div>
+              </div>
+            </div>
+
+            <!-- 上传过滤 -->
+            <div class="sub-section">
+              <div class="sub-section__title">上传过滤</div>
+              <div class="field-grid">
+                <div class="form-row">
+                  <label>最小宽度 (px)</label>
+                  <input class="input" type="number" min="0"
+                    :value="activeProfile.upload_filter.min_width || ''"
+                    @input="activeProfile.upload_filter.min_width = $event.target.value ? +$event.target.value : null"
+                    placeholder="不限" />
+                </div>
+                <div class="form-row">
+                  <label>最小高度 (px)</label>
+                  <input class="input" type="number" min="0"
+                    :value="activeProfile.upload_filter.min_height || ''"
+                    @input="activeProfile.upload_filter.min_height = $event.target.value ? +$event.target.value : null"
+                    placeholder="不限" />
+                </div>
+                <div class="form-row form-row--full">
+                  <label class="check-label">
+                    <input type="checkbox" v-model="activeProfile.upload_filter.only_original" />
+                    仅上传原图（跳过未通过 getCompleteUrl 的预览图）
+                  </label>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -179,12 +245,17 @@ const settings = ref({ task_profile: 'compressed_webp', profiles: [] })
 const activeProfile  = computed(() => settings.value.profiles.find(p => p.key === activeKey.value) || null)
 const enabledProfiles = computed(() => settings.value.profiles.filter(p => p.enabled))
 
+const DEFAULT_FILTER = () => ({ min_width: null, min_height: null, only_original: false })
+
 function defaultProfiles() {
   return [
     {
       key: 'compressed_webp', name: '壁纸压缩图床', enabled: true,
       base_url: 'https://imgbed.lacexr.com', api_token: '',
       channel: 'telegram', server_compress: true,
+      folder_landscape: 'bg/pc', folder_portrait: 'bg/mb',
+      folder_dynamic: 'bg/dynamic', folder_pattern: '',
+      upload_filter: DEFAULT_FILTER(),
       image_processing: {
         enabled: true, telegram_only: false, format: 'webp',
         quality: 86, min_quality: 72, threshold_mb: 5, target_mb: 4, disable_above_mb: 10,
@@ -194,6 +265,9 @@ function defaultProfiles() {
       key: 'original_lossless', name: '原图无损图床', enabled: false,
       base_url: 'https://imgbed.lacexr.com', api_token: '',
       channel: 'huggingface', server_compress: false,
+      folder_landscape: 'bg/pc', folder_portrait: 'bg/mb',
+      folder_dynamic: 'bg/dynamic', folder_pattern: '',
+      upload_filter: { ...DEFAULT_FILTER(), only_original: true },
       image_processing: {
         enabled: false, telegram_only: false, format: 'original',
         quality: 100, min_quality: 100, threshold_mb: 5, target_mb: 4, disable_above_mb: 10,
@@ -224,7 +298,11 @@ async function loadSettings() {
     task_profile: res.task_profile || 'compressed_webp',
     profiles: (res.profiles || fallback).map(p => {
       const base = fallback.find(f => f.key === p.key) || fallback[0]
-      return { ...base, ...p, image_processing: { ...base.image_processing, ...(p.image_processing || {}) } }
+      return {
+        ...base, ...p,
+        image_processing: { ...base.image_processing, ...(p.image_processing || {}) },
+        upload_filter: { ...DEFAULT_FILTER(), ...(p.upload_filter || {}) },
+      }
     }),
   }
   if (!settings.value.profiles.find(p => p.key === activeKey.value)) {
@@ -337,9 +415,37 @@ onMounted(loadSettings)
 .check-label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
 .check-label input { accent-color: var(--accent); }
 
+/* 目录配置 / 上传过滤子区块 */
+.sub-section {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 16px; border-radius: var(--radius);
+  background: var(--bg-base); border: 1px solid var(--border);
+}
+.sub-section__title {
+  font-size: 12px; font-weight: 600; color: var(--text-2);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px;
+}
+.label-hint { font-size: 11px; font-weight: 400; color: var(--text-3); margin-left: 4px; }
+
+.var-hint {
+  font-size: 11px; color: var(--text-3); line-height: 1.8;
+  padding: 6px 10px; background: var(--bg-hover); border-radius: var(--radius);
+  font-family: var(--font-ui);
+}
+.var-hint code {
+  font-family: var(--font-mono, monospace); color: var(--accent);
+  background: transparent; font-size: 11px;
+}
+
+.dir-grid { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+
+@media (max-width: 900px) { .dir-grid { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) {
   .profile-layout { flex-direction: column; }
   .profile-list { width: 100%; border-right: none; border-bottom: 1px solid var(--border); flex-direction: row; flex-wrap: wrap; }
   .field-grid { grid-template-columns: 1fr; }
+  .dir-grid { grid-template-columns: 1fr; }
 }
+
+
 </style>
