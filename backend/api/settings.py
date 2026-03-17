@@ -24,6 +24,12 @@ class ImageProcessingPayload(BaseModel):
     disable_above_mb: float = Field(default=10, gt=0)
 
 
+class UploadFilterPayload(BaseModel):
+    min_width: Optional[int] = Field(default=None, ge=0)
+    min_height: Optional[int] = Field(default=None, ge=0)
+    only_original: bool = False
+
+
 class UploadProfilePayload(BaseModel):
     key: str
     name: str
@@ -32,11 +38,17 @@ class UploadProfilePayload(BaseModel):
     api_token: str
     channel: str = "telegram"
     server_compress: bool = False
+    folder_landscape: str = ""
+    folder_portrait: str = ""
+    folder_dynamic: str = ""
+    folder_pattern: str = ""
+    upload_filter: UploadFilterPayload = UploadFilterPayload()
     image_processing: ImageProcessingPayload = ImageProcessingPayload()
 
 
 class UploadSettingsPayload(BaseModel):
     task_profile: str
+    gallery_default_format: str = "profile"
     profiles: List[UploadProfilePayload]
 
 

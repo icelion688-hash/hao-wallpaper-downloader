@@ -1,59 +1,82 @@
 @echo off
+setlocal
 chcp 65001 >nul
-title 好壁纸下载器
+title HaoWallpaper Downloader
+
+set "ROOT_DIR=%~dp0"
+cd /d "%ROOT_DIR%"
 
 echo ========================================
-echo   好壁纸下载器 - 一键启动
+echo   HaoWallpaper Downloader - Start
 echo ========================================
 echo.
 
-:: 检查 Python
-python --version >nul 2>&1
+set "PYTHON_EXE=python"
+set "DEPS_OK=1"
+
+%PYTHON_EXE% --version >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未检测到 Python，请先安装 Python 3.10+
+    echo [ERROR] Python 3.10+ was not found.
     pause
     exit /b 1
 )
 
-:: 检查并安装依赖
-echo [1/3] 检查 Python 依赖...
-pip show fastapi >nul 2>&1
-if errorlevel 1 (
-    echo      正在安装依赖，请稍等...
-    pip install -r requirements.txt -q
+echo [1/3] Checking Python dependencies...
+for %%M in (fastapi uvicorn sqlalchemy httpx yaml multipart aiofiles Crypto PIL tzdata imageio imageio_ffmpeg) do (
+    %PYTHON_EXE% -c "import %%M" >nul 2>&1
+    if errorlevel 1 set "DEPS_OK=0"
 )
-echo      依赖就绪 ✓
 
-:: 检查 Node.js 和前端
-echo [2/3] 检查前端...
+if "%DEPS_OK%"=="0" (
+    echo      Missing dependencies detected. Installing requirements.txt ...
+    pip install -r "requirements.txt"
+    if errorlevel 1 (
+        echo [ERROR] Failed to install Python dependencies.
+        pause
+        exit /b 1
+    )
+) else (
+    echo      Python dependencies are ready.
+)
+
+echo [2/3] Checking frontend...
 node --version >nul 2>&1
 if errorlevel 1 (
-    echo      [提示] 未检测到 Node.js，将跳过前端构建
-    echo      后端服务仍可正常使用，API 地址: http://localhost:8000
+    echo      [INFO] Node.js was not found. Frontend build will be skipped.
+    echo      Backend API is still available at: http://localhost:8000
     goto start_backend
 )
 
 if not exist "frontend\dist" (
-    echo      正在构建前端，请稍等...
-    cd frontend
+    echo      Building frontend...
+    cd /d "%ROOT_DIR%frontend"
     call npm install -q
+    if errorlevel 1 (
+        echo [ERROR] Failed to install frontend dependencies.
+        pause
+        exit /b 1
+    )
     call npm run build
-    cd ..
-    echo      前端构建完成 ✓
+    if errorlevel 1 (
+        echo [ERROR] Frontend build failed.
+        pause
+        exit /b 1
+    )
+    cd /d "%ROOT_DIR%"
+    echo      Frontend build completed.
 ) else (
-    echo      前端已构建 ✓
+    echo      Frontend is already built.
 )
 
 :start_backend
-echo [3/3] 启动后端服务...
+echo [3/3] Starting backend service...
 echo.
 echo ========================================
-echo   服务地址: http://localhost:8000
-echo   按 Ctrl+C 停止服务
+echo   URL: http://localhost:8000
+echo   Press Ctrl+C to stop
 echo ========================================
 echo.
 
-:: 从项目根目录启动，确保模块路径正确
-python -m backend.main
+%PYTHON_EXE% -m backend.main
 
 pause

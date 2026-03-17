@@ -220,6 +220,7 @@ class ImgbedUploader:
         wallpaper_type: str = "static",
         category: str = "",
         is_original: bool = False,
+        format_override: Optional[str] = None,
     ) -> Optional[str]:
         if not os.path.exists(local_path):
             logger.warning("[Imgbed] file not found: %s", local_path)
@@ -243,7 +244,7 @@ class ImgbedUploader:
 
         upload_path = local_path
         upload_name = os.path.basename(local_path)
-        temp_path = self._prepare_upload_file(local_path)
+        temp_path = self._prepare_upload_file(local_path, format_override=format_override)
         if temp_path:
             upload_path = temp_path
             upload_name = os.path.basename(temp_path)
@@ -312,16 +313,27 @@ class ImgbedUploader:
                 except OSError:
                     logger.warning("[Imgbed] failed to remove temp file: %s", temp_path)
 
-    def _prepare_upload_file(self, local_path: str) -> Optional[str]:
+    def _prepare_upload_file(
+        self,
+        local_path: str,
+        format_override: Optional[str] = None,
+    ) -> Optional[str]:
         cfg = self.image_processing
-        if not cfg.enabled:
+        override = str(format_override or "").strip().lower()
+
+        if override == "original":
             return None
-        if cfg.telegram_only and self.channel.lower() != "telegram":
+        if not cfg.enabled and override != "webp":
             return None
-        if cfg.format == "original":
+        if not override and cfg.telegram_only and self.channel.lower() != "telegram":
             return None
-        if cfg.format != "webp":
-            logger.warning("[Imgbed] unsupported local format: %s", cfg.format)
+        target_format = override or cfg.format
+        if target_format == "original":
+            return None
+        if target_format != "webp":
+            logger.warning("[Imgbed] unsupported local format: %s", target_format)
+            return None
+        if os.path.splitext(local_path)[1].lower() == ".webp":
             return None
 
         size_mb = os.path.getsize(local_path) / (1024 * 1024)

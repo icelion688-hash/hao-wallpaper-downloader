@@ -23,6 +23,14 @@
               </option>
             </select>
           </div>
+          <div class="form-row">
+            <label>画廊批量上传默认格式</label>
+            <select class="select" v-model="settings.gallery_default_format">
+              <option v-for="item in uploadFormatOptions" :key="item.value" :value="item.value">
+                {{ item.label }}
+              </option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -183,44 +191,46 @@
                 </div>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
 
-      <!-- 批量上传 -->
-      <div class="card section-card">
-        <div class="card-header">批量上传</div>
-        <div class="section-body">
-          <div class="batch-row">
-            <div class="batch-form">
-              <div class="form-row">
-                <label>选择 Profile</label>
-                <select class="select" v-model="batchProfileKey">
-                  <option value="">请选择</option>
-                  <option v-for="p in enabledProfiles" :key="p.key" :value="p.key">
-                    {{ p.name }} / {{ p.channel }}
-                  </option>
-                </select>
+            <div class="sub-section">
+              <div class="sub-section__title">批量上传</div>
+              <div class="batch-inline-head">
+                <span class="tag tag--info">{{ activeProfile.name }}</span>
+                <span class="batch-inline-meta">{{ activeProfile.channel }} / {{ activeProfile.enabled ? '已启用' : '未启用' }}</span>
               </div>
-              <div class="form-row">
-                <label>筛选分类（留空=全部）</label>
-                <input class="input" v-model="batchCategory" placeholder="动漫｜二次元" />
+              <div class="field-grid">
+                <div class="form-row">
+                  <label>筛选分类（留空=全部）</label>
+                  <input class="input" v-model="batchCategory" placeholder="动漫｜二次元" />
+                </div>
+                <div class="form-row">
+                  <label>本次上传格式</label>
+                  <select class="select" v-model="batchUploadFormat">
+                    <option v-for="item in uploadFormatOptions" :key="item.value" :value="item.value">
+                      {{ item.label }}
+                    </option>
+                  </select>
+                  <div class="batch-hint">{{ batchFormatHint }}</div>
+                </div>
               </div>
-              <label class="check-label" style="margin-top:8px">
+              <label class="check-label">
                 <input type="checkbox" v-model="batchOnlyNew" />
-                仅上传尚未上传该 Profile 的壁纸
+                仅上传尚未上传该 Profile 同格式版本的壁纸
               </label>
+              <div class="batch-inline-actions">
+                <button class="btn btn--primary" @click="batchUpload" :disabled="uploading || !activeProfile?.enabled">
+                  {{ uploading ? '上传中…' : '使用当前 Profile 开始批量上传' }}
+                </button>
+                <span class="batch-inline-warn" v-if="!activeProfile?.enabled">当前 Profile 未启用，无法上传</span>
+              </div>
+              <div class="upload-result" v-if="uploadResult">
+                <span class="result-ok">✓ 成功 {{ uploadResult.success_count }}</span>
+                <span class="result-skip">— 跳过 {{ uploadResult.skipped_count }}</span>
+                <span class="result-fail" v-if="uploadResult.failed_count">✗ 失败 {{ uploadResult.failed_count }}</span>
+                <span class="result-format">格式: {{ uploadResult.upload_format_label || formatUploadFormatLabel(batchUploadFormat) }}</span>
+                <span class="result-profile">Profile: {{ uploadResult.profile_name }}</span>
+              </div>
             </div>
-            <button class="btn btn--primary batch-upload-btn" @click="batchUpload" :disabled="uploading || !batchProfileKey">
-              {{ uploading ? '上传中…' : '开始批量上传' }}
-            </button>
-          </div>
-
-          <div class="upload-result" v-if="uploadResult">
-            <span class="result-ok">✓ 成功 {{ uploadResult.success_count }}</span>
-            <span class="result-skip">— 跳过 {{ uploadResult.skipped_count }}</span>
-            <span class="result-fail" v-if="uploadResult.failed_count">✗ 失败 {{ uploadResult.failed_count }}</span>
-            <span class="result-profile">Profile: {{ uploadResult.profile_name }}</span>
           </div>
         </div>
       </div>
@@ -231,86 +241,63 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { galleryApi, settingsApi } from '../api'
+import {
+  applyCompressedUploadProfile,
+  applyLosslessUploadProfile,
+  formatUploadFormatLabel,
+  isLosslessUploadProfile,
+  normalizeUploadFormat,
+  normalizeUploadSettings,
+  uploadFormatOptions,
+} from '../utils/uploadProfiles'
 
 const saving       = ref(false)
 const uploading    = ref(false)
 const activeKey    = ref('compressed_webp')
-const batchProfileKey = ref('')
+const batchUploadFormat = ref('profile')
 const batchCategory   = ref('')
 const batchOnlyNew    = ref(true)
 const uploadResult    = ref(null)
 
-const settings = ref({ task_profile: 'compressed_webp', profiles: [] })
+const settings = ref({ task_profile: 'compressed_webp', gallery_default_format: 'profile', profiles: [] })
 
 const activeProfile  = computed(() => settings.value.profiles.find(p => p.key === activeKey.value) || null)
-const enabledProfiles = computed(() => settings.value.profiles.filter(p => p.enabled))
 
-const DEFAULT_FILTER = () => ({ min_width: null, min_height: null, only_original: false })
-
-function defaultProfiles() {
-  return [
-    {
-      key: 'compressed_webp', name: '壁纸压缩图床', enabled: true,
-      base_url: 'https://imgbed.lacexr.com', api_token: '',
-      channel: 'telegram', server_compress: true,
-      folder_landscape: 'bg/pc', folder_portrait: 'bg/mb',
-      folder_dynamic: 'bg/dynamic', folder_pattern: '',
-      upload_filter: DEFAULT_FILTER(),
-      image_processing: {
-        enabled: true, telegram_only: false, format: 'webp',
-        quality: 86, min_quality: 72, threshold_mb: 5, target_mb: 4, disable_above_mb: 10,
-      },
-    },
-    {
-      key: 'original_lossless', name: '原图无损图床', enabled: false,
-      base_url: 'https://imgbed.lacexr.com', api_token: '',
-      channel: 'huggingface', server_compress: false,
-      folder_landscape: 'bg/pc', folder_portrait: 'bg/mb',
-      folder_dynamic: 'bg/dynamic', folder_pattern: '',
-      upload_filter: { ...DEFAULT_FILTER(), only_original: true },
-      image_processing: {
-        enabled: false, telegram_only: false, format: 'original',
-        quality: 100, min_quality: 100, threshold_mb: 5, target_mb: 4, disable_above_mb: 10,
-      },
-    },
-  ]
-}
+const batchFormatHint = computed(() => {
+  switch (normalizeUploadFormat(batchUploadFormat.value)) {
+    case 'original':
+      return '直接上传原始文件，不额外套用 Profile 的本地格式处理。'
+    case 'webp':
+      return '静态图可直接压缩为 WebP；动态图建议先在格式转换页生成动态 WebP。'
+    case 'gif':
+      return '仅上传 GIF 文件；如果当前没有 GIF，请先到格式转换页生成。'
+    case 'png':
+    case 'jpg':
+      return '仅上传对应格式文件；如果当前没有该格式，请先到格式转换页生成。'
+    default:
+      return '跟随当前 Profile 的默认上传策略，最适合日常批量上传。'
+  }
+})
 
 function isLossless(p) {
-  return p?.image_processing?.format === 'original' || !p?.image_processing?.enabled
+  return isLosslessUploadProfile(p)
 }
 
 function applyLossless(p) {
-  p.server_compress = false
-  p.image_processing.enabled = false
-  p.image_processing.format = 'original'
+  applyLosslessUploadProfile(p)
 }
 
 function applyCompressed(p) {
-  p.image_processing.enabled = true
-  p.image_processing.format = 'webp'
+  applyCompressedUploadProfile(p)
 }
 
 async function loadSettings() {
   const res = await settingsApi.getUploads()
-  const fallback = defaultProfiles()
-  settings.value = {
-    task_profile: res.task_profile || 'compressed_webp',
-    profiles: (res.profiles || fallback).map(p => {
-      const base = fallback.find(f => f.key === p.key) || fallback[0]
-      return {
-        ...base, ...p,
-        image_processing: { ...base.image_processing, ...(p.image_processing || {}) },
-        upload_filter: { ...DEFAULT_FILTER(), ...(p.upload_filter || {}) },
-      }
-    }),
-  }
+  settings.value = normalizeUploadSettings(res)
   if (!settings.value.profiles.find(p => p.key === activeKey.value)) {
     activeKey.value = settings.value.profiles[0]?.key || ''
   }
-  if (!batchProfileKey.value) {
-    batchProfileKey.value = settings.value.task_profile
-  }
+  batchUploadFormat.value = settings.value.gallery_default_format
 }
 
 async function saveSettings() {
@@ -318,21 +305,24 @@ async function saveSettings() {
   try {
     const res = await settingsApi.setUploads({
       task_profile: settings.value.task_profile,
+      gallery_default_format: normalizeUploadFormat(settings.value.gallery_default_format),
       profiles: settings.value.profiles.map(p => ({ ...p, image_processing: { ...p.image_processing } })),
     })
-    settings.value = res.uploads
+    settings.value = normalizeUploadSettings(res.uploads)
+    batchUploadFormat.value = normalizeUploadFormat(settings.value.gallery_default_format)
   } finally {
     saving.value = false
   }
 }
 
 async function batchUpload() {
-  if (!batchProfileKey.value) return
+  if (!activeProfile.value?.key || !activeProfile.value?.enabled) return
   uploading.value = true
   uploadResult.value = null
   try {
     const res = await galleryApi.batchUpload({
-      profile_key:      batchProfileKey.value,
+      profile_key:      activeProfile.value.key,
+      upload_format:    normalizeUploadFormat(batchUploadFormat.value),
       upload_scope:     'filtered',
       category:         batchCategory.value || undefined,
       only_not_uploaded: batchOnlyNew.value,
@@ -397,10 +387,35 @@ onMounted(loadSettings)
 .chk { accent-color: var(--accent); width: 15px; height: 15px; }
 
 /* 批量上传 */
-.batch-row { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
-.batch-form { flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 10px; }
-
-.batch-upload-btn { height: 40px; padding: 0 24px; white-space: nowrap; align-self: flex-end; }
+.batch-inline-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.batch-inline-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--font-ui);
+}
+.batch-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.batch-inline-warn {
+  font-size: 11px;
+  color: var(--orange);
+  font-family: var(--font-ui);
+}
+.batch-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.6;
+  font-family: var(--font-ui);
+}
 
 .upload-result {
   display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
@@ -410,6 +425,7 @@ onMounted(loadSettings)
 .result-ok     { color: var(--green); }
 .result-skip   { color: var(--text-2); }
 .result-fail   { color: var(--red); }
+.result-format { color: var(--accent); }
 .result-profile { color: var(--text-3); margin-left: auto; font-size: 11px; }
 
 .check-label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }

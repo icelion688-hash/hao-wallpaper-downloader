@@ -19,9 +19,13 @@ from backend.core.dedup import DedupManager
 from backend.core.downloader import DOWNLOAD_ROOT
 from backend.core.upload_profiles import build_uploader_by_key, list_upload_profiles
 from backend.core.upload_record_helper import (
+    UPLOAD_FORMAT_LABELS,
     build_upload_record,
+    build_upload_record_key,
     dump_upload_records,
     find_reusable_upload_record,
+    get_upload_record,
+    normalize_upload_format,
     parse_upload_records,
 )
 from backend.models.database import get_db
@@ -135,12 +139,66 @@ def _w_to_dict(w: Wallpaper) -> dict:
 
 class BatchUploadRequest(BaseModel):
     profile_key: str
+    upload_format: str = "profile"
     wallpaper_ids: list[int] = Field(default_factory=list)
     upload_scope: str = "selected"
     category: Optional[str] = None
     wallpaper_type: Optional[str] = None
     search: Optional[str] = None
     only_not_uploaded: bool = True
+
+
+def _path_ext_to_upload_format(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".webp": "webp",
+        ".gif": "gif",
+        ".png": "png",
+        ".jpg": "jpg",
+        ".jpeg": "jpg",
+    }.get(ext, "original")
+
+
+def _resolve_upload_asset(
+    wallpaper: Wallpaper,
+    upload_format: str,
+) -> tuple[Optional[str], Optional[str], str]:
+    """
+    返回 (upload_path, format_override, reason)。
+
+    format_override:
+    - profile: 跟随 Profile 默认行为
+    - original: 直接上传给定文件，不做额外本地预处理
+    - webp: 对原始静态图强制做一次本地 WebP 预处理
+    """
+    original_abs = os.path.join(DOWNLOAD_ROOT, wallpaper.local_path) if wallpaper.local_path else None
+    converted_abs = (
+        os.path.join(DOWNLOAD_ROOT, wallpaper.converted_path)
+        if wallpaper.converted_path else None
+    )
+    normalized = normalize_upload_format(upload_format)
+
+    if normalized == "profile":
+        return original_abs, "profile", ""
+
+    if not original_abs or not os.path.exists(original_abs):
+        return None, None, "原始文件不存在"
+
+    original_format = _path_ext_to_upload_format(original_abs)
+    if normalized == "original" or original_format == normalized:
+        return original_abs, "original", ""
+
+    if converted_abs and os.path.exists(converted_abs):
+        converted_format = _path_ext_to_upload_format(converted_abs)
+        if converted_format == normalized:
+            return converted_abs, "original", ""
+
+    if normalized == "webp" and wallpaper.wallpaper_type != "dynamic":
+        return original_abs, "webp", ""
+
+    if wallpaper.wallpaper_type == "dynamic":
+        return None, None, f"当前是动态图，请先转换出 {UPLOAD_FORMAT_LABELS[normalized]} 再上传"
+    return None, None, f"当前未找到可上传的 {UPLOAD_FORMAT_LABELS[normalized]} 文件"
 
 
 class BatchDeleteRequest(BaseModel):
@@ -266,6 +324,8 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
     profile = next((item for item in list_upload_profiles() if item.get("key") == body.profile_key), None)
     if not profile:
         raise HTTPException(404, f"上传配置不存在: {body.profile_key}")
+    upload_format = normalize_upload_format(body.upload_format)
+    format_label = UPLOAD_FORMAT_LABELS[upload_format]
 
     if body.upload_scope == "selected":
         if not body.wallpaper_ids:
@@ -301,9 +361,10 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
             continue
 
         records = parse_upload_records(wallpaper.upload_records)
-        existing_self = records.get(body.profile_key, {})
+        record_key = build_upload_record_key(body.profile_key, upload_format)
+        existing_self = get_upload_record(records, body.profile_key, upload_format) or {}
         if existing_self.get("url"):
-            skipped_items.append({"id": wallpaper.id, "reason": "该配置已上传"})
+            skipped_items.append({"id": wallpaper.id, "reason": f"该 Profile 的 {format_label} 已上传"})
             continue
 
         reusable_record = find_reusable_upload_record(
@@ -312,37 +373,50 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
             sha256=wallpaper.sha256,
             md5=wallpaper.md5,
             exclude_wallpaper_id=wallpaper.id,
+            format_key=upload_format,
         )
         if reusable_record:
-            records[body.profile_key] = reusable_record
+            records[record_key] = reusable_record
             wallpaper.upload_records = dump_upload_records(records)
             if not wallpaper.imgbed_url:
                 wallpaper.imgbed_url = reusable_record.get("url")
-            skipped_items.append({"id": wallpaper.id, "reason": "发现同哈希图片，已复用已有上传链接"})
+            skipped_items.append({"id": wallpaper.id, "reason": f"发现同哈希的 {format_label} 上传记录，已复用现有链接"})
+            continue
+
+        upload_path, format_override, reason = _resolve_upload_asset(wallpaper, upload_format)
+        if not upload_path or not format_override:
+            skipped_items.append({"id": wallpaper.id, "reason": reason or "未找到可上传文件"})
             continue
 
         url = await uploader.upload(
-            abs_path,
+            upload_path,
             width=wallpaper.width,
             height=wallpaper.height,
             wallpaper_type=wallpaper.wallpaper_type or "static",
             category=wallpaper.category or "",
             is_original=bool(wallpaper.is_original),
+            format_override=format_override,
         )
         if not url:
-            failed_items.append({"id": wallpaper.id, "reason": "上传失败"})
+            failed_items.append({"id": wallpaper.id, "reason": f"{format_label} 上传失败"})
             continue
 
-        records[body.profile_key] = build_upload_record(
+        records[record_key] = build_upload_record(
             profile_key=body.profile_key,
             profile_name=profile.get("name", body.profile_key),
             channel=profile.get("channel", ""),
             url=url,
+            format_key=upload_format,
         )
         wallpaper.upload_records = dump_upload_records(records)
         if not wallpaper.imgbed_url:
             wallpaper.imgbed_url = url
-        success_items.append({"id": wallpaper.id, "url": url})
+        success_items.append({
+            "id": wallpaper.id,
+            "url": url,
+            "format_key": upload_format,
+            "format_label": format_label,
+        })
 
     db.commit()
 
@@ -350,6 +424,8 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
         "success": True,
         "profile_key": body.profile_key,
         "profile_name": profile.get("name"),
+        "upload_format": upload_format,
+        "upload_format_label": format_label,
         "total": len(wallpapers),
         "success_count": len(success_items),
         "failed_count": len(failed_items),

@@ -68,6 +68,9 @@ def _normalize_upload_profiles(cfg: dict) -> None:
 
     uploads["profiles"] = normalized
     uploads.setdefault("task_profile", normalized[0]["key"])
+    uploads["gallery_default_format"] = str(
+        uploads.get("gallery_default_format", "profile") or "profile"
+    ).lower()
 
     # 兼容旧字段，始终同步为任务默认图床
     task_profile = next((p for p in normalized if p["key"] == uploads["task_profile"]), normalized[0])
@@ -83,13 +86,22 @@ def _default_upload_profile_template(key: str | None = None) -> dict:
         "api_token": "",
         "channel": "telegram",
         "server_compress": False,
-            "image_processing": {
-                "enabled": False,
-                "telegram_only": False,
-                "format": "original",
-                "quality": 86,
-                "min_quality": 72,
-                "threshold_mb": 5,
+        "folder_landscape": "bg/pc",
+        "folder_portrait": "bg/mb",
+        "folder_dynamic": "bg/dynamic",
+        "folder_pattern": "",
+        "upload_filter": {
+            "min_width": None,
+            "min_height": None,
+            "only_original": False,
+        },
+        "image_processing": {
+            "enabled": False,
+            "telegram_only": False,
+            "format": "original",
+            "quality": 86,
+            "min_quality": 72,
+            "threshold_mb": 5,
             "target_mb": 4,
             "disable_above_mb": 10,
         },
@@ -106,6 +118,15 @@ def _default_upload_profiles() -> list[dict]:
             "api_token": "",
             "channel": "telegram",
             "server_compress": True,
+            "folder_landscape": "bg/pc",
+            "folder_portrait": "bg/mb",
+            "folder_dynamic": "bg/dynamic",
+            "folder_pattern": "",
+            "upload_filter": {
+                "min_width": None,
+                "min_height": None,
+                "only_original": False,
+            },
             "image_processing": {
                 "enabled": True,
                 "telegram_only": False,
@@ -125,6 +146,15 @@ def _default_upload_profiles() -> list[dict]:
             "api_token": "",
             "channel": "huggingface",
             "server_compress": False,
+            "folder_landscape": "bg/pc",
+            "folder_portrait": "bg/mb",
+            "folder_dynamic": "bg/dynamic",
+            "folder_pattern": "",
+            "upload_filter": {
+                "min_width": None,
+                "min_height": None,
+                "only_original": True,
+            },
             "image_processing": {
                 "enabled": False,
                 "telegram_only": False,
@@ -152,6 +182,7 @@ def _default_config() -> dict:
         "imgbed": _default_upload_profiles()[0],
         "uploads": {
             "task_profile": "compressed_webp",
+            "gallery_default_format": "profile",
             "profiles": _default_upload_profiles(),
         },
     }

@@ -310,7 +310,7 @@
             <div class="upload-badges" v-if="Object.keys(w.upload_records || {}).length">
               <a v-for="(rec, key) in w.upload_records" :key="key"
                 class="upload-badge" :href="rec.url" target="_blank" rel="noreferrer">
-                {{ rec.profile_name || key }}
+                {{ rec.profile_name || key }}<template v-if="rec.format_key && rec.format_key !== 'profile'"> · {{ rec.format_label || rec.format_key.toUpperCase() }}</template>
               </a>
             </div>
           </div>
