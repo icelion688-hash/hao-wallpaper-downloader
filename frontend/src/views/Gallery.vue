@@ -248,8 +248,8 @@
                 <span class="video-hint-text" v-if="w.file_url">悬停播放</span>
                 <span class="video-duration" v-if="w.video_duration">{{ fmtDuration(w.video_duration) }}</span>
               </div>
-              <!-- 已转换标记 -->
-              <div v-if="w.converted_url" class="converted-badge">WebP</div>
+              <!-- 已转换标记 + 浏览器查看 -->
+              <div v-if="w.converted_url" class="converted-badge" @click.stop="openInBrowser(w.converted_url)" title="在浏览器中直接查看动态 WebP">WebP ↗</div>
             </template>
 
             <!-- 静态图 -->
@@ -265,13 +265,14 @@
               <div class="img-placeholder" :class="{ 'img-placeholder--hidden': w.converted_url || w.file_url }">
                 <span>○</span>
               </div>
-              <div v-if="w.converted_url" class="converted-badge">WebP</div>
+              <div v-if="w.converted_url" class="converted-badge" @click.stop="openInBrowser(w.converted_url)" title="在浏览器中直接查看">WebP ↗</div>
             </template>
 
             <div class="img-overlay">
               <span class="res-badge font-mono">{{ w.resolution }}</span>
               <div class="overlay-actions">
                 <button class="btn btn--sm convert-btn" @click.stop="convertOne(w)" title="转换格式">⇄</button>
+                <a v-if="w.file_url" class="btn btn--sm" :href="encodeFileUrl(w.file_url)" target="_blank" @click.stop title="在浏览器查看原文件">↗</a>
                 <button class="btn btn--sm btn--danger del-btn" @click.stop="deleteWallpaper(w.id)">删除</button>
               </div>
             </div>
@@ -505,6 +506,10 @@ function toggleSelectCurrentPage(checked) {
 
 // ── 格式转换 ───────────────────────────────────────
 const converting = ref(false)
+
+function openInBrowser(url) {
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
 
 async function convertOne(w) {
   converting.value = true

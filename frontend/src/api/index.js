@@ -80,7 +80,9 @@ export const settingsApi = {
 }
 
 export const convertApi = {
-  batchConvert: (data) => http.post('/gallery/convert/batch', data, { timeout: 0 }),
+  batchConvert: (data) => http.post('/gallery/convert/batch', data),
+  queueStatus: () => http.get('/gallery/convert/queue'),
+  batchStatus: (batchId) => http.get(`/gallery/convert/queue/${batchId}`),
 }
 
 export const autopilotApi = {

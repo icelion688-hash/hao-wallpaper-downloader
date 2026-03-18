@@ -11,6 +11,7 @@ from typing import Optional
 
 import httpx
 
+from backend.core.anti_detection import AntiDetection
 from backend.core.captcha_solver import AltchaSolver
 
 BASE_URL = "https://haowallpaper.com"
@@ -36,19 +37,12 @@ def build_auth_headers(
     cookie: str,
     referer: str = "https://haowallpaper.com/",
     extra: Optional[dict] = None,
+    session_profile: Optional[dict] = None,
 ) -> dict:
     """构建与官网前端一致的登录态请求头。"""
-    headers = {
-        "Cookie": cookie,
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Referer": referer,
-        "Accept": "application/json, text/plain, */*",
-        "Cache-Control": "no-cache",
-    }
+    anti = AntiDetection(use_proxy=False)
+    headers = anti.build_headers(cookie, referer=referer, profile=session_profile)
+    headers["Cache-Control"] = "no-cache"
     token = extract_token(cookie)
     if token:
         headers["token"] = token
@@ -71,6 +65,7 @@ def _parse_wrapper_message(resp: httpx.Response) -> str:
 async def probe_login_status(
     client: httpx.AsyncClient,
     cookie: str,
+    session_profile: Optional[dict] = None,
 ) -> tuple[Optional[bool], str]:
     """
     探测账号登录态。
@@ -80,7 +75,7 @@ async def probe_login_status(
         (False, msg): 站点确认未授权 / cookie 失效
         (None, msg): 网络异常或限流，状态未知
     """
-    headers = build_auth_headers(cookie)
+    headers = build_auth_headers(cookie, session_profile=session_profile)
 
     try:
         resp = await client.get(AUTH_PROBE_URL, headers=headers, timeout=10)
@@ -112,6 +107,7 @@ async def probe_original_access(
     cookie: str,
     captcha_solver: AltchaSolver,
     wallpaper_id: str = ORIGINAL_ACCESS_TEST_WALLPAPER_ID,
+    session_profile: Optional[dict] = None,
 ) -> tuple[Optional[bool], int | None, str]:
     """
     探测账号是否能获取原图直链。
@@ -121,11 +117,17 @@ async def probe_original_access(
         (False, 401, msg): 登录有效但无法获取原图
         (None, code, msg): 网络异常或状态未知
     """
-    verified = await captcha_solver.verify_download(client, cookie)
+    extra_headers = build_auth_headers(cookie, session_profile=session_profile)
+    verified = await captcha_solver.verify_download(
+        client,
+        cookie,
+        extra_headers=extra_headers,
+        ua=session_profile.get("ua") if session_profile else None,
+    )
     if not verified:
         return None, None, "altcha 验证失败"
 
-    headers = build_auth_headers(cookie)
+    headers = build_auth_headers(cookie, session_profile=session_profile)
     try:
         resp = await client.get(
             f"{COMPLETE_URL}/{wallpaper_id}",

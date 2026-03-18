@@ -34,20 +34,9 @@ from backend.models.wallpaper import Wallpaper
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# 全局转换信号量：防止批量转换任务并发过多占满 CPU/内存
-# 实际上限从 config media_convert.max_concurrent 读取，首次请求时懒初始化
-_convert_sem: Optional[asyncio.Semaphore] = None
-_convert_sem_size: int = 0
-
-
-def _get_convert_sem() -> asyncio.Semaphore:
-    global _convert_sem, _convert_sem_size
-    from backend.config import load_config as _lc
-    size = int(_lc().get("media_convert", {}).get("max_concurrent", 1))
-    if _convert_sem is None or _convert_sem_size != size:
-        _convert_sem = asyncio.Semaphore(size)
-        _convert_sem_size = size
-    return _convert_sem
+def _get_convert_queue():
+    from backend.core.convert_queue import get_convert_queue
+    return get_convert_queue()
 
 
 def _apply_filters(
@@ -509,70 +498,29 @@ async def clean_duplicates(dry_run: bool = False, db: Session = Depends(get_db))
 
 # ── 批量格式转换 ─────────────────────────────────────────
 
+# 转换预设（覆盖 media_convert 配置中对应字段）
+_CONVERT_PRESETS: dict[str, dict] = {
+    "original": {"fps": 0, "max_width": 0, "max_frames": 0, "quality": 90},
+    "standard": {"fps": 30, "max_width": 1280, "max_frames": 120, "quality": 80},
+    "lite":     {"fps": 8,  "max_width": 854,  "max_frames": 30,  "quality": 65},
+}
+
+
 class BatchConvertRequest(BaseModel):
     scope: str = "selected"                # "selected" | "all" | "dynamic" | "static"
     wallpaper_ids: list[int] = Field(default_factory=list)
     # 使用全局 media_convert 配置；以下字段可覆盖
     output_format: Optional[str] = None    # 覆盖输出格式
     delete_original: Optional[bool] = None # 覆盖是否删除原文件
-
-
-def _do_convert_wallpaper(
-    wallpaper_id: int,
-    abs_path: str,
-    wallpaper_type: str,
-    media_cfg: dict,
-    delete_original_override: Optional[bool],
-    output_format_override: Optional[str],
-    timeout_seconds_override: Optional[int] = None,
-) -> dict:
-    """
-    同步转换单张壁纸（在线程池中执行）。
-    返回 {"id": ..., "status": "ok"|"skip"|"fail", "converted_path": ...}
-    """
-    from backend.core.media_converter import MediaConverter, VideoConvertConfig, ImageConvertConfig
-
-    is_video = wallpaper_type == "dynamic"
-    cfg_key = "video" if is_video else "image"
-    cfg_dict = dict(media_cfg.get(cfg_key, {}))
-    cfg_dict["enabled"] = True  # 手动触发时强制 enabled
-    if output_format_override is not None:
-        cfg_dict["output_format"] = output_format_override
-    if delete_original_override is not None:
-        cfg_dict["delete_original"] = delete_original_override
-    if timeout_seconds_override is not None:
-        cfg_dict["timeout_seconds"] = timeout_seconds_override
-
-    if is_video:
-        mc = MediaConverter(video_config=VideoConvertConfig.from_dict(cfg_dict))
-        converted_abs = mc.convert_video(abs_path)
-    else:
-        mc = MediaConverter(image_config=ImageConvertConfig.from_dict(cfg_dict))
-        converted_abs = mc.convert_image(abs_path)
-
-    if not converted_abs:
-        return {"id": wallpaper_id, "status": "fail", "converted_path": None}
-
-    converted_rel = os.path.relpath(converted_abs, DOWNLOAD_ROOT).replace("\\", "/")
-    deleted_original = False
-    if cfg_dict.get("delete_original") and os.path.abspath(abs_path) != os.path.abspath(converted_abs):
-        try:
-            os.remove(abs_path)
-            deleted_original = True
-        except OSError:
-            pass
-
-    return {
-        "id": wallpaper_id,
-        "status": "ok",
-        "converted_path": converted_rel,
-        "deleted_original": deleted_original,
-    }
+    preset: Optional[str] = None           # "original" | "standard" | "lite"（覆盖 fps/max_width/max_frames/quality）
 
 
 @router.post("/convert/batch")
 async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depends(get_db)):
-    """批量格式转换（在线程池中执行，不阻塞事件循环）"""
+    """
+    批量格式转换：立即入队，返回 {batch_id, queued_count, skipped_count}。
+    实际转换由后台 ConvertQueue worker 异步执行，可通过 GET /convert/queue 查询进度。
+    """
     media_cfg = load_config().get("media_convert", {})
 
     # 构建壁纸列表
@@ -595,9 +543,9 @@ async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depe
     else:
         raise HTTPException(400, f"无效的 scope: {body.scope!r}")
 
-    loop = asyncio.get_event_loop()
-    success_items, failed_items, skipped_items = [], [], []
-    sem = _get_convert_sem()
+    # 过滤无效条目（无路径 / 文件不存在），剩余全部入队
+    valid_items: list[dict] = []
+    skipped_items: list[dict] = []
 
     for w in wallpapers:
         if not w.local_path:
@@ -607,35 +555,55 @@ async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depe
         if not os.path.exists(abs_path):
             skipped_items.append({"id": w.id, "reason": "本地文件不存在"})
             continue
+        valid_items.append({
+            "id": w.id,
+            "abs_path": abs_path,
+            "wallpaper_type": w.wallpaper_type or "static",
+        })
 
-        async with sem:  # 限制并发转换数，防止 CPU/内存过载
-            result = await loop.run_in_executor(
-                None,
-                _do_convert_wallpaper,
-                w.id, abs_path, w.wallpaper_type or "static",
-                media_cfg,
-                body.delete_original,
-                body.output_format,
-            )
+    if not valid_items:
+        return {
+            "success": True,
+            "batch_id": None,
+            "queued_count": 0,
+            "skipped_count": len(skipped_items),
+            "message": "没有可转换的壁纸",
+        }
 
-        if result["status"] == "ok":
-            w.converted_path = result["converted_path"]
-            if result.get("deleted_original"):
-                w.local_path = result["converted_path"]
-            success_items.append(result)
-        elif result["status"] == "skip":
-            skipped_items.append({"id": w.id, "reason": "跳过"})
-        else:
-            failed_items.append({"id": w.id, "reason": "转换失败"})
-
-    db.commit()
+    cq = _get_convert_queue()
+    job = cq.submit_batch(
+        items=valid_items,
+        media_cfg=media_cfg,
+        delete_original=body.delete_original,
+        output_format=body.output_format,
+        timeout_override=None,
+        preset=body.preset,
+    )
 
     return {
         "success": True,
-        "total": len(wallpapers),
-        "success_count": len(success_items),
-        "failed_count": len(failed_items),
+        "batch_id": job.batch_id,
+        "queued_count": job.total,
         "skipped_count": len(skipped_items),
-        "items": success_items,
-        "failed_items": failed_items,
+        "message": f"已入队 {job.total} 个任务，后台转换中",
     }
+
+
+@router.get("/convert/queue")
+async def get_convert_queue_status():
+    """返回全局转换队列状态及各批次进度。"""
+    cq = _get_convert_queue()
+    return cq.get_status()
+
+
+@router.get("/convert/queue/{batch_id}")
+async def get_convert_batch_status(batch_id: str):
+    """返回指定批次的转换进度。"""
+    cq = _get_convert_queue()
+    job = cq.get_batch(batch_id)
+    if job is None:
+        raise HTTPException(404, f"批次 {batch_id} 不存在或已过期")
+    result = job.to_dict()
+    result["items"] = job.items
+    result["failed_items"] = job.failed_items
+    return result

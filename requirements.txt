@@ -10,3 +10,4 @@ Pillow==11.2.1
 tzdata==2024.2
 imageio>=2.33.0
 imageio-ffmpeg>=0.4.9
+webp>=0.3.0

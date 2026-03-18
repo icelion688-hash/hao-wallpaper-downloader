@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import load_config
 from backend.core.account_pool import AccountPool
+from backend.core.anti_detection import AntiDetection
 from backend.core.captcha_solver import AltchaSolver
 from backend.core.session_manager import SessionManager
 from backend.core.site_auth import probe_login_status, probe_original_access
@@ -192,9 +193,21 @@ def _apply_login_probe_state(account: Account, valid: bool) -> None:
 
 
 async def _verify_account_access(account: Account) -> dict:
+    cfg = load_config()
+    anti = AntiDetection(
+        proxies=cfg.get("proxies", []),
+        min_delay=cfg.get("min_delay", 0.5),
+        max_delay=cfg.get("max_delay", 2.0),
+        use_proxy=cfg.get("use_proxy", False),
+    )
+    session_profile = anti.pick_session_profile()
     solver = AltchaSolver()
-    async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(20)) as client:
-        auth_valid, auth_msg = await probe_login_status(client, account.cookie)
+    async with anti.build_client(account.cookie, timeout=20, profile=session_profile) as client:
+        auth_valid, auth_msg = await probe_login_status(
+            client,
+            account.cookie,
+            session_profile=session_profile,
+        )
         if auth_valid is False:
             account.is_active = False
             _save_verify_state(
@@ -238,6 +251,7 @@ async def _verify_account_access(account: Account) -> dict:
             client,
             account.cookie,
             solver,
+            session_profile=session_profile,
         )
 
     account.is_active = True

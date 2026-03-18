@@ -3,8 +3,8 @@
     <div class="page-header">
       <h1 class="page-title">格式转换 <small>MP4 → 动态 WebP / GIF · 静态图 → WebP</small></h1>
       <div class="header-actions">
-        <button class="btn" @click="applyRecommend" :disabled="!sysInfo" title="根据当前机器配置一键填入建议值">
-          一键推荐配置
+        <button class="btn" @click="applyRecommend" :disabled="!sysInfo || applyingRecommend" title="根据当前机器配置一键填入建议值并保存">
+          {{ applyingRecommend ? '应用中…' : '一键推荐配置' }}
         </button>
         <button class="btn btn--primary" @click="saveSettings" :disabled="saving">
           {{ saving ? '保存中…' : '保存配置' }}
@@ -48,6 +48,7 @@
           视频转换需要 <code>imageio-ffmpeg</code>（pip 包，内含 ffmpeg 二进制，<strong>无需系统安装</strong>）。
           运行 <code>pip install imageio imageio-ffmpeg</code> 安装。
           静态图转换仅需 Pillow（已内置）。已内置 CPU 降权、内存自适应和超时保护，不会卡死服务器。
+          全帧转换会沿用原视频时间轴，原图模式下也会自动忽略视频超时，避免 4K 长视频被截短。
         </div>
       </div>
 
@@ -71,7 +72,7 @@
               </div>
             </div>
             <div class="form-row">
-              <label>视频超时 <span class="form-hint">超时后软取消，已采集帧仍会保存</span></label>
+              <label>视频超时 <span class="form-hint">标准/低配模式生效；全帧转换时自动忽略</span></label>
               <div class="input-row">
                 <input class="input" type="number" v-model.number="form.video.timeout_seconds" min="30" max="3600" />
                 <span class="unit">秒</span>
@@ -112,6 +113,23 @@
               <span>{{ form.video.enabled ? '已启用' : '已禁用' }}</span>
             </label>
           </div>
+          <!-- 预设按钮行 -->
+          <div class="preset-row">
+            <span class="preset-label">快速预设：</span>
+            <button
+              v-for="p in VIDEO_PRESETS" :key="p.key"
+              class="btn btn--preset"
+              :class="{ 'btn--preset-active': activePreset === p.key }"
+              @click="applyVideoPreset(p.key)"
+              :title="p.hint"
+            >{{ p.label }}</button>
+            <button
+              v-if="activePreset"
+              class="btn btn--preset-clear"
+              @click="activePreset = null"
+              title="取消预设选中（不影响当前值）"
+            >✕ 取消预设</button>
+          </div>
           <div class="card-body" :class="{ 'cfg-disabled': !form.video.enabled }">
             <div class="form-grid">
               <div class="form-row">
@@ -122,35 +140,40 @@
                 </select>
               </div>
               <div class="form-row">
-                <label>输出帧率 <span class="form-hint">原始帧率按比例降采样</span></label>
+                <label>输出帧率
+                  <span class="form-hint">0 = 保留源帧率（原图模式）</span>
+                </label>
                 <div class="input-row">
-                  <input class="input" type="number" v-model.number="form.video.fps" min="1" max="60" />
+                  <input class="input" type="number" v-model.number="form.video.fps" min="0" max="120" />
                   <span class="unit">fps</span>
+                  <span class="unit-tag unit-tag--special" v-if="form.video.fps === 0">源帧率</span>
                 </div>
               </div>
               <div class="form-row">
                 <label>
                   最大帧数
-                  <span class="form-hint">实际值由可用内存自动压缩</span>
-                  <span class="form-badge" :class="framesBudgetClass">{{ framesBudgetHint }}</span>
+                  <span class="form-hint">0 = 不限（原图模式全帧转换）</span>
+                  <span class="form-badge" :class="framesBudgetClass" v-if="form.video.max_frames > 0">{{ framesBudgetHint }}</span>
                 </label>
                 <div class="input-row">
-                  <input class="input" type="number" v-model.number="form.video.max_frames" min="10" max="600" />
+                  <input class="input" type="number" v-model.number="form.video.max_frames" min="0" max="9999" />
                   <span class="unit">帧</span>
-                  <span class="unit-calc">≈ {{ (form.video.max_frames / Math.max(form.video.fps, 1)).toFixed(1) }}s</span>
+                  <span class="unit-tag unit-tag--special" v-if="form.video.max_frames === 0">全帧</span>
+                  <span class="unit-calc" v-else-if="form.video.fps > 0">
+                    ≈ {{ (form.video.max_frames / form.video.fps).toFixed(1) }}s
+                  </span>
                 </div>
               </div>
               <div class="form-row">
                 <label>
                   帧宽上限 max_width
-                  <span class="form-hint">4K(3840)→1280px 内存从 24MB→2.8MB/帧</span>
+                  <span class="form-hint">0 = 不缩放（原图模式）</span>
                 </label>
                 <div class="input-row">
                   <input class="input" type="number" v-model.number="form.video.max_width" min="0" step="8" />
                   <span class="unit">px</span>
-                  <span class="unit-calc" v-if="form.video.max_width">
-                    ~{{ memPerFrame(form.video.max_width) }} MB/帧
-                  </span>
+                  <span class="unit-tag unit-tag--special" v-if="form.video.max_width === 0">原始尺寸</span>
+                  <span class="unit-calc" v-else-if="form.video.max_width">~{{ memPerFrame(form.video.max_width) }} MB/帧</span>
                 </div>
               </div>
               <div class="form-row">
@@ -234,7 +257,16 @@
               </select>
             </div>
             <div class="form-row">
-              <label>覆盖输出格式 <span class="form-hint">留空=使用上方配置</span></label>
+              <label>视频预设 <span class="form-hint">快速切换质量/内存策略</span></label>
+              <select class="select" v-model="batchPreset">
+                <option value="">使用上方配置</option>
+                <option value="original">原图模式（保留源帧率/分辨率/全帧）</option>
+                <option value="standard">标准模式（30fps / 1280px）</option>
+                <option value="lite">低配模式（8fps / 854px，内存极低）</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>覆盖输出格式 <span class="form-hint">留空=使用配置</span></label>
               <select class="select" v-model="batchFormat">
                 <option value="">使用配置默认值</option>
                 <option value="webp">WebP</option>
@@ -255,19 +287,48 @@
           </div>
           <div class="batch-actions">
             <button class="btn btn--primary" @click="startBatchConvert" :disabled="converting">
-              {{ converting ? `转换中… ${convertProgress}` : '开始批量转换' }}
+              {{ converting ? '提交中…' : '开始批量转换' }}
             </button>
-            <div v-if="convertResult" class="convert-result">
-              <span class="result-ok">✓ 成功 {{ convertResult.success_count }}</span>
-              <span class="result-skip">跳过 {{ convertResult.skipped_count }}</span>
-              <span v-if="convertResult.failed_count" class="result-fail">✗ 失败 {{ convertResult.failed_count }}</span>
-              <span class="result-total">共 {{ convertResult.total }} 张</span>
+            <button class="btn" @click="refreshQueueStatus" title="刷新队列状态">刷新队列</button>
+          </div>
+
+          <!-- 当前批次进度 -->
+          <div v-if="batchJob" class="batch-progress">
+            <div class="batch-progress__header">
+              <span class="batch-id">批次 {{ batchJob.batch_id }}</span>
+              <span class="batch-status-badge" :class="batchJob.is_complete ? 'badge--done' : 'badge--running'">
+                {{ batchJob.is_complete ? '已完成' : '转换中…' }}
+              </span>
+            </div>
+            <div class="batch-progress__bar-wrap">
+              <div class="batch-progress__bar" :style="{ width: batchProgressPct + '%' }"></div>
+            </div>
+            <div class="batch-progress__stats">
+              <span class="result-ok">✓ {{ batchJob.success }}</span>
+              <span class="result-skip">跳过 {{ batchJob.skipped }}</span>
+              <span v-if="batchJob.failed" class="result-fail">✗ {{ batchJob.failed }}</span>
+              <span class="result-total">/ {{ batchJob.total }} 张</span>
+              <span class="result-total" style="margin-left:8px">{{ batchJob.done }}/{{ batchJob.total }} 完成</span>
+            </div>
+            <div v-if="batchJob.failed_items?.length" class="failed-list">
+              <div class="failed-list__title">失败项目：</div>
+              <div v-for="item in batchJob.failed_items" :key="item.id" class="failed-item">
+                ID {{ item.id }} — {{ item.reason }}
+              </div>
             </div>
           </div>
-          <div v-if="convertResult?.failed_items?.length" class="failed-list">
-            <div class="failed-list__title">失败项目：</div>
-            <div v-for="item in convertResult.failed_items" :key="item.id" class="failed-item">
-              ID {{ item.id }} — {{ item.reason }}
+
+          <!-- 全局队列概览 -->
+          <div v-if="queueStatus" class="queue-overview">
+            <div class="queue-overview__title">队列概览</div>
+            <div class="queue-overview__stats">
+              <span>等待中：<strong>{{ queueStatus.queue_size }}</strong></span>
+              <span v-if="queueStatus.running">
+                正在转换：<strong>ID {{ queueStatus.running.wallpaper_id }}</strong>
+                ({{ queueStatus.running.wallpaper_type }})
+              </span>
+              <span v-else>空闲</span>
+              <span>历史批次：<strong>{{ queueStatus.batch_count }}</strong></span>
             </div>
           </div>
         </div>
@@ -278,18 +339,51 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { settingsApi, convertApi } from '../api'
 
-const saving     = ref(false)
-const converting = ref(false)
-const convertProgress = ref('')
-const convertResult   = ref(null)
-const sysInfo    = ref(null)
+const saving          = ref(false)
+const applyingRecommend = ref(false)
+const converting      = ref(false)
+const sysInfo         = ref(null)
+const activePreset    = ref(null)  // 当前选中的视频预设 key
 
 const batchScope          = ref('dynamic')
+const batchPreset         = ref('')
 const batchFormat         = ref('')
 const batchDeleteOriginal = ref(false)
+
+// 队列相关
+const batchJob     = ref(null)   // 当前批次 BatchJob
+const queueStatus  = ref(null)   // 全局队列状态
+let _pollTimer = null
+
+const batchProgressPct = computed(() => {
+  if (!batchJob.value || !batchJob.value.total) return 0
+  return Math.round((batchJob.value.done / batchJob.value.total) * 100)
+})
+
+// 视频预设定义（与后端 _CONVERT_PRESETS 对应）
+const VIDEO_PRESETS = [
+  {
+    key: 'original',
+    label: '原图模式',
+    hint: '保留源帧率/分辨率/全帧，流式写入无内存限制，文件较大',
+    values: { fps: 0, max_width: 0, max_frames: 0, quality: 90 },
+  },
+  {
+    key: 'standard',
+    label: '标准模式',
+    hint: '30fps / 1280px 宽，兼顾质量与体积',
+    values: { fps: 30, max_width: 1280, max_frames: 120, quality: 80 },
+  },
+  {
+    key: 'lite',
+    label: '低配模式',
+    hint: '8fps / 854px，内存占用极低，适合低配服务器',
+    values: { fps: 8, max_width: 854, max_frames: 30, quality: 65 },
+  },
+]
 
 const TIER_LABEL = { high: '高配机器', mid: '中配机器', low: '低配机器' }
 
@@ -343,7 +437,7 @@ const framesBudgetClass = computed(() => {
 
 // ── 初始化 ────────────────────────────────────────────
 onMounted(async () => {
-  await Promise.all([loadSettings(), loadSysInfo()])
+  await Promise.all([loadSettings(), loadSysInfo(), refreshQueueStatus()])
 })
 
 async function loadSettings() {
@@ -370,17 +464,33 @@ function mergeForm(data) {
   if (data.image) Object.assign(form.value.image, data.image)
 }
 
-// ── 一键推荐配置 ──────────────────────────────────────
-function applyRecommend() {
-  if (!sysInfo.value) return
+// ── 视频预设切换 ──────────────────────────────────────
+function applyVideoPreset(key) {
+  const preset = VIDEO_PRESETS.find(p => p.key === key)
+  if (!preset) return
+  Object.assign(form.value.video, preset.values)
+  activePreset.value = key
+}
+
+// ── 一键推荐配置（应用并自动保存）────────────────────
+async function applyRecommend() {
+  if (!sysInfo.value || applyingRecommend.value) return
   const r = sysInfo.value.recommend
+  // 应用视频参数
   form.value.video.max_frames = r.max_frames
   form.value.video.max_width  = r.max_width
   form.value.video.fps        = r.fps
-  // 低配自动调高超时
-  if (sysInfo.value.tier === 'low') {
-    form.value.video.timeout_seconds = 600
-    form.value.max_concurrent = 1
+  if (r.timeout_seconds) form.value.video.timeout_seconds = r.timeout_seconds
+  if (r.max_concurrent)  form.value.max_concurrent        = r.max_concurrent
+
+  // 自动保存，让用户看到明确效果
+  applyingRecommend.value = true
+  try {
+    await settingsApi.setMediaConvert(form.value)
+  } catch (e) {
+    alert(`应用推荐配置失败: ${e.message}`)
+  } finally {
+    applyingRecommend.value = false
   }
 }
 
@@ -396,26 +506,61 @@ async function saveSettings() {
   }
 }
 
-// ── 批量转换 ──────────────────────────────────────────
+// ── 批量转换（队列模式）──────────────────────────────
 async function startBatchConvert() {
   converting.value = true
-  convertResult.value = null
-  convertProgress.value = '请求中…'
+  batchJob.value = null
+  stopPolling()
   try {
     const payload = {
-      scope:          batchScope.value,
-      output_format:  batchFormat.value || null,
+      scope:           batchScope.value,
+      preset:          batchPreset.value || null,
+      output_format:   batchFormat.value || null,
       delete_original: batchDeleteOriginal.value || null,
     }
     const res = await convertApi.batchConvert(payload)
-    convertResult.value = res
+    if (res.batch_id) {
+      // 立即拉一次进度，然后启动轮询
+      await pollBatchStatus(res.batch_id)
+      if (!res.queued_count || batchJob.value?.is_complete) return
+      startPolling(res.batch_id)
+    } else {
+      // 没有可转换的壁纸
+      alert(res.message || '没有可转换的壁纸')
+    }
   } catch (e) {
-    alert(`转换失败: ${e.message}`)
+    alert(`提交失败: ${e.message}`)
   } finally {
     converting.value = false
-    convertProgress.value = ''
   }
 }
+
+async function pollBatchStatus(batchId) {
+  try {
+    batchJob.value = await convertApi.batchStatus(batchId)
+  } catch { /* ignore */ }
+}
+
+function startPolling(batchId) {
+  stopPolling()
+  _pollTimer = setInterval(async () => {
+    await pollBatchStatus(batchId)
+    await refreshQueueStatus()
+    if (batchJob.value?.is_complete) stopPolling()
+  }, 2000)
+}
+
+function stopPolling() {
+  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null }
+}
+
+async function refreshQueueStatus() {
+  try {
+    queueStatus.value = await convertApi.queueStatus()
+  } catch { /* ignore */ }
+}
+
+onUnmounted(stopPolling)
 </script>
 
 <style scoped>
@@ -548,5 +693,85 @@ code {
 .failed-list__title { font-size: 11px; color: var(--red); margin-bottom: 6px; font-family: var(--font-ui); }
 .failed-item { font-size: 12px; color: var(--text-2); padding: 2px 0; font-family: var(--font-ui); }
 
+/* ── 批次进度 ─────────────────────────── */
+.batch-progress {
+  margin-top: 14px; padding: 12px 14px;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.batch-progress__header {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+}
+.batch-id { font-size: 11px; color: var(--text-2); font-family: var(--font-ui); }
+.batch-status-badge {
+  font-size: 11px; font-family: var(--font-ui); font-weight: 600;
+  padding: 1px 7px; border-radius: 3px;
+}
+.badge--running { background: rgba(245,166,35,.18); color: var(--orange); }
+.badge--done    { background: rgba(62,207,114,.18); color: var(--green); }
+.batch-progress__bar-wrap {
+  height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-bottom: 8px;
+}
+.batch-progress__bar {
+  height: 100%; background: var(--accent); border-radius: 3px;
+  transition: width .3s ease;
+}
+.batch-progress__stats { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; }
+
+/* ── 队列概览 ─────────────────────────── */
+.queue-overview {
+  margin-top: 10px; padding: 10px 14px;
+  background: rgba(99,102,241,.04); border: 1px solid rgba(99,102,241,.15);
+  border-radius: var(--radius);
+}
+.queue-overview__title {
+  font-size: 11px; font-family: var(--font-ui); font-weight: 600;
+  color: var(--accent); margin-bottom: 6px;
+}
+.queue-overview__stats {
+  display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--text-2);
+}
+.queue-overview__stats strong { color: var(--text-1); }
+
+.batch-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
 .header-actions { display: flex; gap: 8px; align-items: center; }
+
+/* ── 预设行 ───────────────────────────────── */
+.preset-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 16px 0; border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.preset-label {
+  font-size: 11px; color: var(--text-3); font-family: var(--font-ui);
+  text-transform: uppercase; letter-spacing: .05em; flex-shrink: 0;
+}
+.btn--preset {
+  font-size: 11px; padding: 3px 10px; border-radius: 3px;
+  border: 1px solid var(--border); background: var(--bg-hover);
+  color: var(--text-2); cursor: pointer; transition: all .15s;
+  font-family: var(--font-ui);
+}
+.btn--preset:hover { border-color: var(--accent); color: var(--accent); }
+.btn--preset-active {
+  background: rgba(79,142,255,.15); border-color: var(--accent);
+  color: var(--accent); font-weight: 600;
+}
+.btn--preset-clear {
+  font-size: 10px; padding: 2px 7px; border-radius: 3px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-3); cursor: pointer; font-family: var(--font-ui);
+}
+.btn--preset-clear:hover { color: var(--red); border-color: var(--red); }
+
+/* ── 特殊标签 ─────────────────────────────── */
+.unit-tag {
+  font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  font-family: var(--font-ui); white-space: nowrap;
+}
+.unit-tag--special {
+  background: rgba(62,207,114,.15); color: var(--green);
+  border: 1px solid rgba(62,207,114,.3);
+}
 </style>

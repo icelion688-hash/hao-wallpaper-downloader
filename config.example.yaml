@@ -85,7 +85,7 @@ media_convert:
     max_width: 1280        # 帧宽硬上限（4K→1280px 内存从 24MB/帧降至 2.8MB/帧）
     quality: 80            # WebP 质量（1-100）
     delete_original: false # true = 转换成功后删除原 MP4
-    timeout_seconds: 300   # 单文件超时（秒），超时后软取消保留已采集帧
+    timeout_seconds: 300   # 单文件超时（秒）；全帧转换（max_frames=0）时自动忽略
     cpu_nice: 5            # CPU 调度降权（0=不降，5=后台，19=最低；仅 Linux）
 
   image:                   # PNG/JPEG → WebP / JPG / PNG

@@ -34,18 +34,21 @@ pip show fastapi &>/dev/null || {
 echo "      Python 依赖就绪 ✓"
 
 # ── 前端构建 ─────────────────────────────────
-echo "[2/3] 检查前端..."
+echo "[2/3] 构建前端..."
 if command -v node &>/dev/null; then
-    if [ ! -d "frontend/dist" ]; then
-        echo "      构建前端..."
-        cd frontend
+    cd frontend
+
+    if [ ! -d "node_modules" ]; then
+        echo "      安装前端依赖..."
         npm install --silent
-        npm run build
-        cd ..
-        echo "      前端构建完成 ✓"
     else
-        echo "      前端已构建 ✓"
+        echo "      前端依赖已就绪 ✓"
     fi
+
+    echo "      重新构建前端静态资源..."
+    npm run build
+    cd ..
+    echo "      前端构建完成 ✓"
 else
     echo "      [提示] 未检测到 Node.js，跳过前端构建"
     echo "      后端 API: http://localhost:8000/api/"

@@ -20,6 +20,7 @@ from backend.core.account_pool import AccountPool
 from backend.core.anti_detection import AntiDetection, HumanBehaviorController
 from backend.core.autopilot_engine import AutoPilotEngine
 from backend.core.captcha_solver import AltchaSolver
+from backend.core.convert_queue import init_convert_queue
 from backend.core.filters import FilterConfig
 from backend.core.imgbed_uploader import ImgbedUploader
 from backend.core.upload_profiles import build_task_uploader
@@ -31,6 +32,43 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _latest_mtime(path: str) -> float:
+    """Return latest modified time under a file or directory."""
+
+    if not os.path.exists(path):
+        return 0.0
+
+    if os.path.isfile(path):
+        return os.path.getmtime(path)
+
+    latest = 0.0
+    for root, _, files in os.walk(path):
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            latest = max(latest, os.path.getmtime(file_path))
+    return latest
+
+
+def _is_frontend_dist_stale(base_dir: str) -> bool:
+    """Check whether frontend dist is older than source files."""
+
+    frontend_dir = os.path.join(base_dir, "frontend")
+    dist_dir = os.path.join(frontend_dir, "dist")
+    tracked_paths = [
+        os.path.join(frontend_dir, "src"),
+        os.path.join(frontend_dir, "index.html"),
+        os.path.join(frontend_dir, "package.json"),
+        os.path.join(frontend_dir, "vite.config.js"),
+    ]
+
+    if not os.path.exists(dist_dir):
+        return True
+
+    dist_mtime = _latest_mtime(dist_dir)
+    source_mtime = max((_latest_mtime(path) for path in tracked_paths), default=0.0)
+    return source_mtime > dist_mtime
 
 
 class SPAStaticFiles(StaticFiles):
@@ -61,6 +99,7 @@ human_behavior: HumanBehaviorController | None = None
 autopilot_engine: AutoPilotEngine | None = None
 _reset_task: asyncio.Task | None = None
 _scheduler_task: asyncio.Task | None = None
+_convert_queue = None
 
 
 async def _scheduler_loop(app: FastAPI):
@@ -126,10 +165,19 @@ async def _scheduler_loop(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global anti_detection, account_pool, captcha_solver, imgbed_uploader, human_behavior, autopilot_engine, _reset_task, _scheduler_task
+    global anti_detection, account_pool, captcha_solver, imgbed_uploader, human_behavior, autopilot_engine, _reset_task, _scheduler_task, _convert_queue
 
     logger.info("=== HaoWallpaper Downloader 启动 ===")
     init_db()
+
+    if _is_frontend_dist_stale(BASE_DIR):
+        logger.warning(
+            "检测到前端构建产物已过期，请先执行 'cd frontend && npm run build'，"
+            "或使用项目根目录下的 start.sh 重新启动服务"
+        )
+        app.state.frontend_dist_stale = True
+    else:
+        app.state.frontend_dist_stale = False
 
     cfg = load_config()
     anti_detection = AntiDetection(
@@ -173,8 +221,13 @@ async def lifespan(app: FastAPI):
     _reset_task = asyncio.create_task(account_pool.daily_reset_loop())
     _scheduler_task = asyncio.create_task(_scheduler_loop(app))
 
+    # 格式转换队列（后台 worker）
+    _convert_queue = init_convert_queue()
+    _convert_queue.start()
+
     logger.info("后台任务已启动：每日配额重置")
     logger.info("定时调度器已启动（每 30 秒检查一次）")
+    logger.info("格式转换队列已启动")
 
     yield
 
@@ -182,6 +235,8 @@ async def lifespan(app: FastAPI):
         _reset_task.cancel()
     if _scheduler_task:
         _scheduler_task.cancel()
+    if _convert_queue:
+        await _convert_queue.stop()
     if autopilot_engine:
         await autopilot_engine.stop()
     if imgbed_uploader:
@@ -220,7 +275,11 @@ app.include_router(settings.router, prefix="/api/settings", tags=["全局设置"
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "frontend_dist_stale": getattr(app.state, "frontend_dist_stale", False),
+    }
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))

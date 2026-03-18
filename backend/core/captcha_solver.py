@@ -96,6 +96,7 @@ class AltchaSolver:
         self,
         client: httpx.AsyncClient,
         cookie: str,
+        extra_headers: Optional[dict] = None,
         ua: Optional[str] = None,
     ) -> bool:
         """
@@ -110,12 +111,12 @@ class AltchaSolver:
         Returns:
             True 表示验证成功，False 表示失败
         """
-        solution = await self.solve(client, cookie, ua=ua)
+        solution = await self.solve(client, cookie, extra_headers=extra_headers, ua=ua)
         if not solution:
             logger.error("[Altcha] verify_download: PoW 求解失败")
             return False
 
-        headers = self._build_headers(cookie, ua=ua)
+        headers = self._build_headers(cookie, extra=extra_headers, ua=ua)
         try:
             resp = await client.post(
                 VERIFY_URL,

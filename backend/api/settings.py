@@ -87,13 +87,13 @@ async def get_imgbed_settings_compat():
 class VideoConvertPayload(BaseModel):
     enabled: bool = False
     output_format: str = "webp"
-    fps: int = Field(default=10, ge=1, le=60)
-    max_frames: int = Field(default=120, ge=10, le=600)
+    fps: int = Field(default=10, ge=0, le=120)       # 0 = 保留源帧率（原图模式）
+    max_frames: int = Field(default=120, ge=0, le=9999)  # 0 = 不限帧数（原图模式）
     width: int = Field(default=0, ge=0)
-    max_width: int = Field(default=1280, ge=0)
+    max_width: int = Field(default=1280, ge=0)        # 0 = 不缩放（原图模式）
     quality: int = Field(default=80, ge=1, le=100)
     delete_original: bool = False
-    timeout_seconds: int = Field(default=300, ge=30, le=3600)
+    timeout_seconds: int = Field(default=300, ge=30, le=7200)
     cpu_nice: int = Field(default=5, ge=0, le=19)
 
 
