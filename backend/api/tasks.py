@@ -40,7 +40,7 @@ from backend.core.downloader import Downloader
 from backend.core.dedup import DedupManager
 from backend.core.imgbed_uploader import ImgbedUploader
 from backend.config import load_config
-from backend.core.media_converter import MediaConverter, VideoConvertConfig, ImageConvertConfig
+from backend.core.media_converter import MediaConverter
 from backend.core.site_auth import probe_login_status
 from backend.core.upload_record_helper import (
     build_upload_record,
@@ -53,6 +53,11 @@ router = APIRouter()
 
 # 运行中的任务 {task_id: asyncio.Task}
 _running_tasks: dict[int, asyncio.Task] = {}
+
+
+def _get_convert_queue():
+    from backend.core.convert_queue import get_convert_queue
+    return get_convert_queue()
 
 
 def _probe_video_duration(path: str) -> Optional[float]:
@@ -488,6 +493,8 @@ async def _execute_task(
 
                 # 初始化在 try 外部，确保 except 块始终能访问到此变量
                 _is_original_dl = False
+                _queued_convert_msg = None
+                _queued_convert_request = None
 
                 try:
                     # 获取下载直链
@@ -724,38 +731,46 @@ async def _execute_task(
                         _quality = "原图" if _is_original_dl else "预览图"
                         log(f"成功({_quality}): {resource_id} → {local_path}{_size_info}")
 
-                        # ── 自动格式转换 ──────────────────────────────────────
+                        # ── 自动格式转换：统一走全局队列，避免下载 worker 直接重编码 ──
                         _media_cfg = load_config().get("media_convert", {})
                         if _media_cfg.get("auto_convert", False):
                             _is_video = item.get("wallpaper_type") == "dynamic"
                             _conv_key = "video" if _is_video else "image"
                             _conv_dict = dict(_media_cfg.get(_conv_key, {}))
                             if _conv_dict.get("enabled", False):
-                                try:
-                                    if _is_video:
-                                        _mc = MediaConverter(video_config=VideoConvertConfig.from_dict(_conv_dict))
-                                        _convert_fn = lambda p=abs_path: _mc.convert_video(p)
-                                    else:
-                                        _mc = MediaConverter(image_config=ImageConvertConfig.from_dict(_conv_dict))
-                                        _convert_fn = lambda p=abs_path: _mc.convert_image(p)
-                                    _converted_abs = await asyncio.get_event_loop().run_in_executor(None, _convert_fn)
-                                    if _converted_abs:
-                                        _conv_rel = os.path.relpath(_converted_abs, DOWNLOAD_ROOT).replace("\\", "/")
-                                        wallpaper.converted_path = _conv_rel
-                                        log(f"格式转换成功: {_conv_rel}")
-                                        if _conv_dict.get("delete_original", False):
-                                            try:
-                                                os.remove(abs_path)
-                                                wallpaper.local_path = _conv_rel
-                                                log(f"已删除原文件: {local_path}")
-                                            except OSError as _oe:
-                                                log(f"删除原文件失败: {_oe}")
-                                    else:
-                                        log(f"格式转换失败（见日志）: {resource_id}")
-                                except Exception as _conv_err:
-                                    log(f"格式转换异常: {_conv_err}")
+                                if _is_video:
+                                    _queued_convert_msg = "格式转换跳过: 已关闭动态图转换，仅保留静态图转换"
+                                else:
+                                    _queued_convert_request = {
+                                        "id": wallpaper.id,
+                                        "abs_path": abs_path,
+                                        "wallpaper_type": item.get("wallpaper_type", "static"),
+                                        "media_cfg": _media_cfg,
+                                    }
 
                     db.commit()
+                    if _queued_convert_msg:
+                        log(_queued_convert_msg)
+                    elif _queued_convert_request:
+                        try:
+                            job = _get_convert_queue().submit_batch(
+                                items=[{
+                                    "id": _queued_convert_request["id"],
+                                    "abs_path": _queued_convert_request["abs_path"],
+                                    "wallpaper_type": _queued_convert_request["wallpaper_type"],
+                                }],
+                                media_cfg=_queued_convert_request["media_cfg"],
+                                delete_original=None,
+                                output_format=None,
+                                timeout_override=None,
+                                preset=None,
+                            )
+                            log(
+                                f"格式转换已入队: 批次 {job.batch_id} | "
+                                f"壁纸 ID {_queued_convert_request['id']}"
+                            )
+                        except Exception as _conv_err:
+                            log(f"格式转换入队失败: {_conv_err}")
                     task.update_progress()
                     db.commit()
                     # 仅原图（getCompleteUrl）消耗配额；previewFileImg 回退不计入每日限额

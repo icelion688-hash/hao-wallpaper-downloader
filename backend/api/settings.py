@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from backend.config import load_config, update_config
+from backend.config import default_media_convert_config, load_config, update_config
 from backend.core.upload_profiles import build_task_uploader
 
 router = APIRouter()
@@ -64,6 +64,16 @@ def _current_upload_settings() -> dict:
     return load_config().get("uploads", {})
 
 
+def _sanitize_media_convert_settings(data: Optional[dict] = None) -> dict:
+    settings = {**default_media_convert_config(), **(data or {})}
+    video = {**default_media_convert_config()["video"], **(settings.get("video") or {})}
+    image = {**default_media_convert_config()["image"], **(settings.get("image") or {})}
+    video["enabled"] = False
+    settings["video"] = video
+    settings["image"] = image
+    return settings
+
+
 @router.get("/uploads")
 async def get_upload_settings():
     return _current_upload_settings()
@@ -87,11 +97,11 @@ async def get_imgbed_settings_compat():
 class VideoConvertPayload(BaseModel):
     enabled: bool = False
     output_format: str = "webp"
-    fps: int = Field(default=10, ge=0, le=120)       # 0 = 保留源帧率（原图模式）
-    max_frames: int = Field(default=120, ge=0, le=9999)  # 0 = 不限帧数（原图模式）
+    fps: int = Field(default=0, ge=0, le=120)       # 0 = 保留源帧率（原图模式）
+    max_frames: int = Field(default=0, ge=0, le=9999)  # 0 = 不限帧数（原图模式）
     width: int = Field(default=0, ge=0)
-    max_width: int = Field(default=1280, ge=0)        # 0 = 不缩放（原图模式）
-    quality: int = Field(default=80, ge=1, le=100)
+    max_width: int = Field(default=0, ge=0)        # 0 = 不缩放（原图模式）
+    quality: int = Field(default=100, ge=1, le=100)
     delete_original: bool = False
     timeout_seconds: int = Field(default=300, ge=30, le=7200)
     cpu_nice: int = Field(default=5, ge=0, le=19)
@@ -100,7 +110,7 @@ class VideoConvertPayload(BaseModel):
 class ImageConvertPayload(BaseModel):
     enabled: bool = False
     output_format: str = "webp"
-    quality: int = Field(default=85, ge=1, le=100)
+    quality: int = Field(default=100, ge=1, le=100)
     delete_original: bool = False
     timeout_seconds: int = Field(default=120, ge=10, le=600)
     cpu_nice: int = Field(default=5, ge=0, le=19)
@@ -115,13 +125,14 @@ class MediaConvertPayload(BaseModel):
 
 @router.get("/media-convert")
 async def get_media_convert_settings():
-    return load_config().get("media_convert", MediaConvertPayload().model_dump())
+    return _sanitize_media_convert_settings(load_config().get("media_convert"))
 
 
 @router.put("/media-convert")
 async def save_media_convert_settings(body: MediaConvertPayload):
-    cfg = update_config({"media_convert": body.model_dump()})
-    return {"success": True, "media_convert": cfg.get("media_convert", {})}
+    payload = _sanitize_media_convert_settings(body.model_dump())
+    cfg = update_config({"media_convert": payload})
+    return {"success": True, "media_convert": _sanitize_media_convert_settings(cfg.get("media_convert"))}
 
 
 @router.get("/system-info")

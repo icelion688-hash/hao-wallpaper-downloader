@@ -10,6 +10,33 @@ import yaml
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
 
 
+def default_media_convert_config() -> dict:
+    return {
+        "auto_convert": False,
+        "max_concurrent": 1,
+        "video": {
+            "enabled": False,
+            "output_format": "webp",
+            "fps": 0,
+            "max_frames": 0,
+            "width": 0,
+            "max_width": 0,
+            "quality": 100,
+            "delete_original": False,
+            "timeout_seconds": 300,
+            "cpu_nice": 5,
+        },
+        "image": {
+            "enabled": False,
+            "output_format": "webp",
+            "quality": 100,
+            "delete_original": False,
+            "timeout_seconds": 120,
+            "cpu_nice": 5,
+        },
+    }
+
+
 def load_config() -> dict:
     cfg = _deep_merge(_default_config(), _read_raw_config())
     _normalize_upload_profiles(cfg)
@@ -185,4 +212,5 @@ def _default_config() -> dict:
             "gallery_default_format": "profile",
             "profiles": _default_upload_profiles(),
         },
+        "media_convert": default_media_convert_config(),
     }

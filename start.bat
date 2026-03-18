@@ -22,7 +22,7 @@ if errorlevel 1 (
 )
 
 echo [1/3] Checking Python dependencies...
-for %%M in (fastapi uvicorn sqlalchemy httpx yaml multipart aiofiles Crypto PIL tzdata imageio imageio_ffmpeg) do (
+for %%M in (fastapi uvicorn sqlalchemy httpx yaml multipart aiofiles Crypto PIL tzdata imageio imageio_ffmpeg webp) do (
     %PYTHON_EXE% -c "import %%M" >nul 2>&1
     if errorlevel 1 set "DEPS_OK=0"
 )

@@ -297,12 +297,11 @@ def _do_convert(item: ConvertItem) -> dict[str, Any]:
     from backend.core.media_converter import (
         ImageConvertConfig,
         MediaConverter,
-        VideoConvertConfig,
     )
 
     # 预设常量（与 gallery.py 保持一致）
     _PRESETS: dict[str, dict] = {
-        "original": {"fps": 0, "max_width": 0, "max_frames": 0, "quality": 90},
+        "original": {"fps": 0, "max_width": 0, "max_frames": 0, "quality": 100},
         "standard": {"fps": 30, "max_width": 1280, "max_frames": 120, "quality": 80},
         "lite":     {"fps": 8,  "max_width": 854,  "max_frames": 30,  "quality": 65},
     }
@@ -311,6 +310,14 @@ def _do_convert(item: ConvertItem) -> dict[str, Any]:
     cfg_key = "video" if is_video else "image"
     cfg_dict = dict(item.media_cfg.get(cfg_key, {}))
     cfg_dict["enabled"] = True
+
+    if is_video:
+        return {
+            "id": item.wallpaper_id,
+            "status": "skip",
+            "converted_path": None,
+            "reason": "已关闭动态图转换，仅保留静态图转换",
+        }
 
     if item.preset and item.preset in _PRESETS and is_video:
         cfg_dict.update(_PRESETS[item.preset])
@@ -322,12 +329,8 @@ def _do_convert(item: ConvertItem) -> dict[str, Any]:
         cfg_dict["timeout_seconds"] = item.timeout_override
 
     try:
-        if is_video:
-            mc = MediaConverter(video_config=VideoConvertConfig.from_dict(cfg_dict))
-            converted_abs = mc.convert_video(item.abs_path)
-        else:
-            mc = MediaConverter(image_config=ImageConvertConfig.from_dict(cfg_dict))
-            converted_abs = mc.convert_image(item.abs_path)
+        mc = MediaConverter(image_config=ImageConvertConfig.from_dict(cfg_dict))
+        converted_abs = mc.convert_image(item.abs_path)
     except Exception as exc:  # noqa: BLE001
         return {"id": item.wallpaper_id, "status": "fail", "converted_path": None, "reason": str(exc)}
 

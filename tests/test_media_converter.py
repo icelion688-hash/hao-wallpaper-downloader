@@ -16,6 +16,7 @@ except ImportError:
 
 from backend.core.media_converter import (
     _build_frame_durations_ms,
+    _estimate_cpu_guard_ms,
     _select_frame_step,
     _source_duration_ms,
     _source_frame_timestamp_ms,
@@ -46,6 +47,22 @@ class MediaConverterTimingTests(unittest.TestCase):
         )
         self.assertEqual(durations, [100, 100, 133])
         self.assertEqual(sum(durations), 333)
+
+    def test_cpu_guard_is_stronger_for_low_core_high_res_full_frame(self):
+        low_end_guard = _estimate_cpu_guard_ms(
+            cpu_nice=5,
+            cpu_count=4,
+            pixel_count=3840 * 2160,
+            unlimited=True,
+        )
+        high_end_guard = _estimate_cpu_guard_ms(
+            cpu_nice=5,
+            cpu_count=16,
+            pixel_count=1280 * 720,
+            unlimited=False,
+        )
+        self.assertGreater(low_end_guard, high_end_guard)
+        self.assertGreater(low_end_guard, 0.0)
 
 
 if __name__ == '__main__':

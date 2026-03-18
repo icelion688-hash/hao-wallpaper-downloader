@@ -212,44 +212,49 @@
           v-for="w in wallpapers" :key="w.id"
           :class="{ 'gallery-item--dup': w.is_duplicate, 'gallery-item--selected': selectedIds.includes(w.id) }"
         >
-          <div class="img-wrapper">
+          <div class="img-wrapper" :style="mediaAspectStyle(w)" :class="{ 'img-wrapper--portrait': isPortraitWallpaper(w) }">
             <label class="select-box">
               <input type="checkbox" :checked="selectedIds.includes(w.id)" @change="toggleSelect(w.id)" />
             </label>
 
             <!-- 动态视频 -->
             <template v-if="w.wallpaper_type === 'dynamic'">
-              <!-- 已转换为动态 WebP/GIF：直接 <img> 自动循环，无需 JS -->
+              <!-- 优先用原视频做悬停预览，浏览器对 MP4 解码更平滑 -->
+              <video
+                v-if="dynamicPreviewVideoUrl(w)"
+                class="gallery-img"
+                :src="encodeFileUrl(dynamicPreviewVideoUrl(w))"
+                preload="metadata"
+                muted loop playsinline
+                @mouseenter="playPreview"
+                @mouseleave="resetPreview"
+              />
+              <!-- 无原视频时，回退到动态 WebP/GIF -->
               <img
-                v-if="w.converted_url"
+                v-else-if="w.converted_url"
                 class="gallery-img"
                 :src="encodeFileUrl(w.converted_url)"
                 loading="lazy"
                 :title="`已转换: ${w.converted_path}`"
                 @error="e => e.currentTarget.style.display='none'"
               />
-              <!-- 未转换：原始 MP4，悬停时播放 -->
-              <video
-                v-else-if="w.file_url"
-                class="gallery-img"
-                :src="encodeFileUrl(w.file_url)"
-                preload="none"
-                muted loop playsinline
-                @mouseenter="e => e.target.play()"
-                @mouseleave="e => { e.target.pause(); e.target.currentTime = 0 }"
-              />
               <!-- 悬停提示遮罩（转换后不显示）-->
               <div
-                v-if="!w.converted_url"
+                v-if="dynamicPreviewVideoUrl(w) || !w.converted_url"
                 class="video-hint-mask"
-                :class="{ 'video-hint-mask--has-file': !!w.file_url }"
+                :class="{ 'video-hint-mask--has-file': !!dynamicPreviewVideoUrl(w) }"
               >
                 <span class="video-play-icon">▶</span>
-                <span class="video-hint-text" v-if="w.file_url">悬停播放</span>
+                <span class="video-hint-text" v-if="dynamicPreviewVideoUrl(w)">悬停播放</span>
                 <span class="video-duration" v-if="w.video_duration">{{ fmtDuration(w.video_duration) }}</span>
               </div>
               <!-- 已转换标记 + 浏览器查看 -->
-              <div v-if="w.converted_url" class="converted-badge" @click.stop="openInBrowser(w.converted_url)" title="在浏览器中直接查看动态 WebP">WebP ↗</div>
+              <div
+                v-if="w.converted_url"
+                class="converted-badge"
+                @click.stop="openInBrowser(w.converted_url)"
+                :title="convertedFileTitle(w)"
+              >{{ convertedFileLabel(w) }} ↗</div>
             </template>
 
             <!-- 静态图 -->
@@ -265,13 +270,24 @@
               <div class="img-placeholder" :class="{ 'img-placeholder--hidden': w.converted_url || w.file_url }">
                 <span>○</span>
               </div>
-              <div v-if="w.converted_url" class="converted-badge" @click.stop="openInBrowser(w.converted_url)" title="在浏览器中直接查看">WebP ↗</div>
+              <div
+                v-if="w.converted_url"
+                class="converted-badge"
+                @click.stop="openInBrowser(w.converted_url)"
+                :title="convertedFileTitle(w)"
+              >{{ convertedFileLabel(w) }} ↗</div>
             </template>
 
             <div class="img-overlay">
               <span class="res-badge font-mono">{{ w.resolution }}</span>
               <div class="overlay-actions">
-                <button class="btn btn--sm convert-btn" @click.stop="convertOne(w)" title="转换格式">⇄</button>
+                <button
+                  class="btn btn--sm convert-btn"
+                  :class="{ 'convert-btn--disabled': !canConvert(w) }"
+                  :disabled="!canConvert(w)"
+                  @click.stop="convertOne(w)"
+                  :title="canConvert(w) ? '转换格式' : '已存在转换文件，请先删除后再重新转换'"
+                >⇄</button>
                 <a v-if="w.file_url" class="btn btn--sm" :href="encodeFileUrl(w.file_url)" target="_blank" @click.stop title="在浏览器查看原文件">↗</a>
                 <button class="btn btn--sm btn--danger del-btn" @click.stop="deleteWallpaper(w.id)">删除</button>
               </div>
@@ -407,9 +423,62 @@ function uploadCount(w) {
   return Object.keys(w.upload_records || {}).length || 0
 }
 
+function convertedFileLabel(w) {
+  const ext = w?.converted_path?.split('.').pop()?.toUpperCase()
+  return ext || '已转换'
+}
+
+function convertedFileTitle(w) {
+  if (!w?.converted_path) return '在浏览器中直接查看转换文件'
+  return `在浏览器中直接查看 ${convertedFileLabel(w)} 转换文件`
+}
+
+function canConvert(w) {
+  return !w?.converted_exists
+}
+
 function encodeFileUrl(url) {
   if (!url) return ''
   return url.split('/').map((seg, i) => i === 0 ? seg : encodeURIComponent(seg)).join('/')
+}
+
+function isVideoUrl(url) {
+  const clean = String(url || '').split('?')[0].toLowerCase()
+  return ['.mp4', '.webm', '.mov', '.m4v'].some(ext => clean.endsWith(ext))
+}
+
+function dynamicPreviewVideoUrl(w) {
+  return isVideoUrl(w?.file_url) ? w.file_url : ''
+}
+
+function isPortraitWallpaper(w) {
+  const width = Number(w?.width || 0)
+  const height = Number(w?.height || 0)
+  return width > 0 && height > width
+}
+
+function mediaAspectStyle(w) {
+  const width = Number(w?.width || 0)
+  const height = Number(w?.height || 0)
+  if (width <= 0 || height <= 0) return null
+  return { aspectRatio: `${width} / ${height}` }
+}
+
+function playPreview(event) {
+  const media = event?.target
+  if (!media?.play) return
+  media.play().catch(() => {})
+}
+
+function resetPreview(event) {
+  const media = event?.target
+  if (!media) return
+  if (media.pause) media.pause()
+  try {
+    media.currentTime = 0
+  } catch {
+    // 某些浏览器在 metadata 尚未加载时会拒绝 seek，忽略即可
+  }
 }
 
 function showConfirm(title, message = '', confirmText = '确认') {
@@ -512,22 +581,39 @@ function openInBrowser(url) {
 }
 
 async function convertOne(w) {
+  if (!canConvert(w)) {
+    alert('已存在转换文件，请先删除后再重新转换')
+    return
+  }
+  if (converting.value) return
   converting.value = true
   try {
     const res = await convertApi.batchConvert({ scope: 'selected', wallpaper_ids: [w.id] })
-    if (res.success_count > 0) {
-      const item = res.items?.[0]
-      if (item?.converted_path) {
-        w.converted_path = item.converted_path
-        w.converted_url = `/downloads/${item.converted_path}`
-        if (item.deleted_original) {
-          w.local_path = item.converted_path
-          w.file_url = `/downloads/${item.converted_path}`
-        }
-      }
-    } else {
-      alert('转换失败，请检查是否已安装 imageio-ffmpeg 并确认格式转换已在配置中启用。')
+    if (!res.batch_id) {
+      const reason = res.skipped_items?.[0]?.reason || res.message || '没有可转换的文件'
+      alert(reason)
+      return
     }
+
+    let batch = null
+    for (let index = 0; index < 300; index += 1) {
+      batch = await convertApi.batchStatus(res.batch_id)
+      if (batch?.is_complete) break
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+
+    if (!batch?.is_complete) {
+      alert('转换任务仍在后台运行，请到“格式转换”页面查看队列进度。')
+      return
+    }
+
+    if (batch.success > 0) {
+      await loadGallery()
+      return
+    }
+
+    const reason = batch.failed_items?.[0]?.reason || '请检查 imageio-ffmpeg / webp 依赖以及当前转换配置'
+    alert(`转换失败: ${reason}`)
   } catch (e) {
     alert(`转换失败: ${e.message}`)
   } finally {
@@ -751,6 +837,7 @@ onMounted(() => {
 
 /* 图片区 */
 .img-wrapper { position: relative; aspect-ratio: 16/9; background: var(--bg-base); overflow: hidden; }
+.img-wrapper--portrait { background: linear-gradient(180deg, rgba(255,255,255,.02), rgba(0,0,0,.08)); }
 .gallery-img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .2s; }
 .gallery-item:hover .gallery-img { transform: scale(1.03); }
 
@@ -795,6 +882,13 @@ onMounted(() => {
 .overlay-actions { display: flex; gap: 4px; align-items: center; }
 .convert-btn { font-size: 11px; padding: 3px 8px; color: #a78bfa; border-color: rgba(167,139,250,.4); }
 .convert-btn:hover { background: rgba(167,139,250,.15); border-color: #a78bfa; color: #a78bfa; }
+.convert-btn--disabled,
+.convert-btn:disabled {
+  color: var(--text-3);
+  border-color: var(--border);
+  background: rgba(255,255,255,.04);
+  cursor: not-allowed;
+}
 
 .select-box {
   position: absolute; top: 6px; left: 6px; z-index: 2; cursor: pointer;

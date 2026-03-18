@@ -77,14 +77,120 @@ def _get_cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
 
 
+def _estimate_cpu_guard_ms(
+    cpu_nice: int,
+    cpu_count: int,
+    pixel_count: int,
+    unlimited: bool,
+) -> float:
+    """
+    估算每帧需要额外让出的 CPU 时间（毫秒）。
+
+    目标不是把编码“变慢”，而是在低核 / 高分辨率 / 全帧模式下
+    主动给系统交出时间片，降低机器卡死风险。
+    """
+    guard_ms = 0.0
+    if cpu_nice > 0:
+        guard_ms += min(12.0, cpu_nice * 0.7)
+    if cpu_count <= 4:
+        guard_ms += 8.0
+    elif cpu_count <= 8:
+        guard_ms += 4.0
+    if pixel_count >= 3840 * 2160:
+        guard_ms += 6.0
+    elif pixel_count >= 1920 * 1080:
+        guard_ms += 3.0
+    if unlimited:
+        guard_ms += 2.0
+    return guard_ms
+
+
+def is_webp_available() -> bool:
+    """返回当前环境是否可用 pywebp 动态 WebP 编码依赖。"""
+    try:
+        import webp  # noqa: F401, import-outside-toplevel
+        return True
+    except ImportError:
+        return False
+
+
 def _set_low_priority(nice: int) -> None:
-    """降低当前线程/进程的 CPU 调度优先级（仅 Linux/Unix）"""
+    """降低当前进程的 CPU 调度优先级，兼容 Linux / Windows。"""
     if nice <= 0:
         return
+    applied = False
     try:
-        os.nice(nice)
+        if os.name != "nt":
+            os.nice(nice)
+            applied = True
     except (OSError, AttributeError):
-        pass  # Windows 无 os.nice，忽略
+        pass
+    try:
+        import psutil  # noqa: import-outside-toplevel
+        proc = psutil.Process()
+        if os.name == "nt":
+            priority = (
+                psutil.IDLE_PRIORITY_CLASS
+                if nice >= 10 else
+                psutil.BELOW_NORMAL_PRIORITY_CLASS
+            )
+            proc.nice(priority)
+        elif not applied:
+            proc.nice(min(19, max(0, nice)))
+    except Exception:
+        pass
+
+
+class _CpuGuard:
+    """在逐帧编码期间主动让出 CPU，优先保护低配机器可用性。"""
+
+    def __init__(self, cpu_nice: int, pixel_count: int, unlimited: bool):
+        self.cpu_nice = max(0, int(cpu_nice or 0))
+        self.cpu_count = _get_cpu_count()
+        self._base_sleep_ms = _estimate_cpu_guard_ms(
+            cpu_nice=self.cpu_nice,
+            cpu_count=self.cpu_count,
+            pixel_count=max(0, pixel_count),
+            unlimited=unlimited,
+        )
+        self._dynamic_sleep_ms = 0.0
+        self._proc = None
+        self._psutil = None
+        try:
+            import psutil  # noqa: import-outside-toplevel
+            self._psutil = psutil
+            self._proc = psutil.Process()
+            self._proc.cpu_percent(None)
+            psutil.cpu_percent(None)
+        except Exception:
+            self._proc = None
+            self._psutil = None
+
+    def pause(self, frame_count: int) -> None:
+        sleep_ms = self._base_sleep_ms
+        if self._proc and self._psutil and frame_count % 12 == 0:
+            try:
+                system_cpu = self._psutil.cpu_percent(None)
+                process_cpu = self._proc.cpu_percent(None)
+                dynamic_sleep_ms = 0.0
+                if system_cpu >= 92:
+                    dynamic_sleep_ms += 18.0
+                elif system_cpu >= 85:
+                    dynamic_sleep_ms += 10.0
+                elif system_cpu >= 75:
+                    dynamic_sleep_ms += 4.0
+                if self.cpu_count <= 4 and process_cpu >= 90:
+                    dynamic_sleep_ms += 8.0
+                elif self.cpu_count <= 8 and process_cpu >= 90:
+                    dynamic_sleep_ms += 4.0
+                self._dynamic_sleep_ms = dynamic_sleep_ms
+            except Exception:
+                self._dynamic_sleep_ms = 0.0
+        sleep_ms += self._dynamic_sleep_ms
+        if sleep_ms > 0:
+            time.sleep(min(0.04, sleep_ms / 1000.0))
+        else:
+            time.sleep(0)
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -167,11 +273,11 @@ class VideoConvertConfig:
     """
     enabled: bool = False
     output_format: str = "webp"     # "webp" | "gif"
-    fps: int = 10                    # 输出帧率；0 = 保留源帧率（原图模式）
-    max_frames: int = 120            # 最多提取帧数；0 = 不限（原图模式全帧转换）
+    fps: int = 0                     # 输出帧率；0 = 保留源帧率（原图模式）
+    max_frames: int = 0              # 最多提取帧数；0 = 不限（原图模式全帧转换）
     width: int = 0                   # 目标宽度（0 = 使用 max_width 自动裁剪）
-    max_width: int = 1280            # 帧宽上限；0 = 不缩放（原图模式）
-    quality: int = 80                # WebP 质量（1-100）
+    max_width: int = 0               # 帧宽上限；0 = 不缩放（原图模式）
+    quality: int = 100               # WebP 质量（1-100）
     delete_original: bool = False    # 转换完成后删除原 MP4
     timeout_seconds: int = 300       # 单文件最长转换时间；超时已写帧仍保留
     cpu_nice: int = 5                # Linux CPU 优先级降级量（0=不降，19=最低）
@@ -187,7 +293,7 @@ class ImageConvertConfig:
     """静态图 PNG/JPG → WebP / JPG / PNG 配置"""
     enabled: bool = False
     output_format: str = "webp"     # "webp" | "jpg" | "png"
-    quality: int = 85                # JPEG / WebP 质量（1-100）
+    quality: int = 100               # JPEG / WebP 质量（1-100）
     delete_original: bool = False    # 转换完成后删除原文件
     timeout_seconds: int = 120       # 单文件最长转换时间
     cpu_nice: int = 5                # CPU 优先级降级
@@ -436,6 +542,7 @@ class MediaConverter:
         aborted     = False
         covered_full_duration = False
         last_frame_ts_ms: Optional[int] = None
+        cpu_guard = _CpuGuard(cfg.cpu_nice, target_w * target_h, unlimited)
 
         # 原图模式（unlimited=全帧）不设超时，保证完整转换
         # 标准/低配模式使用 cfg.timeout_seconds 保护服务器
@@ -483,13 +590,13 @@ class MediaConverter:
                         enc.encode_frame(pic, frame_ts_ms, webp_cfg)
                     except Exception as exc:
                         logger.warning("[Converter] 第 %d 帧编码失败，跳过: %s", frame_idx, exc)
-                        time.sleep(0)
+                        cpu_guard.pause(frame_count)
                         continue
 
                     last_frame_ts_ms = frame_ts_ms
                     frame_count += 1
                     del frame_np  # 显式释放原始像素
-                    time.sleep(0)
+                    cpu_guard.pause(frame_count)
                 else:
                     covered_full_duration = True
 
@@ -559,6 +666,7 @@ class MediaConverter:
         aborted = False
         covered_full_duration = False
         effective_timeout = 0 if unlimited else cfg.timeout_seconds
+        cpu_guard = _CpuGuard(cfg.cpu_nice, target_w * target_h, unlimited)
 
         try:
             with _ConvertTimeout(effective_timeout) as cancel_ev:
@@ -593,7 +701,7 @@ class MediaConverter:
                     frames_pil.append(Image.fromarray(frame_np).convert("P", palette=Image.ADAPTIVE))
                     frame_timestamps_ms.append(_source_frame_timestamp_ms(frame_idx, src_fps))
                     del frame_np
-                    time.sleep(0)
+                    cpu_guard.pause(len(frames_pil))
                 else:
                     covered_full_duration = True
 
@@ -754,19 +862,19 @@ class MediaConverter:
             tier = "high"
             recommend = {
                 "max_frames": 200, "max_width": 1920, "fps": 30,
-                "timeout_seconds": 300, "max_concurrent": 2,
+                "quality": 80, "timeout_seconds": 300, "max_concurrent": 2,
             }
         elif available_mb >= 1024:
             tier = "mid"
             recommend = {
                 "max_frames": 120, "max_width": 1280, "fps": 30,
-                "timeout_seconds": 600, "max_concurrent": 1,
+                "quality": 80, "timeout_seconds": 600, "max_concurrent": 1,
             }
         else:
             tier = "low"
             recommend = {
                 "max_frames": 60, "max_width": 1280, "fps": 15,
-                "timeout_seconds": 900, "max_concurrent": 1,
+                "quality": 70, "timeout_seconds": 900, "max_concurrent": 1,
             }
 
         # 固定预设定义（前端用于一键切换）
@@ -774,7 +882,7 @@ class MediaConverter:
             "original": {
                 "label": "原图模式",
                 "hint": "保留源帧率/分辨率/全帧，流式写入无内存限制，文件可能很大",
-                "fps": 0, "max_width": 0, "max_frames": 0, "quality": 90,
+                "fps": 0, "max_width": 0, "max_frames": 0, "quality": 100,
             },
             "standard": {
                 "label": "标准模式",
@@ -794,4 +902,5 @@ class MediaConverter:
             "tier": tier,
             "recommend": recommend,
             "presets": presets,
+            "webp_available": is_webp_available(),
         }

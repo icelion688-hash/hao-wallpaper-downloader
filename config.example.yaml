@@ -79,11 +79,11 @@ media_convert:
   video:                   # MP4 → 动态 WebP / GIF
     enabled: false
     output_format: "webp"  # "webp" | "gif"（WebP 体积更小，浏览器直接以 <img> 自动循环播放）
-    fps: 10                # 输出帧率（降低帧率可显著减小体积）
-    max_frames: 120        # 最多提取帧数（实际值由可用内存自动压缩）
+    fps: 0                 # 0 = 保留源帧率（默认原图直出）
+    max_frames: 0          # 0 = 全帧保留（默认不裁剪时长）
     width: 0               # 输出宽度（0 = 使用 max_width 自动裁剪）
-    max_width: 1280        # 帧宽硬上限（4K→1280px 内存从 24MB/帧降至 2.8MB/帧）
-    quality: 80            # WebP 质量（1-100）
+    max_width: 0           # 0 = 不缩放（默认保留原分辨率）
+    quality: 100           # WebP 质量（1-100，默认尽量保真）
     delete_original: false # true = 转换成功后删除原 MP4
     timeout_seconds: 300   # 单文件超时（秒）；全帧转换（max_frames=0）时自动忽略
     cpu_nice: 5            # CPU 调度降权（0=不降，5=后台，19=最低；仅 Linux）
@@ -91,7 +91,7 @@ media_convert:
   image:                   # PNG/JPEG → WebP / JPG / PNG
     enabled: false
     output_format: "webp"  # "webp" | "jpg" | "png"
-    quality: 85            # JPEG/WebP 质量（1-100）
+    quality: 100           # JPEG/WebP 质量（1-100，默认尽量保真）
     delete_original: false # true = 转换成功后删除原文件
     timeout_seconds: 120   # 单文件超时（秒）
     cpu_nice: 5            # CPU 调度降权

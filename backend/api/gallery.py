@@ -92,6 +92,9 @@ def _apply_filters(
 
 def _w_to_dict(w: Wallpaper) -> dict:
     rel = w.local_path.replace("\\", "/") if w.local_path else None
+    converted_rel = w.converted_path.replace("\\", "/") if w.converted_path else None
+    converted_abs = os.path.join(DOWNLOAD_ROOT, w.converted_path) if w.converted_path else None
+    converted_exists = bool(converted_abs and os.path.exists(converted_abs))
     return {
         "id": w.id,
         "resource_id": w.resource_id,
@@ -119,9 +122,10 @@ def _w_to_dict(w: Wallpaper) -> dict:
         "upload_records": parse_upload_records(w.upload_records),
         "video_duration": w.video_duration,
         "converted_path": w.converted_path,
+        "converted_exists": converted_exists,
         "converted_url": (
-            f"/downloads/{w.converted_path.replace(chr(92), '/')}"
-            if w.converted_path else None
+            f"/downloads/{converted_rel}"
+            if converted_rel and converted_exists else None
         ),
     }
 
@@ -188,6 +192,21 @@ def _resolve_upload_asset(
     if wallpaper.wallpaper_type == "dynamic":
         return None, None, f"当前是动态图，请先转换出 {UPLOAD_FORMAT_LABELS[normalized]} 再上传"
     return None, None, f"当前未找到可上传的 {UPLOAD_FORMAT_LABELS[normalized]} 文件"
+
+
+def _delete_wallpaper_files(wallpaper: Wallpaper) -> int:
+    """删除原文件和转换产物，返回删除失败次数。"""
+    failed = 0
+    rel_paths = [wallpaper.local_path, wallpaper.converted_path]
+    for rel_path in {path for path in rel_paths if path}:
+        abs_path = os.path.join(DOWNLOAD_ROOT, rel_path)
+        try:
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+        except OSError as exc:
+            logger.warning("[Gallery] 删除文件失败: %s — %s", abs_path, exc)
+            failed += 1
+    return failed
 
 
 class BatchDeleteRequest(BaseModel):
@@ -443,14 +462,8 @@ async def batch_delete_wallpapers(body: BatchDeleteRequest, db: Session = Depend
     deleted_count = 0
     file_failed = 0
     for w in wallpapers:
-        if body.delete_file and w.local_path:
-            abs_path = os.path.join(DOWNLOAD_ROOT, w.local_path)
-            try:
-                if os.path.exists(abs_path):
-                    os.remove(abs_path)
-            except OSError as exc:
-                logger.warning("[Gallery] 删除文件失败: %s — %s", abs_path, exc)
-                file_failed += 1
+        if body.delete_file:
+            file_failed += _delete_wallpaper_files(w)
         db.delete(w)
         deleted_count += 1
     db.commit()
@@ -462,10 +475,8 @@ async def delete_wallpaper(wallpaper_id: int, delete_file: bool = True, db: Sess
     w = db.query(Wallpaper).filter(Wallpaper.id == wallpaper_id).first()
     if not w:
         raise HTTPException(404)
-    if delete_file and w.local_path:
-        abs_path = os.path.join(DOWNLOAD_ROOT, w.local_path)
-        if os.path.exists(abs_path):
-            os.remove(abs_path)
+    if delete_file:
+        _delete_wallpaper_files(w)
     db.delete(w)
     db.commit()
     return {"success": True}
@@ -500,7 +511,7 @@ async def clean_duplicates(dry_run: bool = False, db: Session = Depends(get_db))
 
 # 转换预设（覆盖 media_convert 配置中对应字段）
 _CONVERT_PRESETS: dict[str, dict] = {
-    "original": {"fps": 0, "max_width": 0, "max_frames": 0, "quality": 90},
+    "original": {"fps": 0, "max_width": 0, "max_frames": 0, "quality": 100},
     "standard": {"fps": 30, "max_width": 1280, "max_frames": 120, "quality": 80},
     "lite":     {"fps": 8,  "max_width": 854,  "max_frames": 30,  "quality": 65},
 }
@@ -551,9 +562,16 @@ async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depe
         if not w.local_path:
             skipped_items.append({"id": w.id, "reason": "缺少本地路径"})
             continue
+        if (w.wallpaper_type or "static") == "dynamic":
+            skipped_items.append({"id": w.id, "reason": "已关闭动态图转换，仅保留静态图转换"})
+            continue
         abs_path = os.path.join(DOWNLOAD_ROOT, w.local_path)
         if not os.path.exists(abs_path):
             skipped_items.append({"id": w.id, "reason": "本地文件不存在"})
+            continue
+        converted_abs = os.path.join(DOWNLOAD_ROOT, w.converted_path) if w.converted_path else None
+        if converted_abs and os.path.exists(converted_abs):
+            skipped_items.append({"id": w.id, "reason": "已存在转换文件，请先删除后再重新转换"})
             continue
         valid_items.append({
             "id": w.id,
@@ -567,7 +585,8 @@ async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depe
             "batch_id": None,
             "queued_count": 0,
             "skipped_count": len(skipped_items),
-            "message": "没有可转换的壁纸",
+            "skipped_items": skipped_items,
+            "message": skipped_items[0]["reason"] if len(skipped_items) == 1 else "没有可转换的壁纸",
         }
 
     cq = _get_convert_queue()
@@ -585,6 +604,7 @@ async def batch_convert_wallpapers(body: BatchConvertRequest, db: Session = Depe
         "batch_id": job.batch_id,
         "queued_count": job.total,
         "skipped_count": len(skipped_items),
+        "skipped_items": skipped_items,
         "message": f"已入队 {job.total} 个任务，后台转换中",
     }
 

@@ -1,7 +1,7 @@
 <template>
   <div>
     <div class="page-header">
-      <h1 class="page-title">格式转换 <small>MP4 → 动态 WebP / GIF · 静态图 → WebP</small></h1>
+      <h1 class="page-title">格式转换 <small>静态图 → WebP / JPG / PNG</small></h1>
       <div class="header-actions">
         <button class="btn" @click="applyRecommend" :disabled="!sysInfo || applyingRecommend" title="根据当前机器配置一键填入建议值并保存">
           {{ applyingRecommend ? '应用中…' : '一键推荐配置' }}
@@ -45,10 +45,9 @@
       <div class="notice-card">
         <div class="notice-icon">ℹ</div>
         <div>
-          视频转换需要 <code>imageio-ffmpeg</code>（pip 包，内含 ffmpeg 二进制，<strong>无需系统安装</strong>）。
-          运行 <code>pip install imageio imageio-ffmpeg</code> 安装。
-          静态图转换仅需 Pillow（已内置）。已内置 CPU 降权、内存自适应和超时保护，不会卡死服务器。
-          全帧转换会沿用原视频时间轴，原图模式下也会自动忽略视频超时，避免 4K 长视频被截短。
+          当前版本仅保留静态图格式转换。
+          为了适配小型服务器并降低 CPU 压力，动态图转换入口已关闭。
+          静态图转换仅需 Pillow（已内置），支持 WebP / JPG / PNG。
         </div>
       </div>
 
@@ -61,7 +60,7 @@
               <input type="checkbox" v-model="form.auto_convert" />
               <div>
                 <div class="toggle-label">下载时自动转换</div>
-                <div class="toggle-sub">下载完成后立即后台转换，视频较慢，建议在低并发时开启</div>
+                <div class="toggle-sub">下载完成后立即后台转换静态图，适合低并发小机器</div>
               </div>
             </label>
             <div class="form-row">
@@ -72,24 +71,10 @@
               </div>
             </div>
             <div class="form-row">
-              <label>视频超时 <span class="form-hint">标准/低配模式生效；全帧转换时自动忽略</span></label>
-              <div class="input-row">
-                <input class="input" type="number" v-model.number="form.video.timeout_seconds" min="30" max="3600" />
-                <span class="unit">秒</span>
-              </div>
-            </div>
-            <div class="form-row">
               <label>图片超时</label>
               <div class="input-row">
                 <input class="input" type="number" v-model.number="form.image.timeout_seconds" min="10" max="600" />
                 <span class="unit">秒</span>
-              </div>
-            </div>
-            <div class="form-row">
-              <label>CPU 降权（视频） <span class="form-hint">0=不降 5=后台 19=最低，仅 Linux</span></label>
-              <div class="nice-row">
-                <input type="range" class="range" v-model.number="form.video.cpu_nice" min="0" max="19" />
-                <span class="quality-val font-mono">{{ NICE_LABEL[form.video.cpu_nice] || form.video.cpu_nice }}</span>
               </div>
             </div>
             <div class="form-row">
@@ -99,111 +84,24 @@
                 <span class="quality-val font-mono">{{ NICE_LABEL[form.image.cpu_nice] || form.image.cpu_nice }}</span>
               </div>
             </div>
+            <div class="form-row">
+              <label>动态图转换</label>
+              <div class="input-row">
+                <span class="unit">已关闭，仅保留静态图转换</span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
 
       <div class="two-col">
-        <!-- 视频转换 -->
         <div class="card">
-          <div class="card-header">
-            <span>视频 &nbsp;MP4 → 动态 WebP / GIF</span>
-            <label class="inline-toggle">
-              <input type="checkbox" v-model="form.video.enabled" />
-              <span>{{ form.video.enabled ? '已启用' : '已禁用' }}</span>
-            </label>
-          </div>
-          <!-- 预设按钮行 -->
-          <div class="preset-row">
-            <span class="preset-label">快速预设：</span>
-            <button
-              v-for="p in VIDEO_PRESETS" :key="p.key"
-              class="btn btn--preset"
-              :class="{ 'btn--preset-active': activePreset === p.key }"
-              @click="applyVideoPreset(p.key)"
-              :title="p.hint"
-            >{{ p.label }}</button>
-            <button
-              v-if="activePreset"
-              class="btn btn--preset-clear"
-              @click="activePreset = null"
-              title="取消预设选中（不影响当前值）"
-            >✕ 取消预设</button>
-          </div>
-          <div class="card-body" :class="{ 'cfg-disabled': !form.video.enabled }">
-            <div class="form-grid">
-              <div class="form-row">
-                <label>输出格式</label>
-                <select class="select" v-model="form.video.output_format">
-                  <option value="webp">动态 WebP（推荐，体积小，浏览器 &lt;img&gt; 自动循环）</option>
-                  <option value="gif">GIF（兼容性更强，体积大）</option>
-                </select>
-              </div>
-              <div class="form-row">
-                <label>输出帧率
-                  <span class="form-hint">0 = 保留源帧率（原图模式）</span>
-                </label>
-                <div class="input-row">
-                  <input class="input" type="number" v-model.number="form.video.fps" min="0" max="120" />
-                  <span class="unit">fps</span>
-                  <span class="unit-tag unit-tag--special" v-if="form.video.fps === 0">源帧率</span>
-                </div>
-              </div>
-              <div class="form-row">
-                <label>
-                  最大帧数
-                  <span class="form-hint">0 = 不限（原图模式全帧转换）</span>
-                  <span class="form-badge" :class="framesBudgetClass" v-if="form.video.max_frames > 0">{{ framesBudgetHint }}</span>
-                </label>
-                <div class="input-row">
-                  <input class="input" type="number" v-model.number="form.video.max_frames" min="0" max="9999" />
-                  <span class="unit">帧</span>
-                  <span class="unit-tag unit-tag--special" v-if="form.video.max_frames === 0">全帧</span>
-                  <span class="unit-calc" v-else-if="form.video.fps > 0">
-                    ≈ {{ (form.video.max_frames / form.video.fps).toFixed(1) }}s
-                  </span>
-                </div>
-              </div>
-              <div class="form-row">
-                <label>
-                  帧宽上限 max_width
-                  <span class="form-hint">0 = 不缩放（原图模式）</span>
-                </label>
-                <div class="input-row">
-                  <input class="input" type="number" v-model.number="form.video.max_width" min="0" step="8" />
-                  <span class="unit">px</span>
-                  <span class="unit-tag unit-tag--special" v-if="form.video.max_width === 0">原始尺寸</span>
-                  <span class="unit-calc" v-else-if="form.video.max_width">~{{ memPerFrame(form.video.max_width) }} MB/帧</span>
-                </div>
-              </div>
-              <div class="form-row">
-                <label>固定输出宽度 <span class="form-hint">0 = 使用 max_width 自动裁剪</span></label>
-                <div class="input-row">
-                  <input class="input" type="number" v-model.number="form.video.width" min="0" step="8" />
-                  <span class="unit">px</span>
-                </div>
-              </div>
-              <div class="form-row">
-                <label>WebP 质量 <span class="form-hint">仅 WebP 格式生效</span></label>
-                <div class="quality-row">
-                  <input type="range" class="range" v-model.number="form.video.quality" min="1" max="100" />
-                  <span class="quality-val font-mono">{{ form.video.quality }}</span>
-                </div>
-              </div>
-              <div class="form-row">
-                <label class="toggle-row toggle-row--inline">
-                  <input type="checkbox" v-model="form.video.delete_original" />
-                  <div>
-                    <div class="toggle-label">转换后删除原 MP4</div>
-                    <div class="toggle-sub">⚠ 不可恢复，请先确认质量满意</div>
-                  </div>
-                </label>
-              </div>
-            </div>
+          <div class="card-header">动态图转换</div>
+          <div class="card-body">
+            <div class="inline-note">已关闭动态图转换，仅保留静态图格式转换与原始文件保存。</div>
           </div>
         </div>
 
-        <!-- 静态图转换 -->
         <div class="card">
           <div class="card-header">
             <span>静态图 &nbsp;PNG / JPG → WebP / JPG / PNG</span>
@@ -251,18 +149,7 @@
             <div class="form-row">
               <label>转换范围</label>
               <select class="select" v-model="batchScope">
-                <option value="dynamic">全部动态视频（MP4）</option>
                 <option value="static">全部静态图片</option>
-                <option value="all">全部（视频 + 图片）</option>
-              </select>
-            </div>
-            <div class="form-row">
-              <label>视频预设 <span class="form-hint">快速切换质量/内存策略</span></label>
-              <select class="select" v-model="batchPreset">
-                <option value="">使用上方配置</option>
-                <option value="original">原图模式（保留源帧率/分辨率/全帧）</option>
-                <option value="standard">标准模式（30fps / 1280px）</option>
-                <option value="lite">低配模式（8fps / 854px，内存极低）</option>
               </select>
             </div>
             <div class="form-row">
@@ -270,7 +157,6 @@
               <select class="select" v-model="batchFormat">
                 <option value="">使用配置默认值</option>
                 <option value="webp">WebP</option>
-                <option value="gif">GIF（仅视频）</option>
                 <option value="jpg">JPEG（仅图片）</option>
                 <option value="png">PNG（仅图片）</option>
               </select>
@@ -346,9 +232,9 @@ const saving          = ref(false)
 const applyingRecommend = ref(false)
 const converting      = ref(false)
 const sysInfo         = ref(null)
-const activePreset    = ref(null)  // 当前选中的视频预设 key
+const activePreset    = ref('original')  // 当前选中的视频预设 key
 
-const batchScope          = ref('dynamic')
+const batchScope          = ref('static')
 const batchPreset         = ref('')
 const batchFormat         = ref('')
 const batchDeleteOriginal = ref(false)
@@ -369,7 +255,7 @@ const VIDEO_PRESETS = [
     key: 'original',
     label: '原图模式',
     hint: '保留源帧率/分辨率/全帧，流式写入无内存限制，文件较大',
-    values: { fps: 0, max_width: 0, max_frames: 0, quality: 90 },
+    values: { fps: 0, max_width: 0, max_frames: 0, quality: 100 },
   },
   {
     key: 'standard',
@@ -386,6 +272,25 @@ const VIDEO_PRESETS = [
 ]
 
 const TIER_LABEL = { high: '高配机器', mid: '中配机器', low: '低配机器' }
+const VIDEO_FPS_CHOICES = [
+  { label: '源帧率', value: 0 },
+  { label: '24fps', value: 24 },
+  { label: '30fps', value: 30 },
+  { label: '60fps', value: 60 },
+  { label: '120fps', value: 120 },
+]
+const VIDEO_WIDTH_CHOICES = [
+  { label: '原始尺寸', value: 0 },
+  { label: '1080p', value: 1920 },
+  { label: '2K', value: 2560 },
+  { label: '4K', value: 3840 },
+]
+const VIDEO_FRAME_CHOICES = [
+  { label: '全帧/全时长', value: 0 },
+  { label: '120 帧', value: 120 },
+  { label: '240 帧', value: 240 },
+  { label: '360 帧', value: 360 },
+]
 
 // nice 值 → 可读标签
 const NICE_LABEL = { 0: '不降权', 5: '后台(5)', 10: '较低(10)', 15: '很低(15)', 19: '最低(19)' }
@@ -395,18 +300,41 @@ const DEFAULT_FORM = () => ({
   max_concurrent: 1,
   video: {
     enabled: false, output_format: 'webp',
-    fps: 10, max_frames: 120, width: 0, max_width: 1280,
-    quality: 80, delete_original: false,
+    fps: 0, max_frames: 0, width: 0, max_width: 0,
+    quality: 100, delete_original: false,
     timeout_seconds: 300, cpu_nice: 5,
   },
   image: {
     enabled: false, output_format: 'webp',
-    quality: 85, delete_original: false,
+    quality: 100, delete_original: false,
     timeout_seconds: 120, cpu_nice: 5,
   },
 })
 
 const form = ref(DEFAULT_FORM())
+
+const videoPolicySummary = computed(() => {
+  const fpsText = form.value.video.fps === 0 ? '保留源帧率' : `${form.value.video.fps}fps`
+  const widthText = form.value.video.max_width === 0 ? '保留源分辨率' : `最长 ${form.value.video.max_width}px`
+  const framesText = form.value.video.max_frames === 0 ? '保留源时长 / 全帧' : `最多 ${form.value.video.max_frames} 帧`
+  const qualityText = form.value.video.output_format === 'webp' ? `质量 ${form.value.video.quality}` : 'GIF 按时间轴输出'
+  return `${fpsText} · ${widthText} · ${framesText} · ${qualityText}`
+})
+
+function syncActivePreset() {
+  const matched = VIDEO_PRESETS.find(({ values }) =>
+    values.fps === form.value.video.fps &&
+    values.max_width === form.value.video.max_width &&
+    values.max_frames === form.value.video.max_frames &&
+    values.quality === form.value.video.quality
+  )
+  activePreset.value = matched?.key || null
+}
+
+function setVideoField(field, value) {
+  form.value.video[field] = value
+  syncActivePreset()
+}
 
 // ── 内存消耗估算（MB/帧） ─────────────────────────────
 function memPerFrame(width) {
@@ -419,6 +347,15 @@ function memPerFrame(width) {
 // ── 帧数内存预警 ──────────────────────────────────────
 const framesBudgetHint = computed(() => {
   if (!sysInfo.value) return ''
+  if (form.value.video.max_frames === 0 && form.value.video.max_width === 0) {
+    return '原图直出: 不限制帧率、分辨率和时长，实际占用取决于源视频'
+  }
+  if (form.value.video.max_frames === 0) {
+    return '全帧模式: 不限制时长，实际占用取决于源视频总帧数'
+  }
+  if (form.value.video.max_width === 0) {
+    return '原始分辨率: 不缩放，内存占用按源视频尺寸波动'
+  }
   const mpf = parseFloat(memPerFrame(form.value.video.max_width || 1280))
   const totalMb = mpf * form.value.video.max_frames
   const avail   = sysInfo.value.available_memory_mb
@@ -430,6 +367,9 @@ const framesBudgetHint = computed(() => {
 
 const framesBudgetClass = computed(() => {
   const hint = framesBudgetHint.value
+  if (hint.startsWith('原图直出') || hint.startsWith('全帧模式') || hint.startsWith('原始分辨率')) {
+    return 'badge--ok'
+  }
   if (hint.startsWith('警告')) return 'badge--warn'
   if (hint.startsWith('中等')) return 'badge--ok'
   return 'badge--safe'
@@ -462,6 +402,7 @@ function mergeForm(data) {
   if (typeof data.max_concurrent === 'number') form.value.max_concurrent = data.max_concurrent
   if (data.video) Object.assign(form.value.video, data.video)
   if (data.image) Object.assign(form.value.image, data.image)
+  syncActivePreset()
 }
 
 // ── 视频预设切换 ──────────────────────────────────────
@@ -469,7 +410,7 @@ function applyVideoPreset(key) {
   const preset = VIDEO_PRESETS.find(p => p.key === key)
   if (!preset) return
   Object.assign(form.value.video, preset.values)
-  activePreset.value = key
+  syncActivePreset()
 }
 
 // ── 一键推荐配置（应用并自动保存）────────────────────
@@ -480,8 +421,10 @@ async function applyRecommend() {
   form.value.video.max_frames = r.max_frames
   form.value.video.max_width  = r.max_width
   form.value.video.fps        = r.fps
+  if (r.quality) form.value.video.quality = r.quality
   if (r.timeout_seconds) form.value.video.timeout_seconds = r.timeout_seconds
   if (r.max_concurrent)  form.value.max_concurrent        = r.max_concurrent
+  syncActivePreset()
 
   // 自动保存，让用户看到明确效果
   applyingRecommend.value = true
@@ -764,6 +707,43 @@ code {
   color: var(--text-3); cursor: pointer; font-family: var(--font-ui);
 }
 .btn--preset-clear:hover { color: var(--red); border-color: var(--red); }
+.policy-summary {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 0 16px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.policy-summary strong {
+  color: var(--text-1);
+  font-family: var(--font-ui);
+  letter-spacing: .03em;
+}
+.choice-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.btn--choice {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-hover);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all .15s;
+  font-family: var(--font-ui);
+}
+.btn--choice:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn--choice-active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(79,142,255,.12);
+}
 
 /* ── 特殊标签 ─────────────────────────────── */
 .unit-tag {
