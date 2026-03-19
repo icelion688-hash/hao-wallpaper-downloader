@@ -41,23 +41,33 @@ VIDEO_URL      = "/link/common/file/getVideoReduce"   # 视频预览
 _AES_KEY = b"68zhehao2O776519"
 _AES_IV  = b"aa176b7519e84710"
 
-# 静态图片 type 值（参考前端 Lf 数组，1=静态图, 4=gif?）
-STATIC_TYPES = {1, 4}
+# 静态图片 type 值（实测 2026-03-19）
+# 电脑壁纸：1/4
+# 手机壁纸：2/6（当前 6 暂未返回，但保留兼容）
+STATIC_TYPES = {1, 2, 4, 6}
+MOBILE_TYPES = {2, 5, 6}
 
 # 排序方式映射（sortType 数值）
+# 2026-03-19 实测站点当前 PC 端下拉为：
+#   1=最新、2=推荐的、3=昨日热门、4=近三天热门、5=上周热门 ...
+# 这里保留历史配置键，兼容已保存的任务与 AutoPilot 配置。
 SORT_MAP = {
-    "yesterday_hot": 1,   # 昨日热门
-    "3days_hot":     2,   # 近三天热门
-    "7days_hot":     3,   # 近七天热门
-    "latest":        4,   # 最新上传
-    "most_views":    5,   # 最多浏览
+    "latest":        1,   # 最新
+    "most_views":    2,   # 兼容旧键：站点当前更接近“推荐的”
+    "yesterday_hot": 3,   # 昨日热门
+    "3days_hot":     4,   # 近三天热门
+    "7days_hot":     5,   # 兼容旧键：站点当前文案为“上周热门”
 }
 
 # wpType 参数（逗号分隔的类型 ID 字符串）
 WP_TYPE_MAP = {
-    "all":     "",   # 空字符串代表全部（服务端默认）
-    "static":  "1",
-    "dynamic": "3",
+    "all":             "",      # 空字符串代表全部（服务端默认，当前更偏电脑端）
+    "static":          "1,4",   # 电脑静态图
+    "dynamic":         "3",     # 电脑动态图
+    "desktop_static":  "1,4",
+    "mobile_static":   "2,6",
+    "desktop_dynamic": "3",
+    "mobile_dynamic":  "5",
 }
 
 
@@ -104,9 +114,12 @@ class WallpaperCrawler:
         category: str = "",
         sort_by: str = "yesterday_hot",
         wallpaper_type: str = "all",
+        source_scope: Optional[str] = None,
         color_theme: str = "",
-        max_count: int = 100,
+        max_count: Optional[int] = 100,
         page_size: int = 20,
+        start_page: int = 1,
+        end_page: Optional[int] = None,
         session_profile: Optional[dict] = None,
     ) -> AsyncIterator[dict]:
         """
@@ -117,24 +130,31 @@ class WallpaperCrawler:
             category:       分类 typeId（如 "0202b9e54c3e843a4e70dc0150399d11"），空为全部
             sort_by:        排序键（见 SORT_MAP）
             wallpaper_type: "all" / "static" / "dynamic"
+            source_scope:   资源来源范围（desktop_static / mobile_static / ...）
             color_theme:    色系 colorId，空为全部
-            max_count:      最多爬取数量
+            max_count:      最多爬取数量；None 表示持续翻页直到没有更多数据
             page_size:      每页条数（建议 12-20）
+            start_page:     起始页码（用于续扫）
+            end_page:       结束页码（包含）；None 表示直到无更多数据
         """
         total_yielded = 0
-        page = 1
+        page = max(1, start_page)
 
         async with self.anti.build_client(cookie, profile=session_profile) as client:
-            while total_yielded < max_count:
+            while (max_count is None or total_yielded < max_count) and (
+                end_page is None or page <= end_page
+            ):
+                rows = page_size if max_count is None else min(page_size, max_count - total_yielded)
                 batch = await self._fetch_list_page(
                     client=client,
                     cookie=cookie,
                     category=category,
                     sort_by=sort_by,
                     wallpaper_type=wallpaper_type,
+                    source_scope=source_scope,
                     color_theme=color_theme,
                     page=page,
-                    page_size=min(page_size, max_count - total_yielded),
+                    page_size=rows,
                     session_profile=session_profile,
                 )
 
@@ -142,10 +162,14 @@ class WallpaperCrawler:
                     logger.info("[Crawler] 第 %d 页无数据，爬取结束", page)
                     break
 
-                for item in batch:
-                    if total_yielded >= max_count:
+                for index_in_page, item in enumerate(batch, start=1):
+                    if max_count is not None and total_yielded >= max_count:
                         break
-                    yield item
+                    yield {
+                        **item,
+                        "_list_page": page,
+                        "_list_index": index_in_page,
+                    }
                     total_yielded += 1
 
                 logger.info("[Crawler] 第 %d 页爬取 %d 条，累计 %d", page, len(batch), total_yielded)
@@ -164,18 +188,20 @@ class WallpaperCrawler:
         category: str,
         sort_by: str,
         wallpaper_type: str,
+        source_scope: Optional[str],
         color_theme: str,
         page: int,
         page_size: int,
         session_profile: Optional[dict] = None,
     ) -> list[dict]:
         """爬取单页列表，返回规范化后的壁纸信息列表"""
+        resolved_wp_type = WP_TYPE_MAP.get(source_scope or wallpaper_type, WP_TYPE_MAP.get(wallpaper_type, ""))
         params: dict = {
             "page":       str(page),
             "sortType":   SORT_MAP.get(sort_by, 1),
             "rows":       page_size,
             "isFavorites": False,
-            "wpType":     WP_TYPE_MAP.get(wallpaper_type, ""),
+            "wpType":     resolved_wp_type,
         }
         if category:
             params["typeId"] = category
@@ -376,6 +402,8 @@ class WallpaperCrawler:
         down_count  = _safe_int(raw.get("downCount"))
         favor_count = _safe_int(raw.get("favorCount"))
 
+        source_route = "mobileViewLook" if wtype in MOBILE_TYPES else "homeViewLook"
+
         return {
             "resource_id":    wt_id,
             "file_id":        file_id,
@@ -397,7 +425,8 @@ class WallpaperCrawler:
             "tags":           ",".join(tags) if isinstance(tags, list) else str(tags),
             "thumbnail_url":  f"{BASE_URL}/link/common/file/getCroppingImg/{file_id}" if file_id else "",
             "download_url":   download_url,
-            "source_url":     f"{BASE_URL}/wallpaper/{wt_id}",
+            "source_url":     f"{BASE_URL}/{source_route}/{wt_id}",
+            "source_route":   source_route,
             "file_mb":        str(raw.get("fileMb") or ""),
             "create_time":    str(raw.get("createTime") or ""),
         }

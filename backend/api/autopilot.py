@@ -61,9 +61,13 @@ async def start(request: Request, body: AutoPilotConfigRequest):
     """启动 AutoPilot，同时保存配置"""
     engine = request.app.state.autopilot
     if engine._status == "running":
-        return {"success": False, "message": "AutoPilot 已在运行中"}
+        return {"success": False, "message": "AutoPilot 已在运行中", "config": engine.get_status()["config"]}
     ok = await engine.start(body.model_dump(), request.app.state)
-    return {"success": ok, "message": "AutoPilot 已启动" if ok else "启动失败"}
+    return {
+        "success": ok,
+        "message": "AutoPilot 已启动" if ok else "启动失败",
+        "config": engine.get_status()["config"],
+    }
 
 
 @router.post("/stop")
@@ -78,5 +82,5 @@ async def stop(request: Request):
 async def update_config(request: Request, body: AutoPilotConfigRequest):
     """更新配置（不影响运行状态，下次会话时生效）"""
     engine = request.app.state.autopilot
-    engine.update_config(body.model_dump())
-    return {"success": True, "message": "配置已更新"}
+    config = engine.update_config(body.model_dump())
+    return {"success": True, "message": "配置已更新", "config": config}

@@ -171,9 +171,9 @@
                 <select class="select" v-model="form.sort_by">
                   <option value="yesterday_hot">昨日热门</option>
                   <option value="3days_hot">近三天热门</option>
-                  <option value="7days_hot">近七天热门</option>
-                  <option value="latest">最新上传</option>
-                  <option value="most_views">最多浏览</option>
+                  <option value="7days_hot">上周热门</option>
+                  <option value="latest">最新</option>
+                  <option value="most_views">推荐的</option>
                 </select>
               </div>
               <div class="form-row">
@@ -383,7 +383,7 @@ function showToast(type, msg, duration = 3500) {
   toastTimer = setTimeout(() => { toast.value = null }, duration)
 }
 
-const SORT_LABELS   = { yesterday_hot: '昨日热门', '3days_hot': '近三天', '7days_hot': '近七天', latest: '最新上传', most_views: '最多浏览' }
+const SORT_LABELS   = { yesterday_hot: '昨日热门', '3days_hot': '近三天', '7days_hot': '上周热门', latest: '最新', most_views: '推荐的' }
 const TYPE_LABELS   = { static: '静态', dynamic: '动态' }
 const ORIENT_LABELS = { landscape: '横屏', portrait: '竖屏' }
 

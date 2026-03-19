@@ -175,6 +175,7 @@
         <div class="delete-result" v-if="deleteResult">
           已删除 {{ deleteResult.deleted_count }} 条记录
           <span v-if="deleteResult.file_failed > 0">（{{ deleteResult.file_failed }} 个文件删除失败）</span>
+          <span v-if="deleteResult.orphan_cleaned > 0">，并清理 {{ deleteResult.orphan_cleaned }} 个残留文件</span>
         </div>
       </template>
     </div>
@@ -819,9 +820,9 @@ onMounted(() => {
 
 /* ── 图片网格 ──────────────────────────────── */
 .gallery-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 16px;
+  /* 瀑布流（CSS Columns）：横图竖图各保持自然高度，不相互拉伸 */
+  column-width: 220px;
+  column-gap: 16px;
 }
 
 .gallery-item {
@@ -830,6 +831,9 @@ onMounted(() => {
   border-radius: var(--radius);
   overflow: hidden;
   transition: border-color .15s;
+  /* 防止卡片在列分隔处断开 */
+  break-inside: avoid;
+  margin-bottom: 16px;
 }
 .gallery-item:hover   { border-color: var(--border-hi); }
 .gallery-item--dup    { border-color: rgba(240,90,90,.4); }
