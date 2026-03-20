@@ -69,6 +69,7 @@ class Downloader:
         category: str = "uncategorized",
         filename: Optional[str] = None,
         wallpaper_type: str = "static",
+        referer_url: Optional[str] = None,
         session_profile: Optional[dict] = None,
     ) -> Optional[str]:
         """
@@ -81,6 +82,7 @@ class Downloader:
             category:     分类目录名（如 "anime", "landscape"）
             filename:     自定义文件名（None 时自动从 URL 提取）
             wallpaper_type: "static" 或 "dynamic"
+            referer_url:  来源详情页（电脑/手机页路径不同）
 
         Returns:
             下载成功时返回本地文件路径（相对于 download_root）
@@ -133,6 +135,7 @@ class Downloader:
                     url=download_url,
                     local_path=local_path,
                     cookie=cookie,
+                    referer_url=referer_url,
                     session_profile=session_profile,
                     wallpaper_type=wallpaper_type,
                 )
@@ -162,6 +165,7 @@ class Downloader:
         url: str,
         local_path: str,
         cookie: str,
+        referer_url: Optional[str] = None,
         session_profile: Optional[dict] = None,
         wallpaper_type: str = "static",
     ) -> bool:
@@ -177,7 +181,7 @@ class Downloader:
 
         headers = self.anti.build_headers(
             cookie,
-            referer=f"https://haowallpaper.com/wallpaper/{resource_id}",
+            referer=referer_url or f"https://haowallpaper.com/wallpaper/{resource_id}",
             profile=session_profile,
         )
 

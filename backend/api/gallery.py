@@ -209,6 +209,45 @@ def _delete_wallpaper_files(wallpaper: Wallpaper) -> int:
     return failed
 
 
+def _prune_empty_download_dirs() -> None:
+    """删除 downloads/ 下的空目录，保留根目录本身。"""
+    for root, dirs, _ in os.walk(DOWNLOAD_ROOT, topdown=False):
+        for dir_name in dirs:
+            abs_path = os.path.join(root, dir_name)
+            try:
+                if abs_path != DOWNLOAD_ROOT and not os.listdir(abs_path):
+                    os.rmdir(abs_path)
+            except OSError:
+                continue
+
+
+def _wipe_download_root() -> tuple[int, int]:
+    """
+    删除 downloads/ 下全部文件并清理空目录。
+
+    返回:
+      (deleted_files, failed_files)
+    """
+    deleted = 0
+    failed = 0
+
+    if not os.path.isdir(DOWNLOAD_ROOT):
+        return deleted, failed
+
+    for root, _, files in os.walk(DOWNLOAD_ROOT):
+        for file_name in files:
+            abs_path = os.path.join(root, file_name)
+            try:
+                os.remove(abs_path)
+                deleted += 1
+            except OSError as exc:
+                logger.warning("[Gallery] 删除残留文件失败: %s — %s", abs_path, exc)
+                failed += 1
+
+    _prune_empty_download_dirs()
+    return deleted, failed
+
+
 class BatchDeleteRequest(BaseModel):
     scope: str = "selected"          # "selected" | "category" | "all"
     wallpaper_ids: list[int] = Field(default_factory=list)
@@ -467,7 +506,18 @@ async def batch_delete_wallpapers(body: BatchDeleteRequest, db: Session = Depend
         db.delete(w)
         deleted_count += 1
     db.commit()
-    return {"success": True, "deleted_count": deleted_count, "file_failed": file_failed}
+
+    orphan_cleaned = 0
+    if body.scope == "all" and body.delete_file:
+        orphan_cleaned, orphan_failed = _wipe_download_root()
+        file_failed += orphan_failed
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "file_failed": file_failed,
+        "orphan_cleaned": orphan_cleaned,
+    }
 
 
 @router.delete("/{wallpaper_id}")

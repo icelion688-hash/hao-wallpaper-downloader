@@ -42,9 +42,9 @@
                 <select class="select" v-model="cfg.sort_by">
                   <option value="yesterday_hot">昨日热门</option>
                   <option value="3days_hot">近三天热门</option>
-                  <option value="7days_hot">近七天热门</option>
-                  <option value="latest">最新上传</option>
-                  <option value="most_views">最多浏览</option>
+                  <option value="7days_hot">上周热门</option>
+                  <option value="latest">最新</option>
+                  <option value="most_views">推荐的</option>
                 </select>
               </div>
               <div class="form-row">
@@ -151,7 +151,7 @@
                     @click="cfg.min_hot_score = s.val">{{ s.label }}</span>
                 </div>
                 <div class="orient-hint" style="margin-top:4px">
-                  热度分 = 下载次数（昨日热门排名越前值越高）。设置阈值可过滤掉小众图片。
+                  热度分 = 列表接口返回的下载次数。设置阈值可过滤掉小众图片。
                 </div>
               </div>
               <div class="form-row">

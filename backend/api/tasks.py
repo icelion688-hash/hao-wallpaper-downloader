@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import subprocess
+from collections import deque
 from datetime import datetime
 from typing import Optional, AsyncIterator
 
@@ -53,6 +54,7 @@ router = APIRouter()
 
 # 运行中的任务 {task_id: asyncio.Task}
 _running_tasks: dict[int, asyncio.Task] = {}
+_STATIC_ORIENTATION_SCAN_LIMIT = 400
 
 
 def _get_convert_queue():
@@ -107,6 +109,144 @@ def _parse_file_mb_to_bytes(file_mb_str: str) -> Optional[int]:
         return int(float(s))
     except (ValueError, TypeError):
         return None
+
+
+def _get_wallpaper_orientation(item: dict) -> str:
+    """根据宽高推断壁纸方向。"""
+    width = item.get("width") or 0
+    height = item.get("height") or 0
+    if width <= 0 or height <= 0:
+        return "unknown"
+    return "landscape" if width >= height else "portrait"
+
+
+def _should_diversify_static_orientations(cfg: FilterConfig) -> bool:
+    """仅在静态图 + 全部方向时启用横竖图补齐。"""
+    return cfg.wallpaper_type == "static" and cfg.screen_orientation == "all"
+
+
+def _resolve_source_scopes(cfg: FilterConfig) -> list[str]:
+    """
+    根据壁纸类型和方向选择需要扫描的站点资源源。
+
+    站点当前使用同一列表接口，但：
+      - 电脑横图主要来自 wpType=1,4
+      - 手机竖图主要来自 wpType=2,6
+      - 动态分别来自 wpType=3 / 5
+    """
+    if cfg.wallpaper_type == "static":
+        if cfg.screen_orientation == "portrait":
+            return ["mobile_static"]
+        if cfg.screen_orientation == "landscape":
+            return ["desktop_static"]
+        return ["desktop_static", "mobile_static"]
+
+    if cfg.wallpaper_type == "dynamic":
+        if cfg.screen_orientation == "portrait":
+            return ["mobile_dynamic"]
+        if cfg.screen_orientation == "landscape":
+            return ["desktop_dynamic"]
+        return ["desktop_dynamic", "mobile_dynamic"]
+
+    if cfg.screen_orientation == "portrait":
+        return ["mobile_static", "mobile_dynamic"]
+    if cfg.screen_orientation == "landscape":
+        return ["desktop_static", "desktop_dynamic"]
+    return ["desktop_static", "mobile_static", "desktop_dynamic", "mobile_dynamic"]
+
+
+def _has_mixed_static_orientations(items: list[dict]) -> bool:
+    """候选池中是否同时存在横图和竖图。"""
+    seen = {
+        _get_wallpaper_orientation(item)
+        for item in items
+        if item.get("wallpaper_type", "static") == "static"
+    }
+    return "landscape" in seen and "portrait" in seen
+
+
+def _select_diversified_candidates(candidates: list[dict], limit: int) -> list[dict]:
+    """
+    在候选池中尽量混排横图和竖图。
+
+    规则保持简单：
+      1. 每个方向内部保持原始热门顺序；
+      2. 优先补齐当前较少的一侧；
+      3. 若某一侧缺失，则退回原始顺序截断。
+    """
+    if limit <= 0 or not candidates:
+        return []
+
+    portraits: deque[dict] = deque()
+    landscapes: deque[dict] = deque()
+    unknowns: deque[dict] = deque()
+
+    for item in candidates:
+        orientation = _get_wallpaper_orientation(item)
+        if orientation == "portrait":
+            portraits.append(item)
+        elif orientation == "landscape":
+            landscapes.append(item)
+        else:
+            unknowns.append(item)
+
+    if not portraits or not landscapes:
+        return candidates[:limit]
+
+    selected: list[dict] = []
+    portrait_count = 0
+    landscape_count = 0
+    first_preferred = _get_wallpaper_orientation(candidates[0])
+
+    while len(selected) < limit:
+        if not selected and first_preferred in {"portrait", "landscape"}:
+            preferred = first_preferred
+        else:
+            preferred = "portrait" if portrait_count < landscape_count else "landscape"
+        secondary = "landscape" if preferred == "portrait" else "portrait"
+
+        picked = None
+        picked_orientation = None
+        if preferred == "portrait" and portraits:
+            picked = portraits.popleft()
+            picked_orientation = "portrait"
+        elif preferred == "landscape" and landscapes:
+            picked = landscapes.popleft()
+            picked_orientation = "landscape"
+        elif secondary == "portrait" and portraits:
+            picked = portraits.popleft()
+            picked_orientation = "portrait"
+        elif secondary == "landscape" and landscapes:
+            picked = landscapes.popleft()
+            picked_orientation = "landscape"
+        elif unknowns:
+            picked = unknowns.popleft()
+        else:
+            break
+
+        selected.append(picked)
+        if picked_orientation == "portrait":
+            portrait_count += 1
+        elif picked_orientation == "landscape":
+            landscape_count += 1
+
+    return selected
+
+
+def _format_prefilter_summary(
+    label: str,
+    batch_count: int,
+    total_count: int,
+    latest_resource_id: str = "",
+    latest_reason: str = "",
+) -> str:
+    """格式化预筛阶段的批量日志，避免重复细粒度日志刷屏。"""
+    parts = [f"{label}: 本轮 {batch_count} 张，累计 {total_count} 张"]
+    if latest_resource_id:
+        parts.append(f"最近资源 {latest_resource_id}")
+    if latest_reason:
+        parts.append(f"最近原因 {latest_reason}")
+    return " | ".join(parts)
 
 
 # ------------------------------------------------------------------ #
@@ -363,9 +503,16 @@ async def _execute_task(
         cfg = FilterConfig.from_dict(task.config)
         upload_enabled = task.config.get("use_imgbed_upload", True)
         effective_uploader = uploader if upload_enabled else None
+        resume_start_page = max(1, int(task.config.get("_resume_start_page", 1) or 1))
 
         def log(msg: str):
             task.append_log(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+            db.commit()
+
+        def update_runtime_config(**kwargs):
+            runtime_cfg = task.config
+            runtime_cfg.update(kwargs)
+            task.config = runtime_cfg
             db.commit()
 
         # ── 活跃时段感知 ─────────────────────────────────────────────────────
@@ -391,6 +538,8 @@ async def _execute_task(
                 f"已下 {human_ctrl.downloaded_today} 张 | "
                 f"本次最多 {effective_max} 张"
             )
+        task.total_count = effective_max
+        db.commit()
         # ────────────────────────────────────────────────────────────────────
 
         pool = AccountPool(db=db, vip_only=cfg.vip_only)
@@ -400,6 +549,8 @@ async def _execute_task(
         filter_engine = FilterEngine(cfg)
 
         log(f"任务启动: {task.name}")
+        if resume_start_page > 1:
+            log(f"查询游标: 从第 {resume_start_page} 页继续扫描")
         logger.info("[Task] Session Profile UA: %s", _session_profile["ua"][:60])
         if upload_enabled:
             log("图床上传: 已启用")
@@ -457,21 +608,12 @@ async def _execute_task(
                 if not resource_id:
                     return
 
-                # ID 去重
+                # ID 去重兜底：正常情况已在预筛阶段拦截，这里只防并发/竞态
                 if dedup.is_resource_downloaded(resource_id):
                     task.skip_count += 1
                     task.update_progress()
                     db.commit()
-                    log(f"跳过(已存在): {resource_id}")
-                    return
-
-                # 筛选
-                passed, reason = filter_engine.match(item)
-                if not passed:
-                    task.skip_count += 1
-                    task.update_progress()
-                    db.commit()
-                    log(f"跳过(不符合筛选): {resource_id} — {reason}")
+                    log(f"跳过(已存在/兜底): {resource_id}")
                     return
 
                 # 人性化每日上限：任务执行中途达到上限时停止继续下载
@@ -610,6 +752,7 @@ async def _execute_task(
                         category=_category,
                         filename=_fname,
                         wallpaper_type=item.get("wallpaper_type", "static"),
+                        referer_url=item.get("source_url"),
                         session_profile=_session_profile,
                     )
 
@@ -805,7 +948,129 @@ async def _execute_task(
                     await pool.release(account, success=False, consume_quota=_is_original_dl)
 
         # 迭代爬取并并发下载
-        worker_tasks = []
+        prefilter_skip_count = 0
+        prefilter_existing_count = 0
+        pending_prefilter_skip = 0
+        pending_prefilter_existing = 0
+        last_prefilter_skip_reason = ""
+        last_prefilter_skip_resource_id = ""
+        last_prefilter_existing_resource_id = ""
+        selected_candidates: list[dict] = []
+        candidate_pool: list[dict] = []
+        diversify_static_orientations = _should_diversify_static_orientations(cfg)
+        orientation_scan_limit = max(effective_max, _STATIC_ORIENTATION_SCAN_LIMIT)
+        source_scopes = _resolve_source_scopes(cfg)
+        primary_source_scope = source_scopes[0]
+        last_scanned_page = resume_start_page
+        stopped_early = False
+        wrapped_scan = False
+
+        def flush_prefilter_logs(force: bool = False) -> None:
+            nonlocal pending_prefilter_skip, pending_prefilter_existing
+            nonlocal last_prefilter_skip_reason, last_prefilter_skip_resource_id
+            nonlocal last_prefilter_existing_resource_id
+
+            if pending_prefilter_skip and (force or pending_prefilter_skip >= 20):
+                log(_format_prefilter_summary(
+                    label="预筛跳过(不符合筛选)",
+                    batch_count=pending_prefilter_skip,
+                    total_count=prefilter_skip_count,
+                    latest_resource_id=last_prefilter_skip_resource_id,
+                    latest_reason=last_prefilter_skip_reason,
+                ))
+                pending_prefilter_skip = 0
+                last_prefilter_skip_reason = ""
+                last_prefilter_skip_resource_id = ""
+
+            if pending_prefilter_existing and (force or pending_prefilter_existing >= 20):
+                log(_format_prefilter_summary(
+                    label="预筛跳过(已存在)",
+                    batch_count=pending_prefilter_existing,
+                    total_count=prefilter_existing_count,
+                    latest_resource_id=last_prefilter_existing_resource_id,
+                ))
+                pending_prefilter_existing = 0
+                last_prefilter_existing_resource_id = ""
+
+        async def scan_candidate_range(
+            source_scope: str,
+            start_page: int,
+            end_page: Optional[int] = None,
+            max_candidates_for_scope: Optional[int] = None,
+        ) -> bool:
+            nonlocal prefilter_skip_count, prefilter_existing_count
+            nonlocal pending_prefilter_skip, pending_prefilter_existing
+            nonlocal last_prefilter_skip_reason, last_prefilter_skip_resource_id
+            nonlocal last_prefilter_existing_resource_id
+            nonlocal last_scanned_page, stopped_early
+            accepted_in_scope = 0
+
+            async for item in crawler.iter_wallpapers(
+                cookie=account_for_crawl.cookie,
+                category=cfg.categories[0] if cfg.categories else "",
+                sort_by=cfg.sort_by,
+                wallpaper_type=cfg.wallpaper_type,
+                source_scope=source_scope,
+                color_theme=cfg.color_themes[0] if cfg.color_themes else "",
+                max_count=None,
+                start_page=start_page,
+                end_page=end_page,
+                session_profile=_session_profile,
+            ):
+                if task.status != "running":
+                    stopped_early = True
+                    return False
+
+                resource_id = item.get("resource_id", "")
+                if source_scope == primary_source_scope:
+                    last_scanned_page = max(1, int(item.get("_list_page") or start_page))
+                passed, reason = filter_engine.match(item)
+                if not passed:
+                    prefilter_skip_count += 1
+                    pending_prefilter_skip += 1
+                    last_prefilter_skip_resource_id = resource_id
+                    last_prefilter_skip_reason = reason
+                    flush_prefilter_logs()
+                    continue
+
+                if dedup.is_resource_downloaded(resource_id):
+                    prefilter_existing_count += 1
+                    pending_prefilter_existing += 1
+                    last_prefilter_existing_resource_id = resource_id
+                    flush_prefilter_logs()
+                    continue
+
+                candidate_pool.append(item)
+                accepted_in_scope += 1
+
+                if max_candidates_for_scope is not None and accepted_in_scope >= max_candidates_for_scope:
+                    stopped_early = True
+                    return False
+
+                if not diversify_static_orientations:
+                    if len(source_scopes) == 1 and len(candidate_pool) >= effective_max:
+                        stopped_early = True
+                        return False
+                    continue
+
+                if len(candidate_pool) < effective_max:
+                    continue
+
+                if _has_mixed_static_orientations(candidate_pool):
+                    stopped_early = True
+                    return False
+
+                if len(candidate_pool) >= orientation_scan_limit:
+                    flush_prefilter_logs(force=True)
+                    log(
+                        f"方向补齐未命中: 已额外扫描 {len(candidate_pool)} 张候选，"
+                        "仍未找到可混排的竖图，将按热门顺序下载"
+                    )
+                    stopped_early = True
+                    return False
+
+            return True
+
         account_for_crawl = await pool.acquire()
         if not account_for_crawl:
             task.status = "failed"
@@ -815,19 +1080,75 @@ async def _execute_task(
             return
 
         try:
-            async for item in crawler.iter_wallpapers(
-                cookie=account_for_crawl.cookie,
-                category=cfg.categories[0] if cfg.categories else "",
-                sort_by=cfg.sort_by,
-                wallpaper_type=cfg.wallpaper_type,
-                color_theme=cfg.color_themes[0] if cfg.color_themes else "",
-                max_count=effective_max,
-                session_profile=_session_profile,
-            ):
+            if len(source_scopes) > 1:
+                log(f"资源入口: 同时扫描 {' / '.join(source_scopes)}")
+
+            for index, source_scope in enumerate(source_scopes):
+                scope_resume_page = resume_start_page if index == 0 else 1
+                per_scope_limit = effective_max if len(source_scopes) > 1 else None
+                fully_scanned = await scan_candidate_range(
+                    source_scope=source_scope,
+                    start_page=scope_resume_page,
+                    max_candidates_for_scope=per_scope_limit,
+                )
+                if (
+                    index == 0
+                    and fully_scanned
+                    and task.status == "running"
+                    and resume_start_page > 1
+                    and len(candidate_pool) < effective_max
+                ):
+                    wrapped_scan = True
+                    log(
+                        f"查询游标已到末页: 从第 1 页回补到第 {resume_start_page - 1} 页"
+                    )
+                    await scan_candidate_range(
+                        source_scope=source_scope,
+                        start_page=1,
+                        end_page=resume_start_page - 1,
+                        max_candidates_for_scope=per_scope_limit,
+                    )
                 if task.status != "running":
                     break
-                worker_tasks.append(asyncio.create_task(process_one(item)))
 
+            flush_prefilter_logs(force=True)
+
+            next_resume_page = 1 if not stopped_early else max(1, last_scanned_page)
+            update_runtime_config(
+                _resume_start_page=resume_start_page,
+                _resume_next_page=next_resume_page,
+                _resume_wrapped=wrapped_scan,
+            )
+
+            if diversify_static_orientations:
+                selected_candidates = _select_diversified_candidates(candidate_pool, effective_max)
+                selected_portraits = sum(
+                    1 for item in selected_candidates
+                    if _get_wallpaper_orientation(item) == "portrait"
+                )
+                selected_landscapes = sum(
+                    1 for item in selected_candidates
+                    if _get_wallpaper_orientation(item) == "landscape"
+                )
+                if selected_portraits and selected_landscapes:
+                    log(
+                        f"方向补齐成功: 候选池 {len(candidate_pool)} 张 | "
+                        f"已选横图 {selected_landscapes} 张、竖图 {selected_portraits} 张"
+                    )
+            else:
+                selected_candidates = candidate_pool[:effective_max]
+
+            if len(selected_candidates) < effective_max:
+                task.total_count = len(selected_candidates)
+                db.commit()
+                log(
+                    f"候选不足: 仅找到 {len(selected_candidates)} 张符合条件且未下载的图片"
+                )
+
+            worker_tasks = [
+                asyncio.create_task(process_one(item))
+                for item in selected_candidates
+            ]
             await asyncio.gather(*worker_tasks, return_exceptions=True)
 
         finally:
@@ -837,7 +1158,11 @@ async def _execute_task(
         task.status = "done"
         task.finished_at = datetime.now()
         task.progress = 100.0
-        log(f"任务完成: 成功={task.success_count} 失败={task.failed_count} 跳过={task.skip_count}")
+        log(
+            f"任务完成: 成功={task.success_count} 失败={task.failed_count} "
+            f"跳过={task.skip_count} 预筛跳过={prefilter_skip_count} "
+            f"预筛已存在={prefilter_existing_count}"
+        )
         db.commit()
 
     except asyncio.CancelledError:

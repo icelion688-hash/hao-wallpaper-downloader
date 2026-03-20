@@ -46,6 +46,19 @@ SUPPORTED_TIMEZONES = [
     "Australia/Sydney",
 ]
 
+RUNTIME_WAKE_KEYS = {
+    "timezone",
+    "active_start",
+    "active_end",
+    "daily_limit_mode",
+    "manual_daily_limit",
+    "inactive_enabled",
+    "active_interval_min",
+    "active_interval_max",
+    "inactive_interval_min",
+    "inactive_interval_max",
+}
+
 
 def _now_in_tz(tz_name: str) -> datetime:
     """返回指定时区的当前时间，zoneinfo 不可用时降级为本地时间"""
@@ -75,8 +88,11 @@ class AutoPilotEngine:
 
     def __init__(self, data_dir: str = "data"):
         self._config_file = os.path.join(data_dir, "autopilot.json")
+        self._cursor_file = os.path.join(data_dir, "autopilot_cursor.json")
         self._config: dict = self._default_config()
+        self._wake_event = asyncio.Event()
         self._load_config()
+        self._cursor_state: dict[str, int] = self._load_cursor_state()
 
         self._status: str = "idle"   # idle / running
         self._phase: str = "idle"    # idle / session / waiting / sleeping / daily_limit
@@ -102,6 +118,10 @@ class AutoPilotEngine:
             "timezone": "Asia/Shanghai",
             "active_start": 8,          # 活跃时段开始（小时 0-23）
             "active_end": 23,           # 活跃时段结束（小时 0-23，不含）
+
+            # ── 每日下载上限 ────────────────────────────────────────────────
+            "daily_limit_mode": "auto",     # auto=自动生成今日上限，manual=使用手动值
+            "manual_daily_limit": None,      # 手动模式下的每日下载上限
 
             # ── 活跃时段下载模式 ────────────────────────────────────────────
             "active_session_min": 5,    # 单次最少下载张数
@@ -140,6 +160,7 @@ class AutoPilotEngine:
                 for k in self._default_config():
                     if k in saved:
                         self._config[k] = saved[k]
+                self._config = self._normalize_config(self._config)
         except Exception as exc:
             logger.warning("[AutoPilot] 配置加载失败: %s", exc)
 
@@ -153,13 +174,124 @@ class AutoPilotEngine:
         except Exception as exc:
             logger.warning("[AutoPilot] 配置保存失败: %s", exc)
 
-    def update_config(self, new_cfg: dict) -> None:
-        """更新配置（运行中也可调用，下一次会话生效）"""
+    def _load_cursor_state(self) -> dict[str, int]:
+        try:
+            if os.path.exists(self._cursor_file):
+                with open(self._cursor_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f) or {}
+                return {
+                    str(key): max(1, int(value))
+                    for key, value in raw.items()
+                }
+        except Exception as exc:
+            logger.warning("[AutoPilot] 游标状态加载失败: %s", exc)
+        return {}
+
+    def _save_cursor_state(self) -> None:
+        try:
+            os.makedirs(
+                os.path.dirname(os.path.abspath(self._cursor_file)), exist_ok=True
+            )
+            with open(self._cursor_file, "w", encoding="utf-8") as f:
+                json.dump(self._cursor_state, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("[AutoPilot] 游标状态保存失败: %s", exc)
+
+    @staticmethod
+    def _build_cursor_key(task_cfg: dict) -> str:
+        """为当前筛选条件生成稳定游标键。"""
+        cursor_cfg = {
+            "wallpaper_type": task_cfg.get("wallpaper_type", "static"),
+            "sort_by": task_cfg.get("sort_by", "yesterday_hot"),
+            "categories": task_cfg.get("categories", []),
+            "color_themes": task_cfg.get("color_themes", []),
+            "vip_only": task_cfg.get("vip_only", False),
+            "min_hot_score": task_cfg.get("min_hot_score", 0),
+            "tag_blacklist": task_cfg.get("tag_blacklist", []),
+            "min_width": task_cfg.get("min_width"),
+            "min_height": task_cfg.get("min_height"),
+            "screen_orientation": task_cfg.get("screen_orientation", "all"),
+        }
+        return json.dumps(cursor_cfg, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _normalize_pair(min_value: int, max_value: int, lower_bound: int) -> tuple[int, int]:
+        safe_min = max(lower_bound, int(min_value))
+        safe_max = max(lower_bound, int(max_value))
+        return (safe_min, safe_max) if safe_min <= safe_max else (safe_max, safe_min)
+
+    @classmethod
+    def _normalize_config(cls, raw_cfg: dict) -> dict:
+        cfg = {**cls._default_config(), **(raw_cfg or {})}
+        cfg["categories"] = [str(item).strip() for item in (cfg.get("categories") or []) if str(item).strip()]
+        cfg["color_themes"] = [str(item).strip() for item in (cfg.get("color_themes") or []) if str(item).strip()]
+        cfg["tag_blacklist"] = [str(item).strip() for item in (cfg.get("tag_blacklist") or []) if str(item).strip()]
+        cfg["active_start"] = max(0, min(23, int(cfg.get("active_start", 8))))
+        cfg["active_end"] = max(0, min(23, int(cfg.get("active_end", 23))))
+        cfg["daily_limit_mode"] = (
+            "manual" if str(cfg.get("daily_limit_mode", "auto")).strip().lower() == "manual" else "auto"
+        )
+        manual_daily_limit = cfg.get("manual_daily_limit")
+        cfg["manual_daily_limit"] = (
+            None if manual_daily_limit in (None, "", 0, "0")
+            else max(1, min(500, int(manual_daily_limit)))
+        )
+        cfg["active_session_min"], cfg["active_session_max"] = cls._normalize_pair(
+            cfg.get("active_session_min", 5),
+            cfg.get("active_session_max", 20),
+            1,
+        )
+        cfg["inactive_session_min"], cfg["inactive_session_max"] = cls._normalize_pair(
+            cfg.get("inactive_session_min", 2),
+            cfg.get("inactive_session_max", 8),
+            1,
+        )
+        cfg["active_interval_min"], cfg["active_interval_max"] = cls._normalize_pair(
+            cfg.get("active_interval_min", 1800),
+            cfg.get("active_interval_max", 7200),
+            60,
+        )
+        cfg["inactive_interval_min"], cfg["inactive_interval_max"] = cls._normalize_pair(
+            cfg.get("inactive_interval_min", 7200),
+            cfg.get("inactive_interval_max", 14400),
+            60,
+        )
+        cfg["inactive_enabled"] = bool(cfg.get("inactive_enabled", False))
+        cfg["use_imgbed_upload"] = bool(cfg.get("use_imgbed_upload", False))
+        cfg["vip_only"] = bool(cfg.get("vip_only", False))
+        cfg["min_hot_score"] = max(0, int(cfg.get("min_hot_score", 0)))
+        for key in ("min_width", "min_height"):
+            value = cfg.get(key)
+            cfg[key] = None if value in (None, "", 0) else max(1, int(value))
+        return cfg
+
+    def update_config(self, new_cfg: dict) -> dict:
+        """更新配置（运行中也可调用，等待状态会按新时间设置重算）"""
+        merged = {**self._config, **(new_cfg or {})}
+        normalized = self._normalize_config(merged)
+        wake_needed = any(self._config.get(key) != normalized.get(key) for key in RUNTIME_WAKE_KEYS)
+        self._config = normalized
+        if wake_needed and self._status == "running":
+            self._wake_event.set()
         defaults = self._default_config()
-        for k, v in new_cfg.items():
-            if k in defaults:
-                self._config[k] = v
         self._save_config()
+        self._sync_human_ctrl_config()
+        return {key: self._config[key] for key in defaults}
+
+    def bind_app_state(self, app_state) -> None:
+        """绑定应用状态，便于同步人性化下载控制器配置。"""
+        self._app_state = app_state
+        self._sync_human_ctrl_config()
+
+    def _sync_human_ctrl_config(self) -> None:
+        app_state = self._app_state
+        human_ctrl = getattr(app_state, "human_ctrl", None) if app_state else None
+        if not human_ctrl:
+            return
+        human_ctrl.apply_daily_limit_config(
+            limit_mode=self._config.get("daily_limit_mode", "auto"),
+            manual_limit=self._config.get("manual_daily_limit"),
+        )
 
     # ── 状态查询 ─────────────────────────────────────────────────────────────
 
@@ -167,6 +299,21 @@ class AutoPilotEngine:
         self._refresh_today()
         tz_name = self._config.get("timezone", "Asia/Shanghai")
         now_tz = _now_in_tz(tz_name)
+        human_ctrl = getattr(self._app_state, "human_ctrl", None) if self._app_state else None
+        today_payload = {
+            "sessions": self._today_sessions,
+            "downloaded": self._today_downloaded,
+            "date": self._today_date,
+        }
+        if human_ctrl:
+            today_payload.update(
+                {
+                    "daily_limit": human_ctrl.daily_limit,
+                    "remaining": human_ctrl.remaining_today,
+                    "limit_mode": human_ctrl.daily_limit_mode,
+                    "manual_daily_limit": human_ctrl.manual_daily_limit,
+                }
+            )
         return {
             "status": self._status,
             "phase": self._phase,
@@ -176,11 +323,7 @@ class AutoPilotEngine:
             "current_tz_time": now_tz.strftime("%H:%M"),
             "current_tz_name": tz_name,
             "is_active_hour": self._is_active_hour(),
-            "today": {
-                "sessions": self._today_sessions,
-                "downloaded": self._today_downloaded,
-                "date": self._today_date,
-            },
+            "today": today_payload,
             "next_session_at": (
                 self._next_session_at.isoformat() if self._next_session_at else None
             ),
@@ -193,9 +336,11 @@ class AutoPilotEngine:
     async def start(self, config: Optional[dict], app_state) -> bool:
         if self._status == "running":
             return False
+        self.bind_app_state(app_state)
         if config:
             self.update_config(config)
-        self._app_state = app_state
+        else:
+            self._sync_human_ctrl_config()
         self._status = "running"
         self._phase = "starting"
         self._loop_task = asyncio.create_task(self._main_loop())
@@ -214,6 +359,7 @@ class AutoPilotEngine:
         self._phase = "idle"
         self._mode = ""
         self._next_session_at = None
+        self._wake_event.set()
         if prev == "running":
             self._log("AutoPilot 已停止")
         if self._loop_task and not self._loop_task.done():
@@ -243,7 +389,8 @@ class AutoPilotEngine:
                         f"约 {secs / 3600:.1f} 小时后（{self._config['timezone']} "
                         f"{self._config['active_start']:02d}:00）恢复"
                     )
-                    await self._interruptible_sleep(min(secs, 600))
+                    if await self._interruptible_sleep(min(secs, 600)):
+                        self._log("调度配置已更新，重新评估今日上限等待时间")
                     continue
 
                 is_active = self._is_active_hour()
@@ -258,7 +405,8 @@ class AutoPilotEngine:
                         f"当前为非活跃时段（{self._config['timezone']} {now_str}），"
                         f"约 {secs / 60:.0f} 分钟后（{self._config['active_start']:02d}:00）恢复"
                     )
-                    await self._interruptible_sleep(min(secs, 600))
+                    if await self._interruptible_sleep(min(secs, 600)):
+                        self._log("调度配置已更新，重新评估活跃时段等待时间")
                     continue
 
                 # ── 选择本次模式参数 ─────────────────────────────────────────
@@ -319,7 +467,8 @@ class AutoPilotEngine:
                     f"[{mode_cn}] 下次会话约 {interval / 60:.0f} 分钟后 "
                     f"（{self._next_session_at.strftime('%H:%M')}）"
                 )
-                await self._interruptible_sleep(interval)
+                if await self._interruptible_sleep(interval):
+                    self._log(f"[{mode_cn}] 间隔配置已更新，已按新设置重新计算等待时间")
                 self._next_session_at = None
 
         except asyncio.CancelledError:
@@ -360,6 +509,9 @@ class AutoPilotEngine:
             "screen_orientation": self._config.get("screen_orientation", "all"),
             "min_file_size": 0,
         }
+        cursor_key = self._build_cursor_key(task_cfg)
+        resume_start_page = self._cursor_state.get(cursor_key, 1)
+        task_cfg["_resume_start_page"] = resume_start_page
 
         db = SessionLocal()
         try:
@@ -379,6 +531,7 @@ class AutoPilotEngine:
             db.close()
 
         self._current_task_id = task_id
+        self._log(f"查询游标: 本次从第 {resume_start_page} 页开始")
         _uploader = (
             getattr(app, "imgbed", None)
             if self._config.get("use_imgbed_upload") else None
@@ -403,6 +556,11 @@ class AutoPilotEngine:
         db = SessionLocal()
         try:
             t = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+            if t:
+                next_page = max(1, int(t.config.get("_resume_next_page", 1) or 1))
+                self._cursor_state[cursor_key] = next_page
+                self._save_cursor_state()
+                self._log(f"查询游标: 下次从第 {next_page} 页开始")
             return t.success_count if t else 0
         finally:
             db.close()
@@ -444,9 +602,20 @@ class AutoPilotEngine:
             self._today_sessions = 0
             self._today_downloaded = 0
 
-    async def _interruptible_sleep(self, seconds: float) -> None:
-        """可中断的 sleep：每 5 秒检查一次 status"""
-        remaining = seconds
-        while remaining > 0 and self._status == "running":
-            await asyncio.sleep(min(remaining, 5.0))
-            remaining -= 5.0
+    async def _interruptible_sleep(self, seconds: float) -> bool:
+        """可中断的 sleep：停止或调度配置变更时提前唤醒。"""
+        deadline = datetime.now() + timedelta(seconds=max(0.0, seconds))
+        while self._status == "running":
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return True
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(self._wake_event.wait(), timeout=min(remaining, 5.0))
+            except asyncio.TimeoutError:
+                continue
+            self._wake_event.clear()
+            return True
+        return True

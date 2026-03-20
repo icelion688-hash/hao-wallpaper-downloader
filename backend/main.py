@@ -217,6 +217,7 @@ async def lifespan(app: FastAPI):
     app.state.human_ctrl = human_behavior
     app.state.autopilot = autopilot_engine
     app.state.db = db
+    autopilot_engine.bind_app_state(app.state)
 
     _reset_task = asyncio.create_task(account_pool.daily_reset_loop())
     _scheduler_task = asyncio.create_task(_scheduler_loop(app))

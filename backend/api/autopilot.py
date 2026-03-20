@@ -22,6 +22,10 @@ class AutoPilotConfigRequest(BaseModel):
     active_start: int = Field(default=8,  ge=0, le=23)
     active_end:   int = Field(default=23, ge=0, le=23)
 
+    # ── 每日下载上限 ────────────────────────────────────────────────────────
+    daily_limit_mode: str = Field(default="auto", pattern="^(auto|manual)$")
+    manual_daily_limit: Optional[int] = Field(default=None, ge=1, le=500)
+
     # ── 活跃时段下载模式 ────────────────────────────────────────────────────
     active_session_min: int = Field(default=5,    ge=1, le=200)
     active_session_max: int = Field(default=20,   ge=1, le=200)
@@ -61,9 +65,13 @@ async def start(request: Request, body: AutoPilotConfigRequest):
     """启动 AutoPilot，同时保存配置"""
     engine = request.app.state.autopilot
     if engine._status == "running":
-        return {"success": False, "message": "AutoPilot 已在运行中"}
+        return {"success": False, "message": "AutoPilot 已在运行中", "config": engine.get_status()["config"]}
     ok = await engine.start(body.model_dump(), request.app.state)
-    return {"success": ok, "message": "AutoPilot 已启动" if ok else "启动失败"}
+    return {
+        "success": ok,
+        "message": "AutoPilot 已启动" if ok else "启动失败",
+        "config": engine.get_status()["config"],
+    }
 
 
 @router.post("/stop")
@@ -78,5 +86,5 @@ async def stop(request: Request):
 async def update_config(request: Request, body: AutoPilotConfigRequest):
     """更新配置（不影响运行状态，下次会话时生效）"""
     engine = request.app.state.autopilot
-    engine.update_config(body.model_dump())
-    return {"success": True, "message": "配置已更新"}
+    config = engine.update_config(body.model_dump())
+    return {"success": True, "message": "配置已更新", "config": config}
