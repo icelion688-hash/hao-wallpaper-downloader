@@ -60,8 +60,23 @@ class ImgbedCompatPayload(BaseModel):
     image_processing: ImageProcessingPayload = ImageProcessingPayload()
 
 
+class SyncSettingsPayload(BaseModel):
+    auth_token: str = ""
+    allowed_sources: List[str] = Field(default_factory=list)
+    export_rate_limit_per_minute: int = Field(default=60, ge=0, le=600)
+
+
 def _current_upload_settings() -> dict:
     return load_config().get("uploads", {})
+
+
+def _current_sync_settings() -> dict:
+    sync = load_config().get("sync", {}) or {}
+    return {
+        "auth_token": str(sync.get("auth_token", "") or ""),
+        "allowed_sources": [str(item).strip() for item in (sync.get("allowed_sources") or []) if str(item).strip()],
+        "export_rate_limit_per_minute": int(sync.get("export_rate_limit_per_minute", 60) or 0),
+    }
 
 
 def _sanitize_media_convert_settings(data: Optional[dict] = None) -> dict:
@@ -133,6 +148,25 @@ async def save_media_convert_settings(body: MediaConvertPayload):
     payload = _sanitize_media_convert_settings(body.model_dump())
     cfg = update_config({"media_convert": payload})
     return {"success": True, "media_convert": _sanitize_media_convert_settings(cfg.get("media_convert"))}
+
+
+@router.get("/sync")
+async def get_sync_settings():
+    return _current_sync_settings()
+
+
+@router.put("/sync")
+async def save_sync_settings(body: SyncSettingsPayload):
+    cfg = update_config({"sync": body.model_dump()})
+    sync = cfg.get("sync", {}) or {}
+    return {
+        "success": True,
+        "sync": {
+            "auth_token": str(sync.get("auth_token", "") or ""),
+            "allowed_sources": [str(item).strip() for item in (sync.get("allowed_sources") or []) if str(item).strip()],
+            "export_rate_limit_per_minute": int(sync.get("export_rate_limit_per_minute", 60) or 0),
+        },
+    }
 
 
 @router.get("/system-info")

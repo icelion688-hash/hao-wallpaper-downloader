@@ -8,6 +8,7 @@ const Filters = () => import('../views/Filters.vue')
 const Stats = () => import('../views/Stats.vue')
 const AutoPilot = () => import('../views/AutoPilot.vue')
 const Convert = () => import('../views/Convert.vue')
+const Sync = () => import('../views/Sync.vue')
 
 const routes = [
   { path: '/', redirect: '/stats' },
@@ -19,6 +20,7 @@ const routes = [
   { path: '/upload', component: Upload, meta: { title: '图床上传' } },
   { path: '/convert', component: Convert, meta: { title: '格式转换' } },
   { path: '/stats', component: Stats, meta: { title: '系统监控' } },
+  { path: '/sync', component: Sync, meta: { title: '数据同步' } },
 ]
 
 const router = createRouter({

@@ -10,6 +10,11 @@ probe_url: "https://haowallpaper.com/user/center"
 free_daily_limit: 10
 log_level: "INFO"
 
+sync:
+  auth_token: ""                  # 可选：为 /api/sync/export 和 /api/sync/handshake 设置迁移密钥
+  allowed_sources: []             # 可选：限制允许访问同步导出接口的来源 IP / CIDR，例如 ["192.168.1.10", "10.0.0.0/24"]
+  export_rate_limit_per_minute: 60  # 可选：每个来源每分钟最多请求次数，0 表示不限制
+
 uploads:
   task_profile: "compressed_webp"
   profiles:

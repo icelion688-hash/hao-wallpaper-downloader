@@ -47,6 +47,7 @@ from backend.core.upload_record_helper import (
     build_upload_record,
     dump_upload_records,
     find_reusable_upload_record,
+    upsert_upload_registry_record,
 )
 
 logger = logging.getLogger(__name__)
@@ -784,12 +785,26 @@ async def _execute_task(
                             profile_key=effective_uploader.profile_key,
                             sha256=sha256,
                             md5=md5,
+                            resource_id=resource_id,
                         ) if effective_uploader.profile_key else None
                         if _reused_record and _reused_record.get("url"):
                             _imgbed_url = _reused_record["url"]
                             _upload_records = dump_upload_records({
                                 effective_uploader.profile_key: _reused_record,
                             })
+                            upsert_upload_registry_record(
+                                db,
+                                profile_key=effective_uploader.profile_key,
+                                format_key=_reused_record.get("format_key"),
+                                url=_imgbed_url,
+                                resource_id=resource_id,
+                                sha256=sha256,
+                                md5=md5,
+                                profile_name=_reused_record.get("profile_name") or effective_uploader.profile_name,
+                                channel=_reused_record.get("channel") or effective_uploader.channel,
+                                uploaded_at=_reused_record.get("uploaded_at"),
+                                source_server=_reused_record.get("source_server"),
+                            )
                             log(f"图床上传复用成功: {_imgbed_url}")
                         else:
                             _imgbed_url = await effective_uploader.upload(
@@ -802,14 +817,26 @@ async def _execute_task(
                             )
                             if _imgbed_url:
                                 if effective_uploader.profile_key:
+                                    _record = build_upload_record(
+                                        profile_key=effective_uploader.profile_key,
+                                        profile_name=effective_uploader.profile_name,
+                                        channel=effective_uploader.channel,
+                                        url=_imgbed_url,
+                                    )
                                     _upload_records = dump_upload_records({
-                                        effective_uploader.profile_key: build_upload_record(
-                                            profile_key=effective_uploader.profile_key,
-                                            profile_name=effective_uploader.profile_name,
-                                            channel=effective_uploader.channel,
-                                            url=_imgbed_url,
-                                        )
+                                        effective_uploader.profile_key: _record
                                     })
+                                    upsert_upload_registry_record(
+                                        db,
+                                        profile_key=effective_uploader.profile_key,
+                                        url=_imgbed_url,
+                                        resource_id=resource_id,
+                                        sha256=sha256,
+                                        md5=md5,
+                                        profile_name=effective_uploader.profile_name,
+                                        channel=effective_uploader.channel,
+                                        uploaded_at=_record.get("uploaded_at"),
+                                    )
                                 log(f"图床上传成功: {_imgbed_url}")
                             else:
                                 log(f"图床上传失败（不影响本地存储）: {resource_id}")

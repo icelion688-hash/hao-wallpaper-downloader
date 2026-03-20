@@ -76,6 +76,8 @@ export const settingsApi = {
   setUploads: (data) => http.put('/settings/uploads', data),
   getMediaConvert: () => http.get('/settings/media-convert'),
   setMediaConvert: (data) => http.put('/settings/media-convert', data),
+  getSync: () => http.get('/settings/sync'),
+  setSync: (data) => http.put('/settings/sync', data),
   getSystemInfo: () => http.get('/settings/system-info'),
 }
 

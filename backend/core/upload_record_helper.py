@@ -11,6 +11,7 @@ from typing import Optional
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from backend.models.upload_registry import UploadRegistry
 from backend.models.wallpaper import Wallpaper
 
 DEFAULT_UPLOAD_FORMAT = "profile"
@@ -95,19 +96,240 @@ def build_upload_record(
     }
 
 
+def _parse_uploaded_at(value: Optional[str | datetime]) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _registry_to_upload_record(item: UploadRegistry) -> dict:
+    normalized = normalize_upload_format(item.format_key)
+    uploaded_at = item.uploaded_at.isoformat(timespec="seconds") if item.uploaded_at else None
+    return {
+        "profile_key": item.profile_key,
+        "profile_name": item.profile_name or item.profile_key,
+        "channel": item.channel or "",
+        "url": item.url,
+        "format_key": normalized,
+        "format_label": UPLOAD_FORMAT_LABELS.get(normalized, UPLOAD_FORMAT_LABELS[DEFAULT_UPLOAD_FORMAT]),
+        "uploaded_at": uploaded_at,
+        "source_server": item.source_server,
+    }
+
+
+def upsert_upload_registry_record(
+    db: Session,
+    *,
+    profile_key: str,
+    url: str,
+    format_key: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    sha256: Optional[str] = None,
+    md5: Optional[str] = None,
+    profile_name: Optional[str] = None,
+    channel: Optional[str] = None,
+    uploaded_at: Optional[str | datetime] = None,
+    source_server: Optional[str] = None,
+) -> UploadRegistry:
+    normalized = normalize_upload_format(format_key)
+    query = db.query(UploadRegistry).filter(
+        UploadRegistry.profile_key == profile_key,
+        UploadRegistry.format_key == normalized,
+    )
+
+    identity_filters = []
+    if sha256:
+        identity_filters.append(UploadRegistry.sha256 == sha256)
+    if md5:
+        identity_filters.append(UploadRegistry.md5 == md5)
+    if resource_id:
+        identity_filters.append(UploadRegistry.resource_id == resource_id)
+    if url:
+        identity_filters.append(UploadRegistry.url == url)
+
+    existing = query.filter(or_(*identity_filters)).order_by(UploadRegistry.id.asc()).first() if identity_filters else None
+    uploaded_dt = _parse_uploaded_at(uploaded_at)
+
+    if existing:
+        if not existing.resource_id and resource_id:
+            existing.resource_id = resource_id
+        if not existing.sha256 and sha256:
+            existing.sha256 = sha256
+        if not existing.md5 and md5:
+            existing.md5 = md5
+        if not existing.profile_name and profile_name:
+            existing.profile_name = profile_name
+        if not existing.channel and channel:
+            existing.channel = channel
+        if not existing.source_server and source_server:
+            existing.source_server = source_server
+        if not existing.uploaded_at and uploaded_dt:
+            existing.uploaded_at = uploaded_dt
+        existing.url = existing.url or url
+        return existing
+
+    item = UploadRegistry(
+        resource_id=resource_id,
+        sha256=sha256,
+        md5=md5,
+        profile_key=profile_key,
+        format_key=normalized,
+        profile_name=profile_name,
+        channel=channel,
+        url=url,
+        source_server=source_server,
+        uploaded_at=uploaded_dt,
+    )
+    db.add(item)
+    return item
+
+
+def persist_wallpaper_upload_records_to_registry(
+    db: Session,
+    wallpaper: Wallpaper,
+    source_server: Optional[str] = None,
+) -> int:
+    records = parse_upload_records(wallpaper.upload_records)
+    created_or_updated = 0
+
+    for raw_key, record in records.items():
+        if not isinstance(record, dict):
+            continue
+        url = record.get("url")
+        profile_key = record.get("profile_key")
+        if not profile_key and isinstance(raw_key, str):
+            profile_key = raw_key.split("::", 1)[0]
+        if not profile_key or not url:
+            continue
+
+        upsert_upload_registry_record(
+            db,
+            profile_key=profile_key,
+            format_key=record.get("format_key"),
+            url=url,
+            resource_id=wallpaper.resource_id,
+            sha256=wallpaper.sha256,
+            md5=wallpaper.md5,
+            profile_name=record.get("profile_name"),
+            channel=record.get("channel"),
+            uploaded_at=record.get("uploaded_at"),
+            source_server=record.get("source_server") or source_server,
+        )
+        created_or_updated += 1
+
+    if wallpaper.imgbed_url:
+        default_profile_key = None
+        if len(records) == 1:
+            first = next(iter(records.values()))
+            if isinstance(first, dict):
+                default_profile_key = first.get("profile_key")
+
+        if default_profile_key:
+            upsert_upload_registry_record(
+                db,
+                profile_key=default_profile_key,
+                url=wallpaper.imgbed_url,
+                resource_id=wallpaper.resource_id,
+                sha256=wallpaper.sha256,
+                md5=wallpaper.md5,
+                source_server=source_server,
+            )
+            created_or_updated += 1
+
+    return created_or_updated
+
+
+def backfill_upload_registry_from_wallpapers(
+    db: Session,
+    source_server: Optional[str] = None,
+) -> int:
+    wallpapers = (
+        db.query(Wallpaper)
+        .filter(
+            or_(
+                Wallpaper.upload_records.isnot(None),
+                Wallpaper.imgbed_url.isnot(None),
+            )
+        )
+        .all()
+    )
+    total = 0
+    for wallpaper in wallpapers:
+        total += persist_wallpaper_upload_records_to_registry(db, wallpaper, source_server=source_server)
+    return total
+
+
+def _find_registry_upload_record(
+    db: Session,
+    profile_key: str,
+    sha256: Optional[str] = None,
+    md5: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    format_key: Optional[str] = None,
+) -> Optional[dict]:
+    filters = []
+    if sha256:
+        filters.append(UploadRegistry.sha256 == sha256)
+    if md5:
+        filters.append(UploadRegistry.md5 == md5)
+    if resource_id:
+        filters.append(UploadRegistry.resource_id == resource_id)
+    if not filters:
+        return None
+
+    normalized = normalize_upload_format(format_key)
+    item = (
+        db.query(UploadRegistry)
+        .filter(
+            UploadRegistry.profile_key == profile_key,
+            UploadRegistry.format_key == normalized,
+            or_(*filters),
+        )
+        .order_by(UploadRegistry.id.asc())
+        .first()
+    )
+    if item and item.url:
+        return _registry_to_upload_record(item)
+    return None
+
+
 def find_reusable_upload_record(
     db: Session,
     profile_key: str,
     sha256: Optional[str] = None,
     md5: Optional[str] = None,
+    resource_id: Optional[str] = None,
     exclude_wallpaper_id: Optional[int] = None,
     format_key: Optional[str] = None,
 ) -> Optional[dict]:
+    registry_record = _find_registry_upload_record(
+        db,
+        profile_key=profile_key,
+        sha256=sha256,
+        md5=md5,
+        resource_id=resource_id,
+        format_key=format_key,
+    )
+    if registry_record:
+        return registry_record
+
     filters = []
     if sha256:
         filters.append(Wallpaper.sha256 == sha256)
     if md5:
         filters.append(Wallpaper.md5 == md5)
+    if resource_id:
+        filters.append(Wallpaper.resource_id == resource_id)
     if not filters:
         return None
 

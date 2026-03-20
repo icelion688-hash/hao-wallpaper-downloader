@@ -65,6 +65,7 @@ const navItems = [
   { path: '/gallery',    icon: '⊞', label: '下载画廊' },
   { path: '/upload',     icon: '↑', label: '图床上传' },
   { path: '/convert',   icon: '⇄', label: '格式转换' },
+  { path: '/sync',      icon: '⇅', label: '数据同步' },
 ]
 
 async function checkHealth() {

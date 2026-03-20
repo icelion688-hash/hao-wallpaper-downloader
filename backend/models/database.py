@@ -36,7 +36,7 @@ def get_db():
 
 def init_db():
     """创建所有表并执行轻量迁移。"""
-    from backend.models import account, task, wallpaper  # noqa: F401
+    from backend.models import account, sync_history, task, upload_registry, wallpaper  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
     _migrate_db()

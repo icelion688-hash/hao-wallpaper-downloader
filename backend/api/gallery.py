@@ -27,6 +27,7 @@ from backend.core.upload_record_helper import (
     get_upload_record,
     normalize_upload_format,
     parse_upload_records,
+    upsert_upload_registry_record,
 )
 from backend.models.database import get_db
 from backend.models.wallpaper import Wallpaper
@@ -419,6 +420,7 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
             profile_key=body.profile_key,
             sha256=wallpaper.sha256,
             md5=wallpaper.md5,
+            resource_id=wallpaper.resource_id,
             exclude_wallpaper_id=wallpaper.id,
             format_key=upload_format,
         )
@@ -427,6 +429,19 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
             wallpaper.upload_records = dump_upload_records(records)
             if not wallpaper.imgbed_url:
                 wallpaper.imgbed_url = reusable_record.get("url")
+            upsert_upload_registry_record(
+                db,
+                profile_key=body.profile_key,
+                format_key=upload_format,
+                url=reusable_record["url"],
+                resource_id=wallpaper.resource_id,
+                sha256=wallpaper.sha256,
+                md5=wallpaper.md5,
+                profile_name=reusable_record.get("profile_name") or profile.get("name", body.profile_key),
+                channel=reusable_record.get("channel") or profile.get("channel", ""),
+                uploaded_at=reusable_record.get("uploaded_at"),
+                source_server=reusable_record.get("source_server"),
+            )
             skipped_items.append({"id": wallpaper.id, "reason": f"发现同哈希的 {format_label} 上传记录，已复用现有链接"})
             continue
 
@@ -448,16 +463,29 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
             failed_items.append({"id": wallpaper.id, "reason": f"{format_label} 上传失败"})
             continue
 
-        records[record_key] = build_upload_record(
+        record = build_upload_record(
             profile_key=body.profile_key,
             profile_name=profile.get("name", body.profile_key),
             channel=profile.get("channel", ""),
             url=url,
             format_key=upload_format,
         )
+        records[record_key] = record
         wallpaper.upload_records = dump_upload_records(records)
         if not wallpaper.imgbed_url:
             wallpaper.imgbed_url = url
+        upsert_upload_registry_record(
+            db,
+            profile_key=body.profile_key,
+            format_key=upload_format,
+            url=url,
+            resource_id=wallpaper.resource_id,
+            sha256=wallpaper.sha256,
+            md5=wallpaper.md5,
+            profile_name=profile.get("name", body.profile_key),
+            channel=profile.get("channel", ""),
+            uploaded_at=record.get("uploaded_at"),
+        )
         success_items.append({
             "id": wallpaper.id,
             "url": url,

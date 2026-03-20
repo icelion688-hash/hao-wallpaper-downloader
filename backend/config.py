@@ -212,5 +212,10 @@ def _default_config() -> dict:
             "gallery_default_format": "profile",
             "profiles": _default_upload_profiles(),
         },
+        "sync": {
+            "auth_token": "",
+            "allowed_sources": [],
+            "export_rate_limit_per_minute": 60,
+        },
         "media_convert": default_media_convert_config(),
     }
