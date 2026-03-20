@@ -64,6 +64,59 @@ npm run build
 
 如果你是通过项目根目录下的 `start.sh` 启动服务，脚本会在每次启动时自动重新构建前端，确保 `git pull` 后页面与最新源码保持一致。
 
+## Docker 部署
+
+项目已提供 `Dockerfile` 和 `docker-compose.yml`，适合单机部署。
+
+### 1. 最简单启动
+
+```bash
+mkdir -p data downloads
+docker compose up -d --build
+```
+
+第一次启动时，容器会自动生成 `data/config.yaml`，SQLite 默认位于 `data/wallpaper.db`。
+
+默认访问地址：
+
+- 应用首页：`http://localhost:8000`
+- 健康检查：`http://localhost:8000/api/health`
+
+### 2. 改配置
+
+```bash
+sed -n '1,120p' data/config.yaml
+```
+
+需要修改图床、代理等配置时，直接编辑宿主机上的 `data/config.yaml`，然后重启容器：
+
+```bash
+docker compose restart
+```
+
+### 3. 常用命令
+
+```bash
+docker compose logs -f
+docker compose ps
+docker compose down
+```
+
+### 4. 可选端口
+
+```bash
+APP_PORT=8080 docker compose up -d --build
+```
+
+这时访问地址变为 `http://localhost:8080`。
+
+### 5. 部署说明
+
+- 镜像使用多阶段构建，前端会先编译成 `frontend/dist/`，再由 FastAPI 统一托管
+- 当前部署模型适合单实例运行，不建议直接扩成多副本
+- 原因是项目内置了本地 SQLite、定时调度器、下载队列和 AutoPilot 单例状态
+- 如果后续要做多实例，需要再拆分数据库、任务调度和共享存储
+
 ## 远程协作建议
 
 - 使用 GitHub 私有仓库

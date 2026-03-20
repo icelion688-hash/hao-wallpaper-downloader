@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hao-wallpaper
+    restart: unless-stopped
+    init: true
+    ports:
+      - '${APP_PORT:-8000}:8000'
+    environment:
+      TZ: '${TZ:-Asia/Shanghai}'
+      PYTHONUNBUFFERED: '1'
+    volumes:
+      - './data:/app/data'
+      - './downloads:/app/downloads'
