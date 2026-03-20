@@ -201,7 +201,15 @@
               <div class="field-grid">
                 <div class="form-row">
                   <label>筛选分类（留空=全部）</label>
-                  <input class="input" v-model="batchCategory" placeholder="动漫｜二次元" />
+                  <select class="select" v-model="batchCategory" :disabled="loadingCategories">
+                    <option value="">全部分类</option>
+                    <option v-for="item in categoryOptions" :key="item.name" :value="item.name">
+                      {{ item.name }}（{{ item.count }}）
+                    </option>
+                  </select>
+                  <div class="batch-hint">
+                    {{ loadingCategories ? '正在加载图库分类...' : categoryOptions.length ? '可直接从已有图库分类中选择，无需手动输入。' : '当前图库暂无分类数据，保持“全部分类”即可。' }}
+                  </div>
                 </div>
                 <div class="form-row">
                   <label>本次上传格式</label>
@@ -253,11 +261,13 @@ import {
 
 const saving       = ref(false)
 const uploading    = ref(false)
-const activeKey    = ref('compressed_webp')
+const activeKey    = ref('')
 const batchUploadFormat = ref('profile')
 const batchCategory   = ref('')
 const batchOnlyNew    = ref(true)
 const uploadResult    = ref(null)
+const categoryOptions = ref([])
+const loadingCategories = ref(false)
 
 const settings = ref({ task_profile: 'compressed_webp', gallery_default_format: 'profile', profiles: [] })
 
@@ -291,13 +301,53 @@ function applyCompressed(p) {
   applyCompressedUploadProfile(p)
 }
 
+function pickPreferredProfileKey(uploadSettings, currentKey = '') {
+  const profiles = Array.isArray(uploadSettings?.profiles) ? uploadSettings.profiles : []
+  if (!profiles.length) return ''
+
+  const currentProfile = profiles.find((item) => item.key === currentKey)
+  if (currentProfile) {
+    return currentProfile.key
+  }
+
+  const taskProfile = profiles.find((item) => item.key === uploadSettings?.task_profile)
+  if (taskProfile?.enabled) {
+    return taskProfile.key
+  }
+
+  const firstEnabledProfile = profiles.find((item) => item.enabled)
+  if (firstEnabledProfile) {
+    return firstEnabledProfile.key
+  }
+
+  if (taskProfile) {
+    return taskProfile.key
+  }
+
+  return profiles[0]?.key || ''
+}
+
 async function loadSettings() {
   const res = await settingsApi.getUploads()
   settings.value = normalizeUploadSettings(res)
-  if (!settings.value.profiles.find(p => p.key === activeKey.value)) {
-    activeKey.value = settings.value.profiles[0]?.key || ''
-  }
+  activeKey.value = pickPreferredProfileKey(settings.value, activeKey.value)
   batchUploadFormat.value = settings.value.gallery_default_format
+}
+
+async function loadCategories() {
+  loadingCategories.value = true
+  try {
+    const res = await galleryApi.categories()
+    categoryOptions.value = Array.isArray(res.categories) ? res.categories : []
+    if (batchCategory.value && !categoryOptions.value.some(item => item.name === batchCategory.value)) {
+      batchCategory.value = ''
+    }
+  } catch (e) {
+    console.error('加载上传分类失败', e)
+    categoryOptions.value = []
+  } finally {
+    loadingCategories.value = false
+  }
 }
 
 async function saveSettings() {
@@ -309,6 +359,7 @@ async function saveSettings() {
       profiles: settings.value.profiles.map(p => ({ ...p, image_processing: { ...p.image_processing } })),
     })
     settings.value = normalizeUploadSettings(res.uploads)
+    activeKey.value = pickPreferredProfileKey(settings.value, activeKey.value)
     batchUploadFormat.value = normalizeUploadFormat(settings.value.gallery_default_format)
   } finally {
     saving.value = false
@@ -333,7 +384,9 @@ async function batchUpload() {
   }
 }
 
-onMounted(loadSettings)
+onMounted(async () => {
+  await Promise.all([loadSettings(), loadCategories()])
+})
 </script>
 
 <style scoped>
