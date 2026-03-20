@@ -316,6 +316,8 @@ class HumanBehaviorController:
 
     DAILY_MIN = 25   # 每日下载上限的下界
     DAILY_MAX = 70   # 每日下载上限的上界
+    MANUAL_LIMIT_MIN = 1
+    MANUAL_LIMIT_MAX = 500
 
     def __init__(self, data_dir: str = "data"):
         self._state_file = os.path.join(data_dir, "human_behavior.json")
@@ -331,6 +333,14 @@ class HumanBehaviorController:
                     self._state = json.load(f)
         except Exception:
             self._state = {}
+        if not isinstance(self._state, dict):
+            self._state = {}
+        self._state["limit_mode"] = self._normalize_limit_mode(
+            self._state.get("limit_mode", "auto")
+        )
+        self._state["manual_limit"] = self._normalize_manual_limit(
+            self._state.get("manual_limit")
+        )
 
     def _save(self) -> None:
         try:
@@ -339,6 +349,82 @@ class HumanBehaviorController:
                 json.dump(self._state, f, ensure_ascii=False, indent=2)
         except Exception as exc:
             logger.warning("[Human] 状态保存失败: %s", exc)
+
+    @staticmethod
+    def _normalize_limit_mode(raw_mode: str) -> str:
+        return "manual" if str(raw_mode).strip().lower() == "manual" else "auto"
+
+    @classmethod
+    def _normalize_manual_limit(cls, raw_limit) -> Optional[int]:
+        if raw_limit in (None, "", 0, "0"):
+            return None
+        try:
+            manual_limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return None
+        return max(cls.MANUAL_LIMIT_MIN, min(cls.MANUAL_LIMIT_MAX, manual_limit))
+
+    @classmethod
+    def _auto_limit_for_date(cls, date_str: str) -> int:
+        # 哈希种子：同一天结果稳定，不同天差异足够大
+        seed = int(hashlib.md5(date_str.encode()).hexdigest()[:8], 16)
+        rng = random.Random(seed)
+        # 正态分布截断到 [DAILY_MIN, DAILY_MAX]，均值 45，标准差 12
+        raw = rng.gauss(45, 12)
+        return max(cls.DAILY_MIN, min(cls.DAILY_MAX, int(raw)))
+
+    def _resolve_limit_for_day(
+        self,
+        date_str: str,
+        limit_mode: Optional[str] = None,
+        manual_limit: Optional[int] = None,
+    ) -> int:
+        mode = self._normalize_limit_mode(limit_mode or self._state.get("limit_mode", "auto"))
+        resolved_manual_limit = self._normalize_manual_limit(
+            manual_limit if manual_limit is not None else self._state.get("manual_limit")
+        )
+        if mode == "manual" and resolved_manual_limit is not None:
+            return resolved_manual_limit
+        return self._auto_limit_for_date(date_str)
+
+    def apply_daily_limit_config(
+        self,
+        limit_mode: str = "auto",
+        manual_limit: Optional[int] = None,
+    ) -> None:
+        normalized_mode = self._normalize_limit_mode(limit_mode)
+        normalized_manual_limit = self._normalize_manual_limit(manual_limit)
+        today = date.today().isoformat()
+        downloaded = max(0, int(self._state.get("downloaded", 0) or 0))
+        effective_limit = self._resolve_limit_for_day(
+            today,
+            limit_mode=normalized_mode,
+            manual_limit=normalized_manual_limit,
+        )
+        changed = (
+            self._state.get("limit_mode") != normalized_mode
+            or self._state.get("manual_limit") != normalized_manual_limit
+            or self._state.get("date") != today
+            or self._state.get("daily_limit") != effective_limit
+        )
+        self._state.update(
+            {
+                "date": today,
+                "limit_mode": normalized_mode,
+                "manual_limit": normalized_manual_limit,
+                "daily_limit": effective_limit,
+                "downloaded": downloaded if self._state.get("date") == today else 0,
+            }
+        )
+        if changed:
+            self._save()
+            mode_label = "手动" if normalized_mode == "manual" and normalized_manual_limit else "自动"
+            logger.info(
+                "[Human] 每日上限策略已更新: %s模式，今日上限 %d 张，已下 %d 张",
+                mode_label,
+                effective_limit,
+                self._state.get("downloaded", 0),
+            )
 
     # ── 活跃时段感知 ─────────────────────────────────────────────────────────
 
@@ -375,22 +461,49 @@ class HumanBehaviorController:
     def _ensure_today(self) -> dict:
         """确保 _state 对应今天，否则重新生成当天的随机上限。"""
         today = date.today().isoformat()
+        limit_mode = self._normalize_limit_mode(self._state.get("limit_mode", "auto"))
+        manual_limit = self._normalize_manual_limit(self._state.get("manual_limit"))
+        limit = self._resolve_limit_for_day(today, limit_mode=limit_mode, manual_limit=manual_limit)
         if self._state.get("date") != today:
-            # 哈希种子：同一天结果稳定，不同天差异足够大
-            seed = int(hashlib.md5(today.encode()).hexdigest()[:8], 16)
-            rng = random.Random(seed)
-            # 正态分布截断到 [DAILY_MIN, DAILY_MAX]，均值 45，标准差 12
-            raw = rng.gauss(45, 12)
-            limit = max(self.DAILY_MIN, min(self.DAILY_MAX, int(raw)))
-            self._state = {"date": today, "daily_limit": limit, "downloaded": 0}
+            self._state = {
+                "date": today,
+                "daily_limit": limit,
+                "downloaded": 0,
+                "limit_mode": limit_mode,
+                "manual_limit": manual_limit,
+            }
             self._save()
-            logger.info("[Human] 新的一天，今日下载上限: %d 张", limit)
+            mode_label = "手动" if limit_mode == "manual" and manual_limit else "自动"
+            logger.info("[Human] 新的一天，今日下载上限: %d 张（%s模式）", limit, mode_label)
+        else:
+            changed = False
+            if self._state.get("daily_limit") != limit:
+                self._state["daily_limit"] = limit
+                changed = True
+            if self._state.get("limit_mode") != limit_mode:
+                self._state["limit_mode"] = limit_mode
+                changed = True
+            if self._state.get("manual_limit") != manual_limit:
+                self._state["manual_limit"] = manual_limit
+                changed = True
+            if changed:
+                self._save()
         return self._state
 
     @property
     def daily_limit(self) -> int:
         """今日下载上限（每天不同，同一天稳定，重启不变）"""
         return self._ensure_today()["daily_limit"]
+
+    @property
+    def daily_limit_mode(self) -> str:
+        """每日上限模式：auto / manual"""
+        return self._ensure_today().get("limit_mode", "auto")
+
+    @property
+    def manual_daily_limit(self) -> Optional[int]:
+        """手动模式下的用户配置上限"""
+        return self._ensure_today().get("manual_limit")
 
     @property
     def downloaded_today(self) -> int:

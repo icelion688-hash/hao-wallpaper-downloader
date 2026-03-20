@@ -22,6 +22,10 @@ class AutoPilotConfigRequest(BaseModel):
     active_start: int = Field(default=8,  ge=0, le=23)
     active_end:   int = Field(default=23, ge=0, le=23)
 
+    # ── 每日下载上限 ────────────────────────────────────────────────────────
+    daily_limit_mode: str = Field(default="auto", pattern="^(auto|manual)$")
+    manual_daily_limit: Optional[int] = Field(default=None, ge=1, le=500)
+
     # ── 活跃时段下载模式 ────────────────────────────────────────────────────
     active_session_min: int = Field(default=5,    ge=1, le=200)
     active_session_max: int = Field(default=20,   ge=1, le=200)

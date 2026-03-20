@@ -50,6 +50,8 @@ RUNTIME_WAKE_KEYS = {
     "timezone",
     "active_start",
     "active_end",
+    "daily_limit_mode",
+    "manual_daily_limit",
     "inactive_enabled",
     "active_interval_min",
     "active_interval_max",
@@ -116,6 +118,10 @@ class AutoPilotEngine:
             "timezone": "Asia/Shanghai",
             "active_start": 8,          # 活跃时段开始（小时 0-23）
             "active_end": 23,           # 活跃时段结束（小时 0-23，不含）
+
+            # ── 每日下载上限 ────────────────────────────────────────────────
+            "daily_limit_mode": "auto",     # auto=自动生成今日上限，manual=使用手动值
+            "manual_daily_limit": None,      # 手动模式下的每日下载上限
 
             # ── 活跃时段下载模式 ────────────────────────────────────────────
             "active_session_min": 5,    # 单次最少下载张数
@@ -222,6 +228,14 @@ class AutoPilotEngine:
         cfg["tag_blacklist"] = [str(item).strip() for item in (cfg.get("tag_blacklist") or []) if str(item).strip()]
         cfg["active_start"] = max(0, min(23, int(cfg.get("active_start", 8))))
         cfg["active_end"] = max(0, min(23, int(cfg.get("active_end", 23))))
+        cfg["daily_limit_mode"] = (
+            "manual" if str(cfg.get("daily_limit_mode", "auto")).strip().lower() == "manual" else "auto"
+        )
+        manual_daily_limit = cfg.get("manual_daily_limit")
+        cfg["manual_daily_limit"] = (
+            None if manual_daily_limit in (None, "", 0, "0")
+            else max(1, min(500, int(manual_daily_limit)))
+        )
         cfg["active_session_min"], cfg["active_session_max"] = cls._normalize_pair(
             cfg.get("active_session_min", 5),
             cfg.get("active_session_max", 20),
@@ -261,7 +275,23 @@ class AutoPilotEngine:
             self._wake_event.set()
         defaults = self._default_config()
         self._save_config()
+        self._sync_human_ctrl_config()
         return {key: self._config[key] for key in defaults}
+
+    def bind_app_state(self, app_state) -> None:
+        """绑定应用状态，便于同步人性化下载控制器配置。"""
+        self._app_state = app_state
+        self._sync_human_ctrl_config()
+
+    def _sync_human_ctrl_config(self) -> None:
+        app_state = self._app_state
+        human_ctrl = getattr(app_state, "human_ctrl", None) if app_state else None
+        if not human_ctrl:
+            return
+        human_ctrl.apply_daily_limit_config(
+            limit_mode=self._config.get("daily_limit_mode", "auto"),
+            manual_limit=self._config.get("manual_daily_limit"),
+        )
 
     # ── 状态查询 ─────────────────────────────────────────────────────────────
 
@@ -269,6 +299,21 @@ class AutoPilotEngine:
         self._refresh_today()
         tz_name = self._config.get("timezone", "Asia/Shanghai")
         now_tz = _now_in_tz(tz_name)
+        human_ctrl = getattr(self._app_state, "human_ctrl", None) if self._app_state else None
+        today_payload = {
+            "sessions": self._today_sessions,
+            "downloaded": self._today_downloaded,
+            "date": self._today_date,
+        }
+        if human_ctrl:
+            today_payload.update(
+                {
+                    "daily_limit": human_ctrl.daily_limit,
+                    "remaining": human_ctrl.remaining_today,
+                    "limit_mode": human_ctrl.daily_limit_mode,
+                    "manual_daily_limit": human_ctrl.manual_daily_limit,
+                }
+            )
         return {
             "status": self._status,
             "phase": self._phase,
@@ -278,11 +323,7 @@ class AutoPilotEngine:
             "current_tz_time": now_tz.strftime("%H:%M"),
             "current_tz_name": tz_name,
             "is_active_hour": self._is_active_hour(),
-            "today": {
-                "sessions": self._today_sessions,
-                "downloaded": self._today_downloaded,
-                "date": self._today_date,
-            },
+            "today": today_payload,
             "next_session_at": (
                 self._next_session_at.isoformat() if self._next_session_at else None
             ),
@@ -295,9 +336,11 @@ class AutoPilotEngine:
     async def start(self, config: Optional[dict], app_state) -> bool:
         if self._status == "running":
             return False
+        self.bind_app_state(app_state)
         if config:
             self.update_config(config)
-        self._app_state = app_state
+        else:
+            self._sync_human_ctrl_config()
         self._status = "running"
         self._phase = "starting"
         self._loop_task = asyncio.create_task(self._main_loop())
