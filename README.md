@@ -68,9 +68,9 @@ npm run build
 
 项目已提供 `Dockerfile` 和 `docker-compose.yml`，适合单机部署。
 
-如果你想直接照着做服务器上线和多机迁移，可以看这份极简手册：
+如果你准备在服务器上长期运行，或需要处理升级、备份、反向代理、多机同步等问题，优先参考这份部署手册：
 
-- [服务器部署与多机迁移极简手册](/home/admin/hao-wallpaper-downloader/docs/server-deploy-and-sync-quickstart.md)
+- [服务器部署与多机同步手册](./docs/server-deploy-and-sync-quickstart.md)
 
 ### 1. 最简单启动
 
@@ -78,6 +78,14 @@ npm run build
 mkdir -p data downloads
 docker compose up -d --build
 ```
+
+如果你希望服务器从“未安装 Docker”开始也能一条命令完成部署，可以直接使用根目录的 [deploy_docker.sh](./deploy_docker.sh)：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downloader/main/deploy_docker.sh | sudo bash -s -- --port 8000
+```
+
+这个脚本会自动检查并安装 Docker、拉取或更新仓库、创建持久化目录，然后启动容器。
 
 第一次启动时，容器会自动生成 `data/config.yaml`，SQLite 默认位于 `data/wallpaper.db`。
 
@@ -97,6 +105,14 @@ sed -n '1,120p' data/config.yaml
 ```bash
 docker compose restart
 ```
+
+如果你准备正式上线，建议继续阅读上面的部署手册，里面补充了：
+
+- 首次部署后的配置说明
+- `APP_PORT`、`TZ` 等环境变量用法
+- 升级与备份流程
+- Nginx 反向代理示例
+- 多机同步上传记录的建议做法
 
 ### 3. 常用命令
 
