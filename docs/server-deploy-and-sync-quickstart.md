@@ -98,6 +98,34 @@ curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downl
 - 脚本会使用 root 或 sudo 提权执行安装操作
 - 如果部署目录已存在且不是 Git 仓库，脚本会直接退出，避免误覆盖
 - 默认仓库地址为当前 GitHub 仓库，可通过 `--repo` 覆盖
+
+### 3.1.1 中国大陆机器的代理用法
+
+当前一键部署脚本已经支持为部署过程本身设置代理，作用范围包括：
+
+- `curl` 下载安装脚本
+- `curl` 下载 Docker 安装脚本
+- `git clone` / `git pull` 访问 GitHub
+
+如果你的服务器位于中国大陆，且访问 GitHub 不稳定，推荐显式传入代理：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downloader/main/deploy_docker.sh | sudo bash -s -- --port 8000 --proxy http://127.0.0.1:7890
+```
+
+也可以先设置环境变量，再执行脚本：
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downloader/main/deploy_docker.sh | sudo bash -s -- --port 8000
+```
+
+注意：
+
+- 这里的代理是“服务器自身可访问”的代理地址
+- 不能直接填写你本地电脑上的 `127.0.0.1:7890`，除非代理服务就运行在服务器本机
+- 如果服务器没有可用代理，脚本仍会直接访问 GitHub，此时可能出现连接超时或 TLS 中断
 ### 3.2 拉取代码
 
 ```bash

@@ -24,6 +24,9 @@ uploads:
       base_url: "https://imgbed.example.com"
       api_token: "replace-with-your-token"
       channel: "telegram"
+      channel_name: ""              # 可选：多渠道场景下指定具体渠道名
+      auto_retry: true              # 失败时允许图床自动切换渠道重试
+      upload_name_type: "default"   # default | index | origin | short
       server_compress: true
       # 目录配置：横图/竖图/动态图分别存放的目录
       # 留空时使用默认值（bg/pc、bg/mb、bg/dynamic）
@@ -54,6 +57,9 @@ uploads:
       base_url: "https://imgbed.example.com"
       api_token: ""
       channel: "huggingface"
+      channel_name: ""
+      auto_retry: true
+      upload_name_type: "default"
       server_compress: false
       folder_landscape: "bg/pc"
       folder_portrait: "bg/mb"

@@ -47,6 +47,7 @@ from backend.core.upload_record_helper import (
     build_upload_record,
     dump_upload_records,
     find_reusable_upload_record,
+    sync_remote_record_metadata,
     upsert_upload_registry_record,
 )
 
@@ -788,6 +789,21 @@ async def _execute_task(
                             resource_id=resource_id,
                         ) if effective_uploader.profile_key else None
                         if _reused_record and _reused_record.get("url"):
+                            _reused_record = dict(_reused_record)
+                            _remote_meta = await sync_remote_record_metadata(
+                                effective_uploader,
+                                url=_reused_record["url"],
+                                width=item.get("width"),
+                                height=item.get("height"),
+                                wallpaper_type=item.get("wallpaper_type", "static"),
+                                category=_category or "",
+                                color_theme=_color_name or "",
+                                tags=item.get("tags", ""),
+                            )
+                            if _remote_meta["remote_path"]:
+                                _reused_record["remote_path"] = _remote_meta["remote_path"]
+                            if _remote_meta["remote_tags"]:
+                                _reused_record["remote_tags"] = _remote_meta["remote_tags"]
                             _imgbed_url = _reused_record["url"]
                             _upload_records = dump_upload_records({
                                 effective_uploader.profile_key: _reused_record,
@@ -813,15 +829,32 @@ async def _execute_task(
                                 height=item.get("height"),
                                 wallpaper_type=item.get("wallpaper_type", "static"),
                                 category=_category or "",
+                                type_id=_type_id or "",
+                                color_theme=_color_name or "",
+                                color_id=_color_id or "",
+                                tags=item.get("tags", ""),
+                                resource_id=resource_id,
                                 is_original=_is_original_dl,
                             )
                             if _imgbed_url:
                                 if effective_uploader.profile_key:
+                                    _remote_meta = await sync_remote_record_metadata(
+                                        effective_uploader,
+                                        url=_imgbed_url,
+                                        width=item.get("width"),
+                                        height=item.get("height"),
+                                        wallpaper_type=item.get("wallpaper_type", "static"),
+                                        category=_category or "",
+                                        color_theme=_color_name or "",
+                                        tags=item.get("tags", ""),
+                                    )
                                     _record = build_upload_record(
                                         profile_key=effective_uploader.profile_key,
                                         profile_name=effective_uploader.profile_name,
                                         channel=effective_uploader.channel,
                                         url=_imgbed_url,
+                                        remote_path=_remote_meta["remote_path"],
+                                        remote_tags=_remote_meta["remote_tags"],
                                     )
                                     _upload_records = dump_upload_records({
                                         effective_uploader.profile_key: _record

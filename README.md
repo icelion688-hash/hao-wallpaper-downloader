@@ -87,6 +87,12 @@ curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downl
 
 这个脚本会自动检查并安装 Docker、拉取或更新仓库、创建持久化目录，然后启动容器。
 
+如果服务器位于中国大陆，访问 GitHub 不稳定，可以额外传入部署代理：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downloader/main/deploy_docker.sh | sudo bash -s -- --port 8000 --proxy http://127.0.0.1:7890
+```
+
 第一次启动时，容器会自动生成 `data/config.yaml`，SQLite 默认位于 `data/wallpaper.db`。
 
 默认访问地址：

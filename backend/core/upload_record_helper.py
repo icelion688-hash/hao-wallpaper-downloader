@@ -5,14 +5,19 @@ upload_record_helper.py - 上传记录与去重复用辅助函数。
 from __future__ import annotations
 
 import json
+import logging
+import re
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote, unquote, urlparse
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from backend.models.upload_registry import UploadRegistry
 from backend.models.wallpaper import Wallpaper
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_UPLOAD_FORMAT = "profile"
 SUPPORTED_UPLOAD_FORMATS = {
@@ -62,6 +67,34 @@ def dump_upload_records(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def build_remote_file_url(base_url: str, remote_path: str) -> str:
+    normalized_base = str(base_url or "").rstrip("/")
+    normalized_path = str(remote_path or "").strip("/")
+    if not normalized_base or not normalized_path:
+        return normalized_base or normalized_path
+    return f"{normalized_base}/file/{quote(normalized_path, safe='/')}"
+
+
+def parse_remote_file_id_from_url(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    parsed = urlparse(text)
+    path = parsed.path or text
+    marker = "/file/"
+    if marker not in path:
+        return None
+
+    remote_path = path.split(marker, 1)[1].strip("/")
+    if not remote_path:
+        return None
+    return unquote(remote_path)
+
+
 def get_upload_record(records: dict, profile_key: str, format_key: Optional[str] = None) -> Optional[dict]:
     record_key = build_upload_record_key(profile_key, format_key)
     record = records.get(record_key)
@@ -83,9 +116,11 @@ def build_upload_record(
     channel: str,
     url: str,
     format_key: Optional[str] = None,
+    remote_path: Optional[str] = None,
+    remote_tags: Optional[list[str]] = None,
 ) -> dict:
     normalized = normalize_upload_format(format_key)
-    return {
+    record = {
         "profile_key": profile_key,
         "profile_name": profile_name,
         "channel": channel,
@@ -93,6 +128,112 @@ def build_upload_record(
         "format_key": normalized,
         "format_label": UPLOAD_FORMAT_LABELS[normalized],
         "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if remote_path:
+        record["remote_path"] = str(remote_path).strip("/")
+    if remote_tags:
+        record["remote_tags"] = [str(item).strip() for item in remote_tags if str(item).strip()]
+    return record
+
+
+def split_remote_tags(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = re.split(r"[,\n|]+", value)
+    else:
+        items = list(value)
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def unique_remote_tags(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def get_orientation_tag(width: Optional[int], height: Optional[int]) -> str:
+    width_value = int(width or 0)
+    height_value = int(height or 0)
+    if width_value <= 0 or height_value <= 0:
+        return "unknown"
+    if width_value == height_value:
+        return "方图"
+    return "竖图" if height_value > width_value else "横图"
+
+
+def build_remote_tags(
+    *,
+    width: Optional[int],
+    height: Optional[int],
+    wallpaper_type: str,
+    category: str,
+    color_theme: str,
+    tags: str | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    type_tag = "动态图" if str(wallpaper_type or "").strip().lower() == "dynamic" else "静态图"
+    orientation = get_orientation_tag(width, height)
+    return unique_remote_tags(
+        [
+            type_tag,
+            orientation,
+            str(category or "").strip(),
+            str(color_theme or "").strip(),
+            *split_remote_tags(tags),
+        ]
+    )
+
+
+async def sync_remote_record_metadata(
+    uploader,
+    *,
+    url: str,
+    width: Optional[int],
+    height: Optional[int],
+    wallpaper_type: str,
+    category: str,
+    color_theme: str,
+    tags: str | list[str] | tuple[str, ...] | None,
+) -> dict:
+    remote_path = parse_remote_file_id_from_url(url) or ""
+    remote_tags = build_remote_tags(
+        width=width,
+        height=height,
+        wallpaper_type=wallpaper_type,
+        category=category,
+        color_theme=color_theme,
+        tags=tags,
+    )
+    synced = False
+    error = ""
+
+    if remote_path and remote_tags:
+        try:
+            await uploader.set_remote_tags(remote_path, remote_tags, action="set")
+            synced = True
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+            logger.warning(
+                "[Imgbed] 同步远端标签失败 path=%s tags=%s error=%s",
+                remote_path,
+                remote_tags,
+                error,
+            )
+
+    return {
+        "remote_path": remote_path,
+        "remote_tags": remote_tags,
+        "tag_sync_success": synced,
+        "tag_sync_error": error,
     }
 
 

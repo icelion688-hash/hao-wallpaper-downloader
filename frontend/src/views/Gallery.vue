@@ -184,6 +184,9 @@
     <div class="select-toolbar" v-if="wallpapers.length">
       <button class="btn btn--sm" @click="toggleSelectCurrentPage(true)">全选当前页</button>
       <button class="btn btn--sm" @click="toggleSelectCurrentPage(false)">清空选择</button>
+      <button class="btn btn--sm" v-if="selectedIds.length" @click="openBatchReclassifyModal">
+        批量重分类
+      </button>
       <span class="selected-count" v-if="selectedIds.length">已选 {{ selectedIds.length }} 张</span>
     </div>
 
@@ -197,6 +200,54 @@
             <button class="btn" @click="confirmModal.resolve(false)">取消</button>
             <button class="btn btn--danger" @click="confirmModal.resolve(true)">
               {{ confirmModal.confirmText }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div class="modal-overlay" v-if="reclassifyModal.visible" @click.self="closeReclassifyModal">
+        <div class="modal-box modal-box--wide">
+          <div class="modal-title">{{ reclassifyModal.mode === 'batch' ? '批量重分类并同步图床' : '重分类并同步图床' }}</div>
+          <div class="modal-message">
+            {{ reclassifyModal.mode === 'batch' ? `将批量更新 ${reclassifyModal.wallpaperIds.length} 张已上传图片的远端目录和标签，不会重复上传。` : '只修改远端目录和标签，不会重复上传图片。' }}
+          </div>
+          <div class="reclassify-form">
+            <label class="field-label">
+              <span>分类</span>
+              <input class="input" v-model.trim="reclassifyForm.category" placeholder="例如：风景 / 动漫" />
+            </label>
+            <label class="field-label">
+              <span>颜色主题</span>
+              <input class="input" v-model.trim="reclassifyForm.color_theme" placeholder="例如：蓝色 / 暗色" />
+            </label>
+            <label class="field-label">
+              <span>壁纸类型</span>
+              <select class="select" v-model="reclassifyForm.wallpaper_type">
+                <option value="static">静态图</option>
+                <option value="dynamic">动态图</option>
+              </select>
+            </label>
+            <label class="field-label field-label--full">
+              <span>标签</span>
+              <textarea class="input textarea" v-model.trim="reclassifyForm.tags" rows="3" placeholder="多个标签用逗号分隔"></textarea>
+            </label>
+            <label class="check-label field-label--full">
+              <input type="checkbox" v-model="reclassifyForm.sync_local_metadata" />
+              同步更新本地画廊里的分类、颜色和标签
+            </label>
+          </div>
+          <div class="reclassify-preview" v-if="reclassifyModal.wallpaper">
+            当前图片：{{ reclassifyModal.wallpaper.title || reclassifyModal.wallpaper.resource_id }}
+          </div>
+          <div class="reclassify-preview" v-else-if="reclassifyModal.mode === 'batch'">
+            当前共选中 {{ reclassifyModal.wallpaperIds.length }} 张图片
+          </div>
+          <div class="modal-actions">
+            <button class="btn" @click="closeReclassifyModal">取消</button>
+            <button class="btn" :disabled="reclassifySubmitting" @click="submitReclassify">
+              {{ reclassifySubmitting ? '保存中...' : (reclassifyModal.mode === 'batch' ? '批量保存并同步' : '保存并同步') }}
             </button>
           </div>
         </div>
@@ -289,6 +340,7 @@
                   @click.stop="convertOne(w)"
                   :title="canConvert(w) ? '转换格式' : '已存在转换文件，请先删除后再重新转换'"
                 >⇄</button>
+                <button v-if="uploadCount(w)" class="btn btn--sm" @click.stop="openReclassifyModal(w)">重分类</button>
                 <a v-if="w.file_url" class="btn btn--sm" :href="encodeFileUrl(w.file_url)" target="_blank" @click.stop title="在浏览器查看原文件">↗</a>
                 <button class="btn btn--sm btn--danger del-btn" @click.stop="deleteWallpaper(w.id)">删除</button>
               </div>
@@ -374,6 +426,15 @@ const filters = ref({
 })
 
 const confirmModal = ref({ visible: false, title: '', message: '', confirmText: '确认', resolve: null })
+const reclassifyModal = ref({ visible: false, mode: 'single', wallpaper: null, wallpaperIds: [] })
+const reclassifySubmitting = ref(false)
+const reclassifyForm = ref({
+  category: '',
+  color_theme: '',
+  wallpaper_type: 'static',
+  tags: '',
+  sync_local_metadata: true,
+})
 
 // ── Computed ──────────────────────────────────────
 const totalPages = computed(() => Math.ceil(total.value / pageSize))
@@ -489,6 +550,75 @@ function showConfirm(title, message = '', confirmText = '确认') {
       resolve: v => { confirmModal.value.visible = false; resolve(v) },
     }
   })
+}
+
+function openReclassifyModal(wallpaper) {
+  reclassifyModal.value = { visible: true, mode: 'single', wallpaper, wallpaperIds: [] }
+  reclassifyForm.value = {
+    category: wallpaper?.category || '',
+    color_theme: wallpaper?.color_theme || '',
+    wallpaper_type: wallpaper?.wallpaper_type || 'static',
+    tags: wallpaper?.tags || '',
+    sync_local_metadata: true,
+  }
+}
+
+function openBatchReclassifyModal() {
+  if (!selectedIds.value.length) return
+  const first = wallpapers.value.find(item => item.id === selectedIds.value[0]) || null
+  reclassifyModal.value = {
+    visible: true,
+    mode: 'batch',
+    wallpaper: null,
+    wallpaperIds: [...selectedIds.value],
+  }
+  reclassifyForm.value = {
+    category: first?.category || '',
+    color_theme: first?.color_theme || '',
+    wallpaper_type: first?.wallpaper_type || 'static',
+    tags: first?.tags || '',
+    sync_local_metadata: true,
+  }
+}
+
+function closeReclassifyModal() {
+  reclassifyModal.value = { visible: false, mode: 'single', wallpaper: null, wallpaperIds: [] }
+  reclassifySubmitting.value = false
+}
+
+async function submitReclassify() {
+  reclassifySubmitting.value = true
+  try {
+    if (reclassifyModal.value.mode === 'batch') {
+      const res = await galleryApi.batchReclassifyUpload({
+        wallpaper_ids: reclassifyModal.value.wallpaperIds,
+        ...reclassifyForm.value,
+      })
+      const updatedWallpapers = Array.isArray(res.items) ? res.items.map(item => item.wallpaper).filter(Boolean) : []
+      if (updatedWallpapers.length) {
+        const updatedMap = new Map(updatedWallpapers.map(item => [item.id, item]))
+        wallpapers.value = wallpapers.value.map(item => updatedMap.get(item.id) || item)
+      }
+      selectedIds.value = selectedIds.value.filter(id => !reclassifyModal.value.wallpaperIds.includes(id))
+    } else {
+      const wallpaper = reclassifyModal.value.wallpaper
+      if (!wallpaper?.id) {
+        reclassifySubmitting.value = false
+        return
+      }
+      const res = await galleryApi.reclassifyUpload(wallpaper.id, { ...reclassifyForm.value })
+      const updated = res.wallpaper
+      if (updated?.id) {
+        wallpapers.value = wallpapers.value.map(item => item.id === updated.id ? updated : item)
+      }
+    }
+    await loadCategories()
+    await loadColorThemes()
+    closeReclassifyModal()
+  } catch (error) {
+    alert(`重分类失败: ${error.message}`)
+    reclassifySubmitting.value = false
+  }
 }
 
 // ── 筛选 ──────────────────────────────────────────
@@ -966,7 +1096,37 @@ onMounted(() => {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 24px; min-width: 320px; max-width: 480px;
 }
+.modal-box--wide { width: min(560px, calc(100vw - 32px)); max-width: 560px; }
 .modal-title   { font-size: 16px; font-weight: 600; margin-bottom: 10px; }
 .modal-message { font-size: 13px; color: var(--text-2); margin-bottom: 20px; line-height: 1.6; }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+.reclassify-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.field-label--full {
+  grid-column: 1 / -1;
+}
+
+.textarea {
+  resize: vertical;
+  min-height: 88px;
+}
+
+.reclassify-preview {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
 </style>

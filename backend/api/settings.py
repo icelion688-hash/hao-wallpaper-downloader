@@ -37,6 +37,9 @@ class UploadProfilePayload(BaseModel):
     base_url: str
     api_token: str
     channel: str = "telegram"
+    channel_name: str = ""
+    auto_retry: bool = True
+    upload_name_type: str = "default"
     server_compress: bool = False
     folder_landscape: str = ""
     folder_portrait: str = ""

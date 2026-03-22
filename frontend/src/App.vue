@@ -1,9 +1,8 @@
 <template>
   <div class="app-shell">
-    <!-- 侧边栏 -->
     <aside class="sidebar">
       <div class="logo">
-        <span class="logo-icon">◈</span>
+        <span class="logo-icon">◉</span>
         <span class="logo-text">好壁纸<em>下载器</em></span>
       </div>
 
@@ -27,7 +26,6 @@
       </div>
     </aside>
 
-    <!-- 主内容区 -->
     <main class="main-content">
       <router-view v-slot="{ Component }">
         <Suspense>
@@ -50,22 +48,23 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { healthCheck } from './api'
 
 const serverOk = ref(true)
 let healthTimer = null
 
 const navItems = [
-  { path: '/stats',      icon: '▣', label: '系统监控' },
-  { path: '/autopilot',  icon: '◎', label: '自动驾驶' },
-  { path: '/accounts',   icon: '◉', label: '账号管理' },
-  { path: '/tasks',      icon: '▶', label: '任务中心' },
-  { path: '/filters',    icon: '◈', label: '筛选配置' },
-  { path: '/gallery',    icon: '⊞', label: '下载画廊' },
-  { path: '/upload',     icon: '↑', label: '图床上传' },
-  { path: '/convert',   icon: '⇄', label: '格式转换' },
-  { path: '/sync',      icon: '⇅', label: '数据同步' },
+  { path: '/stats', icon: '◧', label: '系统监控' },
+  { path: '/autopilot', icon: '◎', label: '自动驾驶' },
+  { path: '/accounts', icon: '◉', label: '账号管理' },
+  { path: '/tasks', icon: '▣', label: '任务中心' },
+  { path: '/filters', icon: '◌', label: '筛选配置' },
+  { path: '/gallery', icon: '▥', label: '下载画廊' },
+  { path: '/upload', icon: '↥', label: '图床上传' },
+  { path: '/imgbed-manager', icon: '▤', label: '远端图床' },
+  { path: '/convert', icon: '↺', label: '格式转换' },
+  { path: '/sync', icon: '⇄', label: '数据同步' },
 ]
 
 async function checkHealth() {
@@ -81,11 +80,13 @@ onMounted(() => {
   checkHealth()
   healthTimer = setInterval(checkHealth, 30000)
 })
-onUnmounted(() => clearInterval(healthTimer))
+
+onUnmounted(() => {
+  clearInterval(healthTimer)
+})
 </script>
 
 <style>
-/* ── 全局重置 ─────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
@@ -107,24 +108,27 @@ onUnmounted(() => clearInterval(healthTimer))
   --font-ui:    'DM Mono', 'Fira Code', 'Courier New', monospace;
   --font-body:  'DM Sans', 'Helvetica Neue', sans-serif;
   --radius:     6px;
-  --sidebar-w:  220px;
+  --sidebar-w:  228px;
 }
 
-html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1); font-family: var(--font-body); font-size: 14px; }
+html, body, #app {
+  height: 100%;
+  background: var(--bg-base);
+  color: var(--text-1);
+  font-family: var(--font-body);
+  font-size: 14px;
+}
 
-/* 自定义滚动条 */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
 
-/* ── 布局 ─────────────────────────────────────── */
 .app-shell {
   display: flex;
   height: 100vh;
   overflow: hidden;
 }
 
-/* ── 侧边栏 ───────────────────────────────────── */
 .sidebar {
   width: var(--sidebar-w);
   flex-shrink: 0;
@@ -132,7 +136,6 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 0;
 }
 
 .logo {
@@ -144,11 +147,16 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   font-family: var(--font-ui);
   letter-spacing: .04em;
 }
+
 .logo-icon { font-size: 20px; color: var(--accent); }
-.logo-text  { font-size: 14px; color: var(--text-1); font-weight: 600; }
+.logo-text { font-size: 14px; color: var(--text-1); font-weight: 600; }
 .logo-text em { font-style: normal; color: var(--text-2); margin-left: 2px; }
 
-.nav { flex: 1; padding: 12px 0; overflow-y: auto; }
+.nav {
+  flex: 1;
+  padding: 12px 0;
+  overflow-y: auto;
+}
 
 .nav-item {
   display: flex;
@@ -163,13 +171,20 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   border-left: 2px solid transparent;
   position: relative;
 }
-.nav-item:hover { background: var(--bg-hover); color: var(--text-1); }
+
+.nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-1);
+}
+
 .nav-item--active {
   color: var(--accent);
   border-left-color: var(--accent);
   background: var(--accent-glow);
 }
+
 .nav-icon { font-size: 12px; width: 16px; text-align: center; }
+
 .nav-badge {
   margin-left: auto;
   background: var(--accent-dim);
@@ -187,16 +202,18 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   align-items: center;
   gap: 8px;
 }
+
 .status-dot {
-  width: 7px; height: 7px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   flex-shrink: 0;
 }
-.status-dot--ok  { background: var(--green); box-shadow: 0 0 6px var(--green); }
-.status-dot--err { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+
+.status-dot--ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.status-dot--err { background: var(--red); box-shadow: 0 0 6px var(--red); }
 .status-label { font-size: 11px; color: var(--text-3); font-family: var(--font-ui); }
 
-/* ── 主内容 ───────────────────────────────────── */
 .main-content {
   flex: 1;
   overflow-y: auto;
@@ -238,12 +255,10 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   to { transform: scaleX(.35); opacity: .4; }
 }
 
-/* ── 页面切换动画 ──────────────────────────────── */
 .page-enter-active, .page-leave-active { transition: opacity .18s, transform .18s; }
 .page-enter-from { opacity: 0; transform: translateY(6px); }
 .page-leave-to   { opacity: 0; transform: translateY(-4px); }
 
-/* ── 通用组件样式 ──────────────────────────────── */
 .page-header {
   padding: 28px 32px 20px;
   border-bottom: 1px solid var(--border);
@@ -252,9 +267,10 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   justify-content: space-between;
   gap: 16px;
 }
+
 .page-title { font-size: 20px; font-weight: 700; letter-spacing: -.01em; }
 .page-title small { font-size: 12px; font-weight: 400; color: var(--text-2); margin-left: 8px; font-family: var(--font-ui); }
-.page-body  { padding: 24px 32px; }
+.page-body { padding: 24px 32px; }
 
 .btn {
   display: inline-flex;
@@ -271,11 +287,12 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   font-family: var(--font-body);
   white-space: nowrap;
 }
-.btn:hover   { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); }
+
+.btn:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); }
 .btn--primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn--primary:hover { filter: brightness(1.15); color: #fff; }
-.btn--danger  { border-color: var(--red); color: var(--red); }
-.btn--danger:hover  { background: rgba(240,90,90,.12); }
+.btn--danger { border-color: var(--red); color: var(--red); }
+.btn--danger:hover { background: rgba(240,90,90,.12); }
 .btn--sm { padding: 5px 10px; font-size: 12px; }
 .btn:disabled { opacity: .4; cursor: not-allowed; pointer-events: none; }
 
@@ -285,6 +302,7 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   border-radius: var(--radius);
   overflow: hidden;
 }
+
 .card-header {
   padding: 14px 18px;
   border-bottom: 1px solid var(--border);
@@ -310,6 +328,7 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   font-family: var(--font-ui);
   letter-spacing: .03em;
 }
+
 .tag--vip     { background: rgba(245,166,35,.15); color: var(--orange); }
 .tag--free    { background: rgba(62,207,114,.1);  color: var(--green); }
 .tag--ok      { background: rgba(62,207,114,.1);  color: var(--green); }
@@ -330,6 +349,7 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   transition: border-color .15s;
   outline: none;
 }
+
 .input:focus { border-color: var(--accent); }
 
 .select {
@@ -343,6 +363,7 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   cursor: pointer;
   outline: none;
 }
+
 .select:focus { border-color: var(--accent); }
 
 .form-row { display: flex; flex-direction: column; gap: 6px; }
@@ -354,5 +375,10 @@ html, body, #app { height: 100%; background: var(--bg-base); color: var(--text-1
   color: var(--text-3);
   font-size: 13px;
 }
-.empty-state .empty-icon { font-size: 36px; margin-bottom: 12px; opacity: .4; }
+
+.empty-state .empty-icon {
+  font-size: 36px;
+  margin-bottom: 12px;
+  opacity: .4;
+}
 </style>

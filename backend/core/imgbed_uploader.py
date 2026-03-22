@@ -19,9 +19,10 @@ import mimetypes
 import os
 import re
 import tempfile
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 import httpx
 from PIL import Image, ImageOps
@@ -110,6 +111,31 @@ def _safe_path_segment(value: str) -> str:
     return cleaned or "unknown"
 
 
+def _normalize_tags(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = re.split(r"[,\n|]+", value)
+    else:
+        items = list(value)
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _trim_joined_segment(parts: list[str], fallback: str) -> str:
+    if not parts:
+        return fallback
+    value = "_".join(parts)
+    return value[:96] if value else fallback
+
+
+def _get_orientation(width: Optional[int], height: Optional[int]) -> str:
+    if not width or not height:
+        return "unknown"
+    if width == height:
+        return "square"
+    return "portrait" if height > width else "landscape"
+
+
 class ImgbedUploader:
     # 默认目录（向后兼容）
     _DEFAULT_LANDSCAPE = "bg/pc"
@@ -127,6 +153,9 @@ class ImgbedUploader:
         api_token: str,
         compress: bool = True,
         channel: str = "telegram",
+        channel_name: str = "",
+        auto_retry: bool = True,
+        upload_name_type: str = "default",
         image_processing: Optional[dict] = None,
         profile_key: Optional[str] = None,
         profile_name: Optional[str] = None,
@@ -142,6 +171,9 @@ class ImgbedUploader:
         self.api_token = api_token
         self.compress = compress
         self.channel = channel or "telegram"
+        self.channel_name = str(channel_name or "").strip()
+        self.auto_retry = bool(auto_retry)
+        self.upload_name_type = str(upload_name_type or "default").strip() or "default"
         self.image_processing = ImageProcessingConfig.from_dict(image_processing)
         self.profile_key = profile_key or ""
         self.profile_name = profile_name or self.profile_key or "upload"
@@ -212,6 +244,258 @@ class ImgbedUploader:
             return self.folder_portrait
         return self.folder_landscape
 
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_token}"}
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+    ) -> dict | list:
+        client = self._ensure_client()
+        response = await client.request(
+            method,
+            f"{self.base_url}{path}",
+            params={k: v for k, v in (params or {}).items() if v not in (None, "")},
+            headers=self._auth_headers(),
+            json=json_body,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _build_template_values(
+        *,
+        width: Optional[int],
+        height: Optional[int],
+        wallpaper_type: str,
+        category: str,
+        type_id: str,
+        color_theme: str,
+        color_id: str,
+        tags: str | list[str] | tuple[str, ...] | None,
+        is_original: bool,
+        resource_id: str,
+    ) -> dict[str, str]:
+        now = datetime.now()
+        orientation = _get_orientation(width, height)
+        normalized_tags = [_safe_path_segment(item) for item in _normalize_tags(tags)]
+        primary_tag = normalized_tags[0] if normalized_tags else "untagged"
+        return {
+            "type": wallpaper_type or "static",
+            "category": _safe_path_segment(category) if category else "uncategorized",
+            "type_id": _safe_path_segment(type_id) if type_id else "unknown-type",
+            "color": _safe_path_segment(color_theme) if color_theme else "uncolored",
+            "color_id": _safe_path_segment(color_id) if color_id else "unknown-color",
+            "orientation": orientation,
+            "primary_tag": primary_tag,
+            "tags": _trim_joined_segment(normalized_tags[:5], "untagged"),
+            "originality": "original" if is_original else "preview",
+            "resource_id": _safe_path_segment(resource_id) if resource_id else "unknown-resource",
+            "year": now.strftime("%Y"),
+            "month": now.strftime("%m"),
+            "date": now.strftime("%Y%m%d"),
+        }
+
+    @classmethod
+    def _resolve_pattern(cls, pattern: str, values: dict[str, str]) -> str:
+        folder = pattern
+        for key, value in values.items():
+            folder = folder.replace(f"{{{key}}}", value)
+        return re.sub(r"/{2,}", "/", folder).strip("/")
+
+    def _determine_folder(
+        self,
+        width: Optional[int],
+        height: Optional[int],
+        wallpaper_type: str = "static",
+        category: str = "",
+        type_id: str = "",
+        color_theme: str = "",
+        color_id: str = "",
+        tags: str | list[str] | tuple[str, ...] | None = None,
+        is_original: bool = False,
+        resource_id: str = "",
+    ) -> str:
+        if self.folder_pattern:
+            return self._resolve_pattern(
+                self.folder_pattern,
+                self._build_template_values(
+                    width=width,
+                    height=height,
+                    wallpaper_type=wallpaper_type,
+                    category=category,
+                    type_id=type_id,
+                    color_theme=color_theme,
+                    color_id=color_id,
+                    tags=tags,
+                    is_original=is_original,
+                    resource_id=resource_id,
+                ),
+            )
+
+        if wallpaper_type == "dynamic":
+            return self.folder_dynamic
+        if _get_orientation(width, height) == "portrait":
+            return self.folder_portrait
+        return self.folder_landscape
+
+    async def list_files(
+        self,
+        *,
+        start: int = 0,
+        count: int = 50,
+        recursive: bool = False,
+        directory: str = "",
+        search: str = "",
+        include_tags: str = "",
+        exclude_tags: str = "",
+        channel: str = "",
+        list_type: str = "",
+    ) -> dict | list:
+        return await self._request_json(
+            "GET",
+            "/api/manage/list",
+            params={
+                "start": start,
+                "count": count,
+                "recursive": str(bool(recursive)).lower(),
+                "dir": directory.strip("/"),
+                "search": search,
+                "includeTags": include_tags,
+                "excludeTags": exclude_tags,
+                "channel": channel,
+                "listType": list_type,
+            },
+        )
+
+    async def get_index_info(self, *, directory: str = "") -> dict | list:
+        return await self._request_json(
+            "GET",
+            "/api/manage/list",
+            params={"action": "info", "dir": directory.strip("/")},
+        )
+
+    async def rebuild_index(self, *, directory: str = "") -> dict | list:
+        return await self._request_json(
+            "GET",
+            "/api/manage/list",
+            params={"action": "rebuild", "dir": directory.strip("/")},
+        )
+
+    async def delete_remote_path(self, remote_path: str, *, folder: bool = False) -> dict | list:
+        normalized = remote_path.strip("/")
+        encoded_path = quote(normalized, safe="/")
+        return await self._request_json(
+            "DELETE",
+            f"/api/manage/delete/{encoded_path}",
+            params={"folder": str(bool(folder)).lower()},
+        )
+
+    async def move_remote_path(
+        self,
+        remote_path: str,
+        *,
+        dist: str = "",
+        folder: bool = False,
+    ) -> dict | list:
+        normalized = remote_path.strip("/")
+        encoded_path = quote(normalized, safe="/")
+        return await self._request_json(
+            "POST",
+            f"/api/manage/move/{encoded_path}",
+            params={
+                "dist": dist.strip("/"),
+                "folder": str(bool(folder)).lower(),
+            },
+        )
+
+    async def get_remote_tags(self, remote_path: str) -> dict | list:
+        normalized = remote_path.strip("/")
+        encoded_path = quote(normalized, safe="/")
+        return await self._request_json(
+            "GET",
+            f"/api/manage/tags/{encoded_path}",
+        )
+
+    async def set_remote_tags(
+        self,
+        remote_path: str,
+        tags: list[str],
+        *,
+        action: str = "set",
+    ) -> dict | list:
+        normalized = remote_path.strip("/")
+        encoded_path = quote(normalized, safe="/")
+        return await self._request_json(
+            "POST",
+            f"/api/manage/tags/{encoded_path}",
+            json_body={
+                "action": action,
+                "tags": tags,
+            },
+        )
+
+    async def set_remote_tags_batch(
+        self,
+        remote_paths: list[str],
+        tags: list[str],
+        *,
+        action: str = "set",
+    ) -> dict | list:
+        file_ids = [str(item).strip("/") for item in remote_paths if str(item).strip("/")]
+        return await self._request_json(
+            "POST",
+            "/api/manage/tags/batch",
+            json_body={
+                "fileIds": file_ids,
+                "action": action,
+                "tags": tags,
+            },
+        )
+
+    async def list_channels(self) -> dict | list:
+        return await self._request_json("GET", "/api/channels")
+
+    async def probe_capabilities(self) -> dict[str, object]:
+        checks = {
+            "channels": ("channels", self.list_channels),
+            "list": ("list", self.get_index_info),
+            "manage": ("manage", lambda: self._request_json("GET", "/api/manage/apiTokens")),
+        }
+        results: dict[str, object] = {}
+
+        for key, (permission, callback) in checks.items():
+            try:
+                await callback()
+                results[key] = {
+                    "ok": True,
+                    "permission": permission,
+                }
+            except httpx.HTTPStatusError as exc:
+                results[key] = {
+                    "ok": False,
+                    "permission": permission,
+                    "status_code": exc.response.status_code,
+                    "detail": (exc.response.text or str(exc))[:200],
+                }
+            except Exception as exc:  # noqa: BLE001
+                results[key] = {
+                    "ok": False,
+                    "permission": permission,
+                    "detail": str(exc),
+                }
+
+        return {
+            "channels": bool(results.get("channels", {}).get("ok")),
+            "list": bool(results.get("list", {}).get("ok")),
+            "manage": bool(results.get("manage", {}).get("ok")),
+            "checks": results,
+        }
+
     async def upload(
         self,
         local_path: str,
@@ -219,6 +503,11 @@ class ImgbedUploader:
         height: Optional[int] = None,
         wallpaper_type: str = "static",
         category: str = "",
+        type_id: str = "",
+        color_theme: str = "",
+        color_id: str = "",
+        tags: str | list[str] | tuple[str, ...] | None = None,
+        resource_id: str = "",
         is_original: bool = False,
         format_override: Optional[str] = None,
     ) -> Optional[str]:
@@ -232,15 +521,30 @@ class ImgbedUploader:
             logger.info("[Imgbed] 跳过上传 file=%s reason=%s", os.path.basename(local_path), reason)
             return None
 
-        folder = self._determine_folder(width, height, wallpaper_type, category)
+        folder = self._determine_folder(
+            width,
+            height,
+            wallpaper_type,
+            category,
+            type_id=type_id,
+            color_theme=color_theme,
+            color_id=color_id,
+            tags=tags,
+            is_original=is_original,
+            resource_id=resource_id,
+        )
         upload_url = f"{self.base_url}/upload"
         params = {
             "uploadChannel": self.channel,
             "uploadFolder": folder,
+            "autoRetry": "true" if self.auto_retry else "false",
+            "uploadNameType": self.upload_name_type,
             "serverCompress": "true" if self.compress else "false",
             "returnFormat": "full",
         }
-        headers = {"Authorization": f"Bearer {self.api_token}"}
+        if self.channel_name:
+            params["channelName"] = self.channel_name
+        headers = self._auth_headers()
 
         upload_path = local_path
         upload_name = os.path.basename(local_path)

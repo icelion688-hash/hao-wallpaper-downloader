@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend.api import accounts, autopilot, gallery, schedule, settings, stats, sync, tasks
+from backend.api import accounts, autopilot, gallery, imgbed_manage, schedule, settings, stats, sync, tasks
 from backend.config import load_config
 from backend.core.account_pool import AccountPool
 from backend.core.anti_detection import AntiDetection, HumanBehaviorController
@@ -273,6 +273,7 @@ app.include_router(stats.router, prefix="/api/stats", tags=["系统监控"])
 app.include_router(schedule.router, prefix="/api/schedule", tags=["定时计划"])
 app.include_router(settings.router, prefix="/api/settings", tags=["全局设置"])
 app.include_router(sync.router, prefix="/api/sync", tags=["数据同步"])
+app.include_router(imgbed_manage.router, prefix="/api/imgbed", tags=["图床管理"])
 
 
 @app.get("/api/health")

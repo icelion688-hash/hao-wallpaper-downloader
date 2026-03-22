@@ -50,6 +50,8 @@ export const galleryApi = {
   wallpaperMeta: () => http.get('/gallery/wallpaper-meta'),
   uploadProfiles: () => http.get('/gallery/upload-profiles'),
   batchUpload: (data) => http.post('/gallery/upload', data),
+  reclassifyUpload: (id, data) => http.post(`/gallery/${id}/reclassify-upload`, data),
+  batchReclassifyUpload: (data) => http.post('/gallery/reclassify-upload/batch', data),
   delete: (id, deleteFile = true) =>
     http.delete(`/gallery/${id}`, { params: { delete_file: deleteFile } }),
   batchDelete: (data) => http.delete('/gallery/batch', { data }),
@@ -79,6 +81,19 @@ export const settingsApi = {
   getSync: () => http.get('/settings/sync'),
   setSync: (data) => http.put('/settings/sync', data),
   getSystemInfo: () => http.get('/settings/system-info'),
+}
+
+export const imgbedApi = {
+  channels: (profileKey) => http.get(`/imgbed/${profileKey}/channels`),
+  capabilities: (profileKey) => http.get(`/imgbed/${profileKey}/capabilities`),
+  list: (profileKey, params) => http.get(`/imgbed/${profileKey}/list`, { params }),
+  indexInfo: (profileKey, params) => http.get(`/imgbed/${profileKey}/index-info`, { params }),
+  rebuildIndex: (profileKey, params) => http.post(`/imgbed/${profileKey}/rebuild-index`, null, { params }),
+  deletePath: (profileKey, params) => http.delete(`/imgbed/${profileKey}/delete`, { params }),
+  movePath: (profileKey, data) => http.post(`/imgbed/${profileKey}/move`, data),
+  getTags: (profileKey, params) => http.get(`/imgbed/${profileKey}/tags`, { params }),
+  setTags: (profileKey, data) => http.post(`/imgbed/${profileKey}/tags`, data),
+  batchTags: (profileKey, data) => http.post(`/imgbed/${profileKey}/tags/batch`, data),
 }
 
 export const convertApi = {

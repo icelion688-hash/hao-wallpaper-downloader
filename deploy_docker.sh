@@ -14,6 +14,7 @@ INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 APP_PORT="${APP_PORT:-$DEFAULT_PORT}"
 TZ_VALUE="${TZ:-$DEFAULT_TZ}"
 USE_LOCAL_REPO="auto"
+PROXY_URL="${PROXY_URL:-${HTTPS_PROXY:-${https_proxy:-}}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -38,6 +39,7 @@ usage() {
   --dir <路径>       部署目录，默认 /opt/hao-wallpaper-downloader
   --port <端口>      对外端口，默认 8000
   --tz <时区>        时区，默认 Asia/Shanghai
+  --proxy <地址>     为 curl / git / docker 安装使用 HTTP(S) 代理
   --repo <地址>      Git 仓库地址
   --branch <分支>    Git 分支，默认 main
   --local-repo       优先使用当前脚本所在仓库
@@ -46,7 +48,8 @@ usage() {
 
 示例：
   sudo bash deploy_docker.sh --port 8080
-  curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downloader/main/deploy_docker.sh | sudo bash -s -- --port 8080
+  sudo bash deploy_docker.sh --port 8080 --proxy http://127.0.0.1:7890
+  curl -fsSL https://raw.githubusercontent.com/icelion688-hash/hao-wallpaper-downloader/main/deploy_docker.sh | sudo bash -s -- --port 8080 --proxy http://127.0.0.1:7890
 EOF
 }
 
@@ -62,6 +65,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --tz)
       TZ_VALUE="$2"
+      shift 2
+      ;;
+    --proxy)
+      PROXY_URL="$2"
       shift 2
       ;;
     --repo)
@@ -128,6 +135,21 @@ run_root() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+apply_proxy_env() {
+  if [ -z "$PROXY_URL" ]; then
+    return
+  fi
+
+  export HTTP_PROXY="$PROXY_URL"
+  export HTTPS_PROXY="$PROXY_URL"
+  export ALL_PROXY="$PROXY_URL"
+  export http_proxy="$PROXY_URL"
+  export https_proxy="$PROXY_URL"
+  export all_proxy="$PROXY_URL"
+
+  info "已启用代理：$PROXY_URL"
 }
 
 detect_pkg_manager() {
@@ -217,13 +239,27 @@ install_docker_if_needed() {
 
   info "开始安装 Docker..."
   install_base_packages
-  run_root sh -c "curl -fsSL https://get.docker.com | sh"
+  run_root sh -c "curl --retry 3 --retry-delay 2 -fsSL https://get.docker.com | sh"
   ensure_docker_service
   install_compose_plugin_if_missing
 }
 
 run_git_remote() {
-  run_root git -C "$INSTALL_DIR" "$@"
+  if [ -n "$PROXY_URL" ]; then
+    run_root git -C "$INSTALL_DIR" -c http.proxy="$PROXY_URL" -c https.proxy="$PROXY_URL" -c http.version=HTTP/1.1 "$@"
+    return
+  fi
+
+  run_root git -C "$INSTALL_DIR" -c http.version=HTTP/1.1 "$@"
+}
+
+run_git() {
+  if [ -n "$PROXY_URL" ]; then
+    run_root git -c http.proxy="$PROXY_URL" -c https.proxy="$PROXY_URL" -c http.version=HTTP/1.1 "$@"
+    return
+  fi
+
+  run_root git -c http.version=HTTP/1.1 "$@"
 }
 
 resolve_repo_mode() {
@@ -255,9 +291,9 @@ prepare_repo() {
 
     if command_exists git && [ -d "$INSTALL_DIR/.git" ]; then
       info "同步当前仓库最新代码..."
-      git -C "$INSTALL_DIR" fetch origin "$BRANCH"
-      git -C "$INSTALL_DIR" checkout "$BRANCH"
-      git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH"
+      run_git_remote fetch origin "$BRANCH"
+      run_git_remote checkout "$BRANCH"
+      run_git_remote pull --ff-only origin "$BRANCH"
     fi
     return
   fi
@@ -279,7 +315,7 @@ prepare_repo() {
   fi
 
   info "从远程仓库克隆代码..."
-  run_root git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  run_git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
 }
 
 prepare_data_dirs() {
@@ -322,6 +358,7 @@ show_result() {
 }
 
 info "开始执行 Docker 一键部署..."
+apply_proxy_env
 install_base_packages
 install_docker_if_needed
 prepare_repo
