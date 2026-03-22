@@ -58,6 +58,11 @@ export const galleryApi = {
   scanDuplicates: () => http.post('/gallery/scan-duplicates'),
   cleanDuplicates: (dryRun = false) =>
     http.post('/gallery/clean-duplicates', null, { params: { dry_run: dryRun } }),
+  // 远端路径匹配本地DB（用于 ImgbedManager 自动补全标签）
+  matchRemote: (data) => http.post('/gallery/match-remote', data),
+  // 本地存储滚动清仓
+  cleanupLocal: (data) => http.post('/gallery/cleanup-local', data),
+  storageStats: () => http.get('/gallery/storage-stats'),
 }
 
 export const statsApi = {

@@ -148,6 +148,14 @@ class AutoPilotEngine:
             "min_width": None,
             "min_height": None,
             "screen_orientation": "all",
+
+            # ── 本地存储自动清仓 ────────────────────────────────────────────
+            # 每次会话结束后，若 storage_auto_clean=True 则自动触发清仓
+            "storage_auto_clean": False,
+            "storage_max_count": 500,         # keep_count 策略下保留的最新文件数
+            "storage_strategy": "keep_count", # keep_count | keep_days | upload_and_delete
+            "storage_keep_days": 30,          # keep_days 策略下保留的天数
+            "storage_uploaded_only": True,    # True=只删已上传到图床的文件
         }
 
     # ── 配置持久化 ───────────────────────────────────────────────────────────
@@ -263,6 +271,13 @@ class AutoPilotEngine:
         for key in ("min_width", "min_height"):
             value = cfg.get(key)
             cfg[key] = None if value in (None, "", 0) else max(1, int(value))
+        # 存储限额规范化
+        cfg["storage_auto_clean"] = bool(cfg.get("storage_auto_clean", False))
+        cfg["storage_max_count"] = max(1, min(99999, int(cfg.get("storage_max_count") or 500)))
+        cfg["storage_keep_days"] = max(1, min(3650, int(cfg.get("storage_keep_days") or 30)))
+        cfg["storage_uploaded_only"] = bool(cfg.get("storage_uploaded_only", True))
+        strategy = str(cfg.get("storage_strategy") or "keep_count").strip().lower()
+        cfg["storage_strategy"] = strategy if strategy in ("keep_count", "keep_days", "upload_and_delete") else "keep_count"
         return cfg
 
     def update_config(self, new_cfg: dict) -> dict:
@@ -456,6 +471,10 @@ class AutoPilotEngine:
                     f"今日 {self._today_sessions} 次 / 累计 {self._today_downloaded} 张"
                 )
 
+                # ── 会话后自动清仓 ────────────────────────────────────────
+                if self._config.get("storage_auto_clean") and downloaded > 0:
+                    await self._run_storage_cleanup()
+
                 if human_ctrl.is_daily_limit_reached():
                     continue
 
@@ -482,6 +501,45 @@ class AutoPilotEngine:
             self._mode = ""
             self._current_task_id = None
             self._next_session_at = None
+
+    # ── 存储清仓 ─────────────────────────────────────────────────────────────
+
+    async def _run_storage_cleanup(self) -> None:
+        """会话后触发本地存储清仓（在线程池中执行 DB 操作）。"""
+        try:
+            from backend.api.gallery import _do_cleanup_local
+            from backend.models.database import SessionLocal
+
+            strategy = self._config.get("storage_strategy", "keep_count")
+            max_count = self._config.get("storage_max_count", 500)
+            keep_days = self._config.get("storage_keep_days", 30)
+            uploaded_only = self._config.get("storage_uploaded_only", True)
+
+            def _cleanup():
+                db = SessionLocal()
+                try:
+                    return _do_cleanup_local(
+                        db,
+                        strategy=strategy,
+                        max_count=max_count,
+                        keep_days=keep_days,
+                        uploaded_only=uploaded_only,
+                        dry_run=False,
+                    )
+                finally:
+                    db.close()
+
+            result = await asyncio.get_event_loop().run_in_executor(None, _cleanup)
+            deleted = result.get("deleted", 0)
+            remaining = result.get("remaining", 0)
+            if deleted > 0:
+                self._log(
+                    f"[存储] 自动清仓完成 — 删除 {deleted} 张本地文件，"
+                    f"剩余 {remaining} 张（策略: {strategy}，"
+                    f"{'仅已上传' if uploaded_only else '全部'}）"
+                )
+        except Exception as exc:
+            logger.warning("[AutoPilot] 自动清仓异常: %s", exc)
 
     # ── 会话执行 ─────────────────────────────────────────────────────────────
 

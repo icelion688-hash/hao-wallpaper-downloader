@@ -933,6 +933,232 @@ async def clean_duplicates(dry_run: bool = False, db: Session = Depends(get_db))
     return {"cleaned": count, "dry_run": dry_run}
 
 
+# ── 远端路径匹配本地 DB（用于图床管理页自动补全标签）─────────────────────
+
+class MatchRemoteRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)   # 远端相对路径，如 "bg/pc/xxx.webp"
+    base_url: str = ""                                # 图床 base_url（用于 URL 后缀匹配）
+
+
+@router.post("/match-remote")
+async def match_remote_files(body: MatchRemoteRequest, db: Session = Depends(get_db)):
+    """
+    将远端图床文件路径匹配到本地数据库壁纸记录。
+    用于 ImgbedManager 页面的"从本地库补全标签"功能。
+    返回每个路径对应的本地元数据（分类、色系、方向等）以及建议打的标签列表。
+    """
+    from backend.core.upload_record_helper import build_remote_tags, get_orientation_tag
+    from urllib.parse import urlparse
+
+    if not body.paths:
+        return {"matched": {}, "unmatched": []}
+
+    # 构建 imgbed_url → Wallpaper 的后缀索引（只加载有 imgbed_url 的记录）
+    wallpapers = (
+        db.query(Wallpaper)
+        .filter(Wallpaper.imgbed_url.isnot(None))
+        .all()
+    )
+
+    # suffix_map: normalized_path → Wallpaper
+    suffix_map: dict[str, Wallpaper] = {}
+    for wp in wallpapers:
+        if not wp.imgbed_url:
+            continue
+        # 存完整 URL
+        suffix_map[wp.imgbed_url.rstrip("/")] = wp
+        # 存路径部分（去掉域名和 /file/ 前缀）
+        parsed = urlparse(wp.imgbed_url)
+        raw_path = parsed.path.lstrip("/")
+        # 去掉 "file/" 前缀（图床 URL 格式：base_url/file/path）
+        if raw_path.startswith("file/"):
+            raw_path = raw_path[5:]
+        suffix_map[raw_path.lstrip("/")] = wp
+
+    base_url_normalized = body.base_url.rstrip("/") if body.base_url else ""
+
+    matched: dict[str, dict] = {}
+    unmatched: list[str] = []
+
+    for path in body.paths:
+        normalized_path = path.lstrip("/")
+        wp: Wallpaper | None = None
+
+        # 尝试精确匹配（相对路径）
+        wp = suffix_map.get(normalized_path)
+
+        # 尝试完整 URL 匹配
+        if not wp and base_url_normalized:
+            full_url = f"{base_url_normalized}/file/{normalized_path}"
+            wp = suffix_map.get(full_url)
+
+        if not wp:
+            unmatched.append(path)
+            continue
+
+        suggested_tags = build_remote_tags(
+            width=wp.width,
+            height=wp.height,
+            wallpaper_type=wp.wallpaper_type or "static",
+            category=wp.category or "",
+            color_theme=wp.color_theme or "",
+            tags=wp.tags or "",
+        )
+        orientation = get_orientation_tag(wp.width, wp.height)
+
+        matched[path] = {
+            "id": wp.id,
+            "resource_id": wp.resource_id,
+            "title": wp.title or "",
+            "category": wp.category or "",
+            "color_theme": wp.color_theme or "",
+            "wallpaper_type": wp.wallpaper_type or "static",
+            "orientation": orientation,
+            "width": wp.width,
+            "height": wp.height,
+            "tags": wp.tags or "",
+            "suggested_tags": suggested_tags,
+            "imgbed_url": wp.imgbed_url or "",
+        }
+
+    return {
+        "matched": matched,
+        "unmatched": unmatched,
+        "matched_count": len(matched),
+        "unmatched_count": len(unmatched),
+    }
+
+
+# ── 本地存储滚动清仓（删除已上传的旧文件，释放磁盘空间）──────────────────
+
+class CleanupLocalRequest(BaseModel):
+    strategy: str = "keep_count"       # keep_count | keep_days | upload_and_delete
+    max_count: int = Field(default=500, ge=1, le=99999)
+    keep_days: int = Field(default=30, ge=1, le=3650)
+    uploaded_only: bool = True         # True: 只清理已上传到图床的文件
+    dry_run: bool = False              # True: 只统计，不实际删除
+
+
+def _do_cleanup_local(
+    db: Session,
+    *,
+    strategy: str,
+    max_count: int,
+    keep_days: int,
+    uploaded_only: bool,
+    dry_run: bool,
+) -> dict:
+    """
+    内部清仓逻辑，供 REST 端点和 AutoPilot 引擎直接调用。
+    """
+    from datetime import timezone as _tz, timedelta as _td
+    import datetime as _dt
+
+    base_q = db.query(Wallpaper).filter(
+        Wallpaper.status == "done",
+        Wallpaper.local_path.isnot(None),
+    )
+    if uploaded_only:
+        base_q = base_q.filter(Wallpaper.imgbed_url.isnot(None))
+
+    total_eligible = base_q.count()
+
+    if strategy == "keep_count":
+        # 保留最新 max_count 张，删除更老的
+        to_keep_ids = {
+            row.id
+            for row in base_q.order_by(Wallpaper.downloaded_at.desc()).limit(max_count).all()
+        }
+        to_delete = base_q.filter(~Wallpaper.id.in_(to_keep_ids)).all() if to_keep_ids else base_q.all()
+    elif strategy == "keep_days":
+        cutoff = _dt.datetime.now(_tz.utc).replace(tzinfo=None) - _td(days=keep_days)
+        to_delete = base_q.filter(Wallpaper.downloaded_at < cutoff).all()
+    elif strategy == "upload_and_delete":
+        # 删除所有已上传的本地文件
+        to_delete = base_q.all() if uploaded_only else base_q.filter(Wallpaper.imgbed_url.isnot(None)).all()
+    else:
+        return {"error": f"未知策略: {strategy}", "deleted": 0, "remaining": total_eligible}
+
+    deleted_paths: list[str] = []
+    file_fail_count = 0
+
+    for wp in to_delete:
+        deleted_paths.append(wp.local_path or "")
+        if not dry_run:
+            # 删除本地文件（原图 + 转换产物）
+            file_fail_count += _delete_wallpaper_files(wp)
+            # 清空 local_path 和 converted_path，保留 DB 记录（imgbed_url 等历史信息不丢）
+            wp.local_path = None
+            wp.converted_path = None
+
+    if not dry_run and to_delete:
+        db.commit()
+        _prune_empty_download_dirs()
+
+    remaining = base_q.count() if not dry_run else total_eligible - len(to_delete)
+
+    return {
+        "success": True,
+        "strategy": strategy,
+        "dry_run": dry_run,
+        "total_eligible": total_eligible,
+        "deleted": len(to_delete),
+        "file_fail_count": file_fail_count,
+        "remaining": remaining,
+        "deleted_paths": deleted_paths[:50],  # 前 50 条路径用于展示
+    }
+
+
+@router.post("/cleanup-local")
+async def cleanup_local_files(body: CleanupLocalRequest, db: Session = Depends(get_db)):
+    """
+    本地存储滚动清仓。
+    - keep_count: 保留最新 max_count 张，删除更老的（只删已上传的，如果 uploaded_only=True）
+    - keep_days: 保留最近 keep_days 天内下载的，更早的删除
+    - upload_and_delete: 删除所有已上传到图床的本地文件
+    - dry_run=True 时只返回统计，不实际删除
+    """
+    return _do_cleanup_local(
+        db,
+        strategy=body.strategy,
+        max_count=body.max_count,
+        keep_days=body.keep_days,
+        uploaded_only=body.uploaded_only,
+        dry_run=body.dry_run,
+    )
+
+
+# ── 本地存储统计（供 AutoPilot 页面实时展示存储状态）──────────────────────
+
+@router.get("/storage-stats")
+async def get_storage_stats(db: Session = Depends(get_db)):
+    """返回本地存储状态统计，用于 AutoPilot 存储管理面板。"""
+    total_local = db.query(Wallpaper).filter(
+        Wallpaper.status == "done",
+        Wallpaper.local_path.isnot(None),
+    ).count()
+    uploaded_local = db.query(Wallpaper).filter(
+        Wallpaper.status == "done",
+        Wallpaper.local_path.isnot(None),
+        Wallpaper.imgbed_url.isnot(None),
+    ).count()
+    pending_upload = db.query(Wallpaper).filter(
+        Wallpaper.status == "done",
+        Wallpaper.local_path.isnot(None),
+        Wallpaper.imgbed_url.is_(None),
+    ).count()
+    total_uploaded = db.query(Wallpaper).filter(
+        Wallpaper.imgbed_url.isnot(None),
+    ).count()
+
+    return {
+        "total_local": total_local,
+        "uploaded_local": uploaded_local,
+        "pending_upload": pending_upload,
+        "total_uploaded": total_uploaded,
+    }
+
+
 # ── 批量格式转换 ─────────────────────────────────────────
 
 # 转换预设（覆盖 media_convert 配置中对应字段）
