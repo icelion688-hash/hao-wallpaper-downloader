@@ -347,8 +347,8 @@
             </div>
           </div>
 
-          <div class="gallery-meta">
-            <div class="gallery-tags">
+            <div class="gallery-meta">
+              <div class="gallery-tags">
               <!-- 分类名称标签 -->
               <span class="tag tag--grey cat-tag" v-if="w.category">{{ w.category }}</span>
               <!-- 色系标签（带颜色色点）-->
@@ -362,6 +362,23 @@
               <span class="tag tag--warn" v-else-if="w.is_original === false" :title="fileSizeTooltip(w)">预览图</span>
               <span class="tag tag--ok" v-if="uploadCount(w)">已上传{{ uploadCount(w) }}</span>
               <span class="tag tag--err" v-if="w.is_duplicate">重复</span>
+            </div>
+
+            <div class="file-tag-row">
+              <span class="file-tag-row__label">文件标签</span>
+              <div v-if="splitWallpaperTags(w.tags).length" class="file-tag-row__chips">
+                <span
+                  v-for="tag in splitWallpaperTags(w.tags).slice(0, 8)"
+                  :key="w.id + '-' + tag"
+                  class="file-tag-chip"
+                >
+                  {{ tag }}
+                </span>
+                <span v-if="splitWallpaperTags(w.tags).length > 8" class="file-tag-chip file-tag-chip--muted">
+                  +{{ splitWallpaperTags(w.tags).length - 8 }}
+                </span>
+              </div>
+              <span v-else class="file-tag-row__empty">暂无标签</span>
             </div>
 
             <!-- 统计行：分辨率 · 大小 · 时长 · 下载量 · 收藏量 -->
@@ -483,6 +500,14 @@ function fileSizeTooltip(w) {
 
 function uploadCount(w) {
   return Object.keys(w.upload_records || {}).length || 0
+}
+
+function splitWallpaperTags(value) {
+  return String(value || '')
+    .replace(/[\n|，]+/g, ',')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
 }
 
 function convertedFileLabel(w) {
@@ -1043,6 +1068,41 @@ onMounted(() => {
 .gallery-meta { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
 
 .gallery-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.file-tag-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 8px;
+}
+.file-tag-row__label {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.file-tag-row__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.file-tag-row__empty {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.file-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.file-tag-chip--muted {
+  color: var(--text-3);
+}
 
 .cat-tag { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

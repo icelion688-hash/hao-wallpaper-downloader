@@ -24,7 +24,11 @@ def _to_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, httpx.HTTPStatusError):
         detail = exc.response.text[:500] or str(exc)
         return HTTPException(exc.response.status_code, detail)
-    return HTTPException(502, str(exc))
+    if isinstance(exc, httpx.ConnectError):
+        detail = str(exc).strip() or "无法连接图床管理接口，请检查图床地址、网络连通性或 TLS/IPv6 兼容性。"
+        return HTTPException(502, detail)
+    detail = str(exc).strip() or exc.__class__.__name__
+    return HTTPException(502, detail)
 
 
 class RemoteMoveRequest(BaseModel):

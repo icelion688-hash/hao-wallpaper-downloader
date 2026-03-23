@@ -14,18 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import mimetypes
 import os
 import re
 import tempfile
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import httpx
 from PIL import Image, ImageOps
+from backend.core.upload_record_helper import normalize_remote_tag
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,8 @@ def _get_orientation(width: Optional[int], height: Optional[int]) -> str:
 
 
 class ImgbedUploader:
+    _MANAGE_TRANSPORT_HINTS: dict[str, str] = {}
+
     # 默认目录（向后兼容）
     _DEFAULT_LANDSCAPE = "bg/pc"
     _DEFAULT_PORTRAIT  = "bg/mb"
@@ -156,6 +160,7 @@ class ImgbedUploader:
         channel_name: str = "",
         auto_retry: bool = True,
         upload_name_type: str = "default",
+        sync_remote_tags: bool = True,
         image_processing: Optional[dict] = None,
         profile_key: Optional[str] = None,
         profile_name: Optional[str] = None,
@@ -174,18 +179,21 @@ class ImgbedUploader:
         self.channel_name = str(channel_name or "").strip()
         self.auto_retry = bool(auto_retry)
         self.upload_name_type = str(upload_name_type or "default").strip() or "default"
+        self.sync_remote_tags = bool(sync_remote_tags)
         self.image_processing = ImageProcessingConfig.from_dict(image_processing)
         self.profile_key = profile_key or ""
         self.profile_name = profile_name or self.profile_key or "upload"
         # 目录配置
         self.folder_landscape = folder_landscape or self._DEFAULT_LANDSCAPE
         self.folder_portrait  = folder_portrait  or self._DEFAULT_PORTRAIT
+        self.folder_dynamic_configured = str(folder_dynamic or "").strip()
         self.folder_dynamic   = folder_dynamic   or self._DEFAULT_DYNAMIC
         self.folder_pattern   = folder_pattern   or ""
         # 上传过滤
         self.upload_filter = UploadFilterConfig.from_dict(upload_filter)
         # 持久 HTTP client：复用连接池，避免每次上传重新握手
         self._client: Optional[httpx.AsyncClient] = None
+        self._prefer_curl_manage_api = self._MANAGE_TRANSPORT_HINTS.get(self.base_url) == "curl"
 
     def _ensure_client(self) -> httpx.AsyncClient:
         """懒初始化持久 client（连接异常时自动重建）"""
@@ -255,16 +263,111 @@ class ImgbedUploader:
         params: Optional[dict] = None,
         json_body: Optional[dict] = None,
     ) -> dict | list:
+        request_url = f"{self.base_url}{path}"
+        filtered_params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+        if self._prefer_curl_manage_api:
+            return await self._request_json_via_curl(
+                method,
+                request_url,
+                params=filtered_params,
+                json_body=json_body,
+            )
         client = self._ensure_client()
-        response = await client.request(
-            method,
-            f"{self.base_url}{path}",
-            params={k: v for k, v in (params or {}).items() if v not in (None, "")},
-            headers=self._auth_headers(),
-            json=json_body,
+        try:
+            response = await client.request(
+                method,
+                request_url,
+                params=filtered_params,
+                headers=self._auth_headers(),
+                json=json_body,
+            )
+            response.raise_for_status()
+            self._prefer_curl_manage_api = False
+            self._MANAGE_TRANSPORT_HINTS[self.base_url] = "httpx"
+            return response.json()
+        except httpx.ConnectError as exc:
+            switched = not self._prefer_curl_manage_api
+            self._prefer_curl_manage_api = True
+            self._MANAGE_TRANSPORT_HINTS[self.base_url] = "curl"
+            logger.warning(
+                "[Imgbed] httpx 连接图床失败，%s method=%s path=%s error=%r",
+                "切换为 curl 回退" if switched else "继续使用 curl 回退",
+                method,
+                path,
+                exc,
+            )
+            return await self._request_json_via_curl(
+                method,
+                request_url,
+                params=filtered_params,
+                json_body=json_body,
+                original_error=exc,
+            )
+
+    async def _request_json_via_curl(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+        original_error: Optional[Exception] = None,
+    ) -> dict | list:
+        query = urlencode(params or {}, doseq=True)
+        request_url = f"{url}?{query}" if query else url
+        marker = "__CURL_HTTP_STATUS__:"
+        command = [
+            "curl",
+            "-sS",
+            "-L",
+            "--max-time",
+            "120",
+            "-X",
+            method.upper(),
+            "-H",
+            f"Authorization: Bearer {self.api_token}",
+            "-w",
+            f"\n{marker}%{{http_code}}",
+            request_url,
+        ]
+
+        if json_body is not None:
+            command[8:8] = [
+                "-H",
+                "Content-Type: application/json",
+                "--data-raw",
+                json.dumps(json_body, ensure_ascii=False),
+            ]
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        response.raise_for_status()
-        return response.json()
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            stderr_text = (stderr.decode("utf-8", errors="ignore") or "").strip()
+            error_detail = stderr_text or repr(original_error) or "未知连接错误"
+            raise RuntimeError(f"图床管理接口连接失败（curl 回退也失败）: {error_detail}")
+
+        payload_text = stdout.decode("utf-8", errors="ignore")
+        body_text, _, status_text = payload_text.rpartition(f"\n{marker}")
+        status_code = int(status_text.strip() or "0") if status_text else 0
+        request = httpx.Request(method.upper(), request_url)
+
+        if status_code >= 400:
+            response = httpx.Response(status_code, text=body_text, request=request)
+            raise httpx.HTTPStatusError(
+                f"图床管理接口返回 HTTP {status_code}",
+                request=request,
+                response=response,
+            )
+
+        try:
+            return json.loads(body_text or "null")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"图床管理接口返回了非 JSON 内容: {(body_text or '').strip()[:200]}") from exc
 
     @staticmethod
     def _build_template_values(
@@ -337,7 +440,7 @@ class ImgbedUploader:
                 ),
             )
 
-        if wallpaper_type == "dynamic":
+        if wallpaper_type == "dynamic" and self.folder_dynamic_configured:
             return self.folder_dynamic
         if _get_orientation(width, height) == "portrait":
             return self.folder_portrait
@@ -430,12 +533,13 @@ class ImgbedUploader:
     ) -> dict | list:
         normalized = remote_path.strip("/")
         encoded_path = quote(normalized, safe="/")
+        cleaned_tags = [normalize_remote_tag(item) for item in tags if normalize_remote_tag(item)]
         return await self._request_json(
             "POST",
             f"/api/manage/tags/{encoded_path}",
             json_body={
                 "action": action,
-                "tags": tags,
+                "tags": cleaned_tags,
             },
         )
 
@@ -447,13 +551,14 @@ class ImgbedUploader:
         action: str = "set",
     ) -> dict | list:
         file_ids = [str(item).strip("/") for item in remote_paths if str(item).strip("/")]
+        cleaned_tags = [normalize_remote_tag(item) for item in tags if normalize_remote_tag(item)]
         return await self._request_json(
             "POST",
             "/api/manage/tags/batch",
             json_body={
                 "fileIds": file_ids,
                 "action": action,
-                "tags": tags,
+                "tags": cleaned_tags,
             },
         )
 

@@ -27,15 +27,17 @@ uploads:
       channel_name: ""              # 可选：多渠道场景下指定具体渠道名
       auto_retry: true              # 失败时允许图床自动切换渠道重试
       upload_name_type: "default"   # default | index | origin | short
+      sync_remote_tags: true        # true=上传后把本地元数据标签同步到图床
       server_compress: true
       # 目录配置：横图/竖图/动态图分别存放的目录
       # 留空时使用默认值（bg/pc、bg/mb、bg/dynamic）
       folder_landscape: "bg/pc"
       folder_portrait: "bg/mb"
-      folder_dynamic: "bg/dynamic"
+      folder_dynamic: "bg/dynamic"  # 留空时，动态图会按横图/竖图目录自动分流
       # 路径模板：非空时优先于上方固定目录，支持变量：
-      # {type}={static|dynamic}  {category}=分类名  {year}  {month}  {date}
-      # 示例："bg/{type}/{year}/{month}"  →  "bg/static/2025/03"
+      # {type}={static|dynamic}  {orientation}={landscape|portrait|square|unknown}
+      # {category}=分类名  {year}  {month}  {date}
+      # 示例："wallpaper/{type}/{orientation}/{category}"
       folder_pattern: ""
       # 上传过滤：不满足条件的图片跳过上传
       upload_filter:
@@ -60,6 +62,7 @@ uploads:
       channel_name: ""
       auto_retry: true
       upload_name_type: "default"
+      sync_remote_tags: true
       server_compress: false
       folder_landscape: "bg/pc"
       folder_portrait: "bg/mb"

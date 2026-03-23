@@ -122,6 +122,10 @@
                     失败时自动切换渠道重试
                   </label>
                   <label class="check-label">
+                    <input type="checkbox" v-model="activeProfile.sync_remote_tags" />
+                    上传后同步标签到图床
+                  </label>
+                  <label class="check-label">
                     <input type="checkbox" v-model="activeProfile.server_compress" />
                     启用图床服务端压缩
                   </label>
@@ -322,6 +326,10 @@
                 <input type="checkbox" v-model="batchOnlyNew" />
                 仅上传尚未上传该 Profile 同格式版本的壁纸
               </label>
+              <label class="check-label">
+                <input type="checkbox" v-model="batchUploadWithTags" />
+                本次上传后同步标签到图床
+              </label>
               <div class="batch-inline-actions">
                 <button class="btn btn--primary" @click="batchUpload" :disabled="uploading || !activeProfile.enabled">
                   {{ uploading ? '上传中...' : '使用当前 Profile 开始批量上传' }}
@@ -333,6 +341,7 @@
                 <span class="result-skip">跳过 {{ uploadResult.skipped_count }}</span>
                 <span class="result-fail" v-if="uploadResult.failed_count">失败 {{ uploadResult.failed_count }}</span>
                 <span class="result-format">格式: {{ uploadResult.upload_format_label || formatUploadFormatLabel(batchUploadFormat) }}</span>
+                <span class="result-format">标签: {{ uploadResult.upload_with_tags === false ? '未同步' : '已同步' }}</span>
                 <span class="result-profile">Profile: {{ uploadResult.profile_name }}</span>
               </div>
             </div>
@@ -497,6 +506,7 @@ const batchColorTheme = ref('')
 const batchWallpaperType = ref('')
 const batchOrientation = ref('')
 const batchOnlyNew = ref(true)
+const batchUploadWithTags = ref(true)
 const uploadResult = ref(null)
 const categoryOptions = ref([])
 const colorThemeOptions = ref([])
@@ -575,6 +585,14 @@ function applyFolderPattern(pattern) {
   activeProfile.value.folder_pattern = pattern
 }
 
+function resolveProfileSyncRemoteTags(profile) {
+  return profile?.sync_remote_tags !== false
+}
+
+function syncBatchUploadWithTagsFromProfile() {
+  batchUploadWithTags.value = resolveProfileSyncRemoteTags(activeProfile.value)
+}
+
 function pickPreferredProfileKey(uploadSettings, currentKey = '') {
   const profiles = Array.isArray(uploadSettings?.profiles) ? uploadSettings.profiles : []
   if (!profiles.length) return ''
@@ -617,6 +635,7 @@ async function loadSettings() {
   settings.value = normalizeUploadSettings(res)
   activeKey.value = pickPreferredProfileKey(settings.value, activeKey.value)
   batchUploadFormat.value = settings.value.gallery_default_format
+  syncBatchUploadWithTagsFromProfile()
 }
 
 async function loadCategories() {
@@ -666,6 +685,7 @@ async function saveSettings() {
     settings.value = normalizeUploadSettings(res.uploads)
     activeKey.value = pickPreferredProfileKey(settings.value, activeKey.value)
     batchUploadFormat.value = normalizeUploadFormat(settings.value.gallery_default_format)
+    syncBatchUploadWithTagsFromProfile()
     await loadRemoteCapabilities()
   } finally {
     saving.value = false
@@ -697,6 +717,7 @@ async function batchUpload() {
     const res = await galleryApi.batchUpload({
       profile_key: activeProfile.value.key,
       upload_format: normalizeUploadFormat(batchUploadFormat.value),
+      upload_with_tags: batchUploadWithTags.value,
       upload_scope: 'filtered',
       category: batchCategory.value || undefined,
       color_theme: batchColorTheme.value || undefined,
@@ -805,6 +826,7 @@ watch(activeKey, async () => {
   uploadResult.value = null
   resetRemoteState()
   remoteQuery.value.dir = ''
+  syncBatchUploadWithTagsFromProfile()
   if (canManageRemote.value) {
     await loadRemoteCapabilities()
     await loadRemoteList()

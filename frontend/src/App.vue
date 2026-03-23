@@ -21,8 +21,17 @@
       </nav>
 
       <div class="sidebar-footer">
-        <div class="status-dot" :class="serverOk ? 'status-dot--ok' : 'status-dot--err'"></div>
-        <span class="status-label">{{ serverOk ? '服务运行中' : '连接断开' }}</span>
+        <div class="sidebar-theme">
+          <span class="sidebar-theme__label">主题</span>
+          <div class="theme-switch">
+            <button class="theme-switch__btn" :class="{ 'theme-switch__btn--active': themeMode === 'light' }" @click="setTheme('light')">亮色</button>
+            <button class="theme-switch__btn" :class="{ 'theme-switch__btn--active': themeMode === 'dark' }" @click="setTheme('dark')">暗色</button>
+          </div>
+        </div>
+        <div class="sidebar-status">
+          <div class="status-dot" :class="serverOk ? 'status-dot--ok' : 'status-dot--err'"></div>
+          <span class="status-label">{{ serverOk ? '服务运行中' : '连接断开' }}</span>
+        </div>
       </div>
     </aside>
 
@@ -51,7 +60,9 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import { healthCheck } from './api'
 
+const APP_THEME_STORAGE_KEY = 'hao-wallpaper-theme'
 const serverOk = ref(true)
+const themeMode = ref('dark')
 let healthTimer = null
 
 const navItems = [
@@ -76,7 +87,20 @@ async function checkHealth() {
   }
 }
 
+function applyTheme(theme) {
+  const normalized = theme === 'light' ? 'light' : 'dark'
+  themeMode.value = normalized
+  document.documentElement.setAttribute('data-theme', normalized)
+  localStorage.setItem(APP_THEME_STORAGE_KEY, normalized)
+}
+
+function setTheme(theme) {
+  applyTheme(theme)
+}
+
 onMounted(() => {
+  const savedTheme = localStorage.getItem(APP_THEME_STORAGE_KEY)
+  applyTheme(savedTheme || 'dark')
   checkHealth()
   healthTimer = setInterval(checkHealth, 30000)
 })
@@ -90,6 +114,16 @@ onUnmounted(() => {
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
+  --primary:     #4f8eff;
+  --primary-light:#eef4ff;
+  --text:        #e8edf5;
+  --text-muted:  #8a96a8;
+  --bg-subtle:   #171b22;
+  --bg-selected: #152033;
+}
+
+:root,
+:root[data-theme='dark'] {
   --bg-base:    #0d0f12;
   --bg-panel:   #13161b;
   --bg-card:    #1a1e25;
@@ -105,10 +139,44 @@ onUnmounted(() => {
   --green:      #3ecf72;
   --red:        #f05a5a;
   --orange:     #f5a623;
+  --page-backdrop:
+    radial-gradient(circle at top left, rgba(79, 142, 255, 0.14), transparent 24%),
+    radial-gradient(circle at bottom right, rgba(62, 207, 114, 0.08), transparent 22%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 28%),
+    var(--bg-base);
   --font-ui:    'DM Mono', 'Fira Code', 'Courier New', monospace;
   --font-body:  'DM Sans', 'Helvetica Neue', sans-serif;
   --radius:     6px;
   --sidebar-w:  228px;
+}
+
+:root[data-theme='light'] {
+  --bg-base:    #eef3f8;
+  --bg-panel:   #f7f9fc;
+  --bg-card:    #ffffff;
+  --bg-hover:   #edf3fa;
+  --border:     #d5deea;
+  --border-hi:  #b7c5d8;
+  --accent:     #2d6cdf;
+  --accent-dim: #dce7fb;
+  --accent-glow:rgba(45,108,223,.12);
+  --text-1:     #17212f;
+  --text-2:     #5f6f84;
+  --text-3:     #8592a4;
+  --primary:    #2d6cdf;
+  --primary-light:#eaf1ff;
+  --text:       #17212f;
+  --text-muted: #5f6f84;
+  --bg-subtle:  #f3f6fb;
+  --bg-selected:#eaf1ff;
+  --green:      #1d9252;
+  --red:        #d54b4b;
+  --orange:     #cc7f18;
+  --page-backdrop:
+    radial-gradient(circle at top left, rgba(45, 108, 223, 0.12), transparent 24%),
+    radial-gradient(circle at bottom right, rgba(16, 185, 129, 0.08), transparent 24%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.24)),
+    var(--bg-base);
 }
 
 html, body, #app {
@@ -127,6 +195,7 @@ html, body, #app {
   display: flex;
   height: 100vh;
   overflow: hidden;
+  background: var(--page-backdrop);
 }
 
 .sidebar {
@@ -199,6 +268,54 @@ html, body, #app {
   padding: 16px 20px;
   border-top: 1px solid var(--border);
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.sidebar-theme {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sidebar-theme__label {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--font-ui);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+.theme-switch {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-base);
+}
+
+.theme-switch__btn {
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  padding: 5px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-body);
+  transition: background .15s, color .15s;
+}
+
+.theme-switch__btn--active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.sidebar-status {
+  display: flex;
   align-items: center;
   gap: 8px;
 }
@@ -217,7 +334,8 @@ html, body, #app {
 .main-content {
   flex: 1;
   overflow-y: auto;
-  background: var(--bg-base);
+  background: var(--page-backdrop);
+  position: relative;
 }
 
 .route-loading {

@@ -69,6 +69,8 @@ class Downloader:
         category: str = "uncategorized",
         filename: Optional[str] = None,
         wallpaper_type: str = "static",
+        width: Optional[int] = None,
+        height: Optional[int] = None,
         referer_url: Optional[str] = None,
         session_profile: Optional[dict] = None,
     ) -> Optional[str]:
@@ -82,6 +84,8 @@ class Downloader:
             category:     分类目录名（如 "anime", "landscape"）
             filename:     自定义文件名（None 时自动从 URL 提取）
             wallpaper_type: "static" 或 "dynamic"
+            width:        宽度（用于动态图按横/竖图归档）
+            height:       高度（用于动态图按横/竖图归档）
             referer_url:  来源详情页（电脑/手机页路径不同）
 
         Returns:
@@ -92,9 +96,12 @@ class Downloader:
             logger.error(f"[Downloader] 资源 {resource_id} 无下载地址")
             return None
 
-        # 动态壁纸放独立子目录
-        if wallpaper_type == "dynamic":
-            category = f"{category}/dynamic" if category else "dynamic"
+        category = self._resolve_save_category(
+            category=category,
+            wallpaper_type=wallpaper_type,
+            width=width,
+            height=height,
+        )
 
         save_dir = os.path.join(self.download_root, category or "uncategorized")
         os.makedirs(save_dir, exist_ok=True)
@@ -154,6 +161,36 @@ class Downloader:
 
         logger.error(f"[Downloader] {resource_id} 所有重试均失败")
         return None
+
+    @staticmethod
+    def _resolve_orientation_label(width: Optional[int], height: Optional[int]) -> str:
+        width_value = int(width or 0)
+        height_value = int(height or 0)
+        if width_value <= 0 or height_value <= 0:
+            return "未定义"
+        if height_value > width_value:
+            return "竖图"
+        if height_value == width_value:
+            return "方图"
+        return "横图"
+
+    @classmethod
+    def _resolve_save_category(
+        cls,
+        *,
+        category: str,
+        wallpaper_type: str,
+        width: Optional[int],
+        height: Optional[int],
+    ) -> str:
+        normalized_category = str(category or "").strip().strip("/\\")
+        if str(wallpaper_type or "").strip().lower() != "dynamic":
+            return normalized_category or "uncategorized"
+
+        orientation = cls._resolve_orientation_label(width, height)
+        if normalized_category:
+            return f"{normalized_category}/{orientation}"
+        return orientation
 
     # ------------------------------------------------------------------ #
     #  断点续传下载

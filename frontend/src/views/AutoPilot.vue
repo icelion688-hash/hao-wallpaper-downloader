@@ -345,66 +345,92 @@
                 </label>
               </div>
               <template v-if="cfg.use_imgbed_upload">
-                <div class="cfg-grid section-top-gap">
-                  <div class="form-row">
-                    <label>上传 Profile</label>
-                    <select class="select" v-model="uploadSettings.task_profile" @change="onCfgChange">
-                      <option v-for="profile in uploadSettings.profiles" :key="profile.key" :value="profile.key">
-                        {{ profile.name }} / {{ profile.channel }}
-                      </option>
-                    </select>
-                  </div>
-                  <div class="form-row">
-                    <label>策略摘要</label>
-                    <div class="inline-note">{{ uploadProfileModeLabel }}</div>
-                  </div>
+                <div class="strategy-note">
+                  静态图和动态图各自绑定独立上传策略，修改不会互相覆盖；建议按文件体积、压缩方式和目录规则分别配置。
                 </div>
-                <div v-if="selectedAutoUploadProfile" class="cfg-grid section-top-gap">
-                  <div class="form-row form-row--full">
-                    <label>路径模板</label>
-                    <input class="input" v-model="selectedAutoUploadProfile.folder_pattern" placeholder="bg/{type}/{year}/{month}（留空用下方固定目录）" @change="onCfgChange" />
-                    <div class="form-help">支持 {type}、{category}、{year}、{month}、{date}；优先级高于固定目录</div>
-                  </div>
-                  <div class="form-row">
-                    <label>横图目录</label>
-                    <input class="input" v-model="selectedAutoUploadProfile.folder_landscape" placeholder="bg/pc" @change="onCfgChange" />
-                  </div>
-                  <div class="form-row">
-                    <label>竖图目录</label>
-                    <input class="input" v-model="selectedAutoUploadProfile.folder_portrait" placeholder="bg/mb" @change="onCfgChange" />
-                  </div>
-                  <div class="form-row">
-                    <label>动态图目录</label>
-                    <input class="input" v-model="selectedAutoUploadProfile.folder_dynamic" placeholder="bg/dynamic" @change="onCfgChange" />
-                  </div>
-                  <div class="form-row">
-                    <label>上传最小宽度</label>
-                    <input class="input" type="number" min="0"
-                      :value="selectedAutoUploadProfile.upload_filter.min_width || ''"
-                      @change="selectedAutoUploadProfile.upload_filter.min_width = $event.target.value ? +$event.target.value : null; onCfgChange()" />
-                  </div>
-                  <div class="form-row">
-                    <label>上传最小高度</label>
-                    <input class="input" type="number" min="0"
-                      :value="selectedAutoUploadProfile.upload_filter.min_height || ''"
-                      @change="selectedAutoUploadProfile.upload_filter.min_height = $event.target.value ? +$event.target.value : null; onCfgChange()" />
-                  </div>
-                  <div class="form-row">
-                    <label>服务端压缩</label>
-                    <input type="checkbox" v-model="selectedAutoUploadProfile.server_compress" class="chk" @change="onCfgChange" />
-                  </div>
-                  <div class="form-row">
-                    <label>本地预处理</label>
-                    <input type="checkbox" v-model="selectedAutoUploadProfile.image_processing.enabled" class="chk" @change="onCfgChange" />
-                  </div>
-                  <div class="form-row form-row--full">
-                    <label class="toggle-row toggle-row--compact">
-                      <span class="toggle-row-label">仅上传原图（跳过预览图）</span>
-                      <label class="toggle">
-                        <input type="checkbox" v-model="selectedAutoUploadProfile.upload_filter.only_original" @change="onCfgChange" />
-                        <span class="toggle-track"></span>
-                      </label>
-                    </label>
+                <div class="upload-strategy-grid section-top-gap">
+                  <div
+                    v-for="card in autoUploadCards"
+                    :key="card.type"
+                    class="upload-strategy-card"
+                  >
+                    <div class="upload-strategy-card__header">
+                      <div>
+                        <div class="upload-strategy-card__title">{{ card.title }}</div>
+                        <div class="upload-strategy-card__subtitle">{{ card.subtitle }}</div>
+                      </div>
+                      <span class="upload-strategy-card__badge">{{ card.badge }}</span>
+                    </div>
+                    <div class="upload-strategy-card__summary">
+                      {{ card.summary }}
+                    </div>
+                    <div class="cfg-grid section-top-gap">
+                      <div class="form-row form-row--full">
+                        <label>{{ card.title }} Profile</label>
+                        <select class="select" :value="card.selectedKey" @change="setAutoUploadProfile(card.type, $event.target.value)">
+                          <option v-for="profile in uploadSettings.profiles" :key="`${card.type}-${profile.key}`" :value="profile.key">
+                            {{ profile.name }} / {{ profile.channel }}
+                          </option>
+                        </select>
+                      </div>
+                      <div class="form-row form-row--full">
+                        <label>路径模板</label>
+                        <input class="input" v-model="card.profile.folder_pattern" placeholder="wallpaper/{type}/{orientation}/{category}" @change="onCfgChange" />
+                        <div class="form-help">支持 {type}、{orientation}、{category}、{year}、{month}、{date}；路径模板优先级高于固定目录。</div>
+                      </div>
+                      <div class="form-row">
+                        <label>横图目录</label>
+                        <input class="input" v-model="card.profile.folder_landscape" placeholder="bg/pc" @change="onCfgChange" />
+                      </div>
+                      <div class="form-row">
+                        <label>竖图目录</label>
+                        <input class="input" v-model="card.profile.folder_portrait" placeholder="bg/mb" @change="onCfgChange" />
+                      </div>
+                      <div class="form-row form-row--full">
+                        <label>动态图独立目录</label>
+                        <input class="input" v-model="card.profile.folder_dynamic" placeholder="留空则按横图/竖图目录分流" @change="onCfgChange" />
+                        <div class="form-help">{{ card.dynamicFolderHint }}</div>
+                      </div>
+                      <div class="form-row">
+                        <label>上传最小宽度</label>
+                        <input class="input" type="number" min="0"
+                          :value="card.profile.upload_filter.min_width || ''"
+                          @change="card.profile.upload_filter.min_width = $event.target.value ? +$event.target.value : null; onCfgChange()" />
+                      </div>
+                      <div class="form-row">
+                        <label>上传最小高度</label>
+                        <input class="input" type="number" min="0"
+                          :value="card.profile.upload_filter.min_height || ''"
+                          @change="card.profile.upload_filter.min_height = $event.target.value ? +$event.target.value : null; onCfgChange()" />
+                      </div>
+                    </div>
+                    <div class="upload-strategy-card__quick-actions">
+                      <button class="preset-btn" @click="applyAutoUploadLossless(card.type)">切到原图直传</button>
+                      <button class="preset-btn" @click="applyAutoUploadCompressed(card.type)">切到压缩上传</button>
+                    </div>
+                    <div class="cfg-grid section-top-gap">
+                      <div class="form-row">
+                        <label>服务端压缩</label>
+                        <input type="checkbox" v-model="card.profile.server_compress" class="chk" @change="onCfgChange" />
+                      </div>
+                      <div class="form-row">
+                        <label>本地预处理</label>
+                        <input type="checkbox" v-model="card.profile.image_processing.enabled" class="chk" @change="onCfgChange" />
+                      </div>
+                      <div class="form-row">
+                        <label>同步标签</label>
+                        <input type="checkbox" v-model="card.profile.sync_remote_tags" class="chk" @change="onCfgChange" />
+                      </div>
+                      <div class="form-row form-row--full">
+                        <label class="toggle-row toggle-row--compact">
+                          <span class="toggle-row-label">仅上传原图（跳过预览图）</span>
+                          <label class="toggle">
+                            <input type="checkbox" v-model="card.profile.upload_filter.only_original" @change="onCfgChange" />
+                            <span class="toggle-track"></span>
+                          </label>
+                        </label>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </template>
@@ -477,6 +503,21 @@
 
             <div class="cfg-section">
               <div class="cfg-section-title">自动清理</div>
+              <div class="storage-runtime-card">
+                <div class="storage-runtime-card__row">
+                  <span>当前状态</span>
+                  <strong>{{ cfg.storage_auto_clean ? '已开启' : '已关闭' }}</strong>
+                </div>
+                <div class="storage-runtime-card__row">
+                  <span>清理策略</span>
+                  <strong>{{ storageStrategyLabel }}</strong>
+                </div>
+                <div class="storage-runtime-card__row">
+                  <span>清理范围</span>
+                  <strong>{{ storageScopeLabel }}</strong>
+                </div>
+                <div class="storage-runtime-card__hint">{{ storageNextActionHint }}</div>
+              </div>
               <div class="toggle-list">
                 <label class="toggle-row">
                   <span class="toggle-row-label">每次下载会话结束后自动清理本地文件</span>
@@ -520,10 +561,26 @@
                   </button>
                   <button class="btn btn--sm btn--danger" @click="runCleanupNow" :disabled="cleaningUp">立即清理</button>
                 </div>
+                <div v-if="lastCleanup" class="cleanup-last-result" :class="cleanupLastResultClass">
+                  <div class="cleanup-last-result__title">最近一次自动清理</div>
+                  <div class="cleanup-last-result__meta">
+                    <span>{{ formatCleanupTime(lastCleanup.ran_at) }}</span>
+                    <span>{{ lastCleanup.skipped ? '已跳过' : '已执行' }}</span>
+                    <span>{{ cleanupLastResultSummary }}</span>
+                  </div>
+                  <div class="cleanup-last-result__reason">{{ lastCleanup.reason }}</div>
+                  <div class="cleanup-last-result__stats">
+                    <span>命中 {{ lastCleanup.total_eligible ?? 0 }}</span>
+                    <span>删除 {{ lastCleanup.deleted ?? 0 }}</span>
+                    <span>剩余 {{ lastCleanup.remaining ?? '--' }}</span>
+                    <span v-if="lastCleanup.file_fail_count">文件异常 {{ lastCleanup.file_fail_count }}</span>
+                  </div>
+                </div>
                 <div v-if="cleanupPreview" class="cleanup-preview">
                   <div class="cleanup-preview__row"><span>符合条件</span><strong>{{ cleanupPreview.total_eligible }}</strong></div>
                   <div class="cleanup-preview__row"><span>将删除</span><strong class="text-red">{{ cleanupPreview.deleted }}</strong></div>
                   <div class="cleanup-preview__row"><span>清理后剩余</span><strong>{{ cleanupPreview.remaining }}</strong></div>
+                  <div v-if="cleanupPreview.reason" class="cleanup-preview__reason">{{ cleanupPreview.reason }}</div>
                   <div class="cleanup-preview__paths" v-if="cleanupPreview.deleted_paths?.length">
                     <div style="font-size:11px;color:var(--text-3);margin-bottom:4px">将删除的文件（前50条）</div>
                     <div v-for="p in cleanupPreview.deleted_paths" :key="p" class="path-item">{{ p }}</div>
@@ -551,18 +608,32 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { autopilotApi, galleryApi, settingsApi } from '../api'
 import { applyCompressedUploadProfile, applyLosslessUploadProfile, isLosslessUploadProfile, normalizeUploadSettings } from '../utils/uploadProfiles'
-const createDefaultAutoPilotConfig=()=>({timezone:'Asia/Shanghai',active_start:8,active_end:23,daily_limit_mode:'auto',manual_daily_limit:null,active_session_min:5,active_session_max:15,active_interval_min:1800,active_interval_max:7200,inactive_enabled:false,inactive_session_min:2,inactive_session_max:5,inactive_interval_min:7200,inactive_interval_max:14400,wallpaper_type:'static',screen_orientation:'all',sort_by:'yesterday_hot',min_hot_score:0,vip_only:false,categories:[],color_themes:[],tag_blacklist:[],min_width:null,min_height:null,use_imgbed_upload:false,storage_auto_clean:false,storage_max_count:500,storage_strategy:'keep_count',storage_keep_days:30,storage_uploaded_only:true})
+const createDefaultAutoPilotConfig=()=>({timezone:'Asia/Shanghai',active_start:8,active_end:23,daily_limit_mode:'auto',manual_daily_limit:null,active_session_min:5,active_session_max:15,active_interval_min:1800,active_interval_max:7200,inactive_enabled:false,inactive_session_min:2,inactive_session_max:5,inactive_interval_min:7200,inactive_interval_max:14400,wallpaper_type:'static',screen_orientation:'all',sort_by:'yesterday_hot',min_hot_score:0,vip_only:false,categories:[],color_themes:[],tag_blacklist:[],min_width:null,min_height:null,use_imgbed_upload:false,static_upload_profile:'',dynamic_upload_profile:'',storage_auto_clean:false,storage_max_count:500,storage_strategy:'keep_count',storage_keep_days:30,storage_uploaded_only:true})
 const createDefaultMediaSettings=()=>({auto_convert:false,max_concurrent:1,video:{enabled:false,output_format:'webp',fps:0,max_frames:0,width:0,max_width:0,quality:100,delete_original:false,timeout_seconds:300,cpu_nice:5},image:{enabled:false,output_format:'webp',quality:100,delete_original:false,timeout_seconds:120,cpu_nice:5}})
 const normalizeMediaSettings=(remote={})=>{const defaults=createDefaultMediaSettings();return{...defaults,...remote,video:{...defaults.video,...(remote.video||{})},image:{...defaults.image,...(remote.image||{})}}}
 const parseCsvInput=value=>value?value.split(',').map(item=>item.trim()).filter(Boolean):[]
 const clampNumber=(value,fallback,min)=>{const numeric=Number(value);if(!Number.isFinite(numeric))return fallback;return Math.max(min,Math.round(numeric))}
 const normalizeRange=(minValue,maxValue,fallbackMin,fallbackMax,minLimit)=>{const safeMin=clampNumber(minValue,fallbackMin,minLimit),safeMax=clampNumber(maxValue,fallbackMax,minLimit);return safeMin<=safeMax?[safeMin,safeMax]:[safeMax,safeMin]}
-const normalizeAutoPilotConfig=remote=>{const merged={...createDefaultAutoPilotConfig(),...(remote||{})};merged.daily_limit_mode=String(merged.daily_limit_mode||'auto').toLowerCase()==='manual'?'manual':'auto';merged.manual_daily_limit=merged.manual_daily_limit?Math.min(500,Math.max(1,Number(merged.manual_daily_limit)||0)):null;[merged.active_session_min,merged.active_session_max]=normalizeRange(merged.active_session_min,merged.active_session_max,5,15,1);[merged.inactive_session_min,merged.inactive_session_max]=normalizeRange(merged.inactive_session_min,merged.inactive_session_max,2,5,1);merged.active_interval_min=clampNumber(merged.active_interval_min,1800,60);merged.active_interval_max=clampNumber(merged.active_interval_max,7200,60);merged.inactive_interval_min=clampNumber(merged.inactive_interval_min,7200,60);merged.inactive_interval_max=clampNumber(merged.inactive_interval_max,14400,60);merged.min_hot_score=clampNumber(merged.min_hot_score,0,0);merged.storage_auto_clean=Boolean(merged.storage_auto_clean);merged.storage_max_count=Math.max(1,Math.min(99999,Number(merged.storage_max_count)||500));merged.storage_keep_days=Math.max(1,Math.min(3650,Number(merged.storage_keep_days)||30));merged.storage_uploaded_only=Boolean(merged.storage_uploaded_only!==false);const strategy=String(merged.storage_strategy||'keep_count').toLowerCase();merged.storage_strategy=['keep_count','keep_days','upload_and_delete'].includes(strategy)?strategy:'keep_count';return merged}
+const normalizeAutoPilotConfig=remote=>{const merged={...createDefaultAutoPilotConfig(),...(remote||{})};merged.daily_limit_mode=String(merged.daily_limit_mode||'auto').toLowerCase()==='manual'?'manual':'auto';merged.manual_daily_limit=merged.manual_daily_limit?Math.min(500,Math.max(1,Number(merged.manual_daily_limit)||0)):null;[merged.active_session_min,merged.active_session_max]=normalizeRange(merged.active_session_min,merged.active_session_max,5,15,1);[merged.inactive_session_min,merged.inactive_session_max]=normalizeRange(merged.inactive_session_min,merged.inactive_session_max,2,5,1);merged.active_interval_min=clampNumber(merged.active_interval_min,1800,60);merged.active_interval_max=clampNumber(merged.active_interval_max,7200,60);merged.inactive_interval_min=clampNumber(merged.inactive_interval_min,7200,60);merged.inactive_interval_max=clampNumber(merged.inactive_interval_max,14400,60);merged.min_hot_score=clampNumber(merged.min_hot_score,0,0);merged.static_upload_profile=String(merged.static_upload_profile||'').trim();merged.dynamic_upload_profile=String(merged.dynamic_upload_profile||'').trim();merged.storage_auto_clean=Boolean(merged.storage_auto_clean);merged.storage_max_count=Math.max(1,Math.min(99999,Number(merged.storage_max_count)||500));merged.storage_keep_days=Math.max(1,Math.min(3650,Number(merged.storage_keep_days)||30));merged.storage_uploaded_only=Boolean(merged.storage_uploaded_only!==false);const strategy=String(merged.storage_strategy||'keep_count').toLowerCase();merged.storage_strategy=['keep_count','keep_days','upload_and_delete'].includes(strategy)?strategy:'keep_count';return merged}
 const cloneUploadProfiles=profiles=>(profiles||[]).map(profile=>({...profile,image_processing:{...(profile.image_processing||{})},upload_filter:{...(profile.upload_filter||{})}}))
 const status=ref({}),toggling=ref(false),logs=ref([]),logEl=ref(null),savedHint=ref(false),supportedTimezones=ref(['Asia/Shanghai']),cfg=ref(createDefaultAutoPilotConfig()),uploadSettings=ref(normalizeUploadSettings()),mediaSettings=ref(createDefaultMediaSettings()),systemInfo=ref(null),categoriesInput=ref(''),colorsInput=ref(''),blacklistInput=ref(''),activeIntervalMinMin=ref(30),activeIntervalMaxMin=ref(120),inactiveIntervalMinMin=ref(120),inactiveIntervalMaxMin=ref(240),currentHour=ref(new Date().getHours()),storageInfo=ref(null),cleaningUp=ref(false),cleanupPreview=ref(null),activeConfigTab=ref('rhythm')
 const running=computed(()=>status.value.status==='running')
-const selectedAutoUploadProfile=computed(()=>{const profiles=uploadSettings.value.profiles||[];return profiles.find(profile=>profile.key===uploadSettings.value.task_profile)||profiles[0]||null})
-const uploadProfileModeLabel=computed(()=>{const profile=selectedAutoUploadProfile.value;if(!profile)return'未找到可用上传 Profile';const mode=isLosslessUploadProfile(profile)?'原图直传':'本地 WebP 预处理';const folderSummary=profile.folder_pattern?`路径模板 ${profile.folder_pattern}`:[profile.folder_landscape,profile.folder_portrait,profile.folder_dynamic].filter(Boolean).join(' / ');return[mode,profile.channel,folderSummary].filter(Boolean).join(' · ')})
+const storageRuntime=computed(()=>status.value.storage||null)
+const resolveAutoUploadProfileKey=type=>{const profiles=uploadSettings.value.profiles||[];const fallback=uploadSettings.value.task_profile||profiles[0]?.key||'';if(type==='dynamic')return cfg.value.dynamic_upload_profile||cfg.value.static_upload_profile||fallback;return cfg.value.static_upload_profile||cfg.value.dynamic_upload_profile||fallback}
+const getAutoUploadProfile=type=>{const profiles=uploadSettings.value.profiles||[];return profiles.find(profile=>profile.key===resolveAutoUploadProfileKey(type))||profiles[0]||null}
+const formatUploadProfileSummary=profile=>{if(!profile)return'未找到可用上传 Profile';const mode=isLosslessUploadProfile(profile)?'原图直传':'本地 WebP 预处理';const tagMode=profile.sync_remote_tags===false?'上传不带标签':'上传后同步标签';const folderSummary=profile.folder_pattern?`路径模板 ${profile.folder_pattern}`:[profile.folder_landscape,profile.folder_portrait,profile.folder_dynamic].filter(Boolean).join(' / ');return[mode,tagMode,profile.channel,folderSummary].filter(Boolean).join(' · ')}
+const autoUploadCards=computed(()=>[
+  {type:'static',title:'静态图上传策略',subtitle:'适合原图、PNG、WebP 等单张壁纸。',badge:'STATIC',selectedKey:resolveAutoUploadProfileKey('static'),profile:getAutoUploadProfile('static'),summary:formatUploadProfileSummary(getAutoUploadProfile('static')),dynamicFolderHint:'通常留空即可；仅当这个 Profile 也会被其他入口复用上传动态图时，才需要单独指定。'},
+  {type:'dynamic',title:'动态图上传策略',subtitle:'适合 GIF、动态壁纸等大体积文件。',badge:'DYNAMIC',selectedKey:resolveAutoUploadProfileKey('dynamic'),profile:getAutoUploadProfile('dynamic'),summary:formatUploadProfileSummary(getAutoUploadProfile('dynamic')),dynamicFolderHint:'留空时会按横图/竖图目录分流；如果动态图需要单独图床目录，可以在这里覆盖。'},
+].filter(card=>card.profile))
+const describeStorageStrategy=(strategy,maxCount,keepDays)=>({keep_count:`保留最新 ${maxCount || 500} 张`,keep_days:`保留最近 ${keepDays || 30} 天`,upload_and_delete:'删除所有已上传本地文件'}[strategy]||'按当前策略清理')
+const describeStorageScope=uploadedOnly=>uploadedOnly?'仅已上传文件':'包含未上传文件'
+const storageStrategyLabel=computed(()=>describeStorageStrategy(cfg.value.storage_strategy,cfg.value.storage_max_count,cfg.value.storage_keep_days))
+const storageScopeLabel=computed(()=>describeStorageScope(cfg.value.storage_uploaded_only))
+const storageNextActionHint=computed(()=>{if(!cfg.value.storage_auto_clean)return'自动清理已关闭，只有手动预览或手动执行时才会触发。';if(running.value&&status.value.phase==='session')return'当前下载会话结束后会立即按上面的规则检查并清理本地文件。';if(running.value)return'下一次下载会话完成后会自动检查并清理本地文件。';return'下次启动 AutoPilot 并完成一次下载会话后，会自动执行清理检查。'})
+const lastCleanup=computed(()=>storageRuntime.value?.last_cleanup||null)
+const cleanupLastResultClass=computed(()=>{if(!lastCleanup.value)return'';if(lastCleanup.value.skipped)return'cleanup-last-result--info';if((lastCleanup.value.file_fail_count||0)>0)return'cleanup-last-result--warn';if((lastCleanup.value.deleted||0)>0)return'cleanup-last-result--ok';return'cleanup-last-result--muted'})
+const cleanupLastResultSummary=computed(()=>{if(!lastCleanup.value)return'';if(lastCleanup.value.skipped)return'本轮未执行';if((lastCleanup.value.deleted||0)>0)return`已删除 ${lastCleanup.value.deleted} 张`;return'没有命中可删文件'})
 const backendLimitReady=computed(()=>Number.isFinite(Number(status.value.today?.daily_limit))&&Number.isFinite(Number(status.value.today?.remaining)))
 const dailyLimitDisplay=computed(()=>backendLimitReady.value?status.value.today.daily_limit:'待刷新')
 const remainingLimitDisplay=computed(()=>backendLimitReady.value?status.value.today.remaining:'待刷新')
@@ -573,13 +644,14 @@ const nextSessionLabel=computed(()=>{if(!running.value)return'—';if(status.val
 const nextSessionClass=computed(()=>status.value.phase==='session'?'stat-num--active':'')
 let savedHintTimer=null,pollTimer=null,configLoaded=false
 const syncFilterInputsFromConfig=()=>{categoriesInput.value=(cfg.value.categories||[]).join(', ');colorsInput.value=(cfg.value.color_themes||[]).join(', ');blacklistInput.value=(cfg.value.tag_blacklist||[]).join(', ')}
-const applyConfig=remote=>{cfg.value=normalizeAutoPilotConfig(remote);activeIntervalMinMin.value=Math.round((cfg.value.active_interval_min??1800)/60);activeIntervalMaxMin.value=Math.round((cfg.value.active_interval_max??7200)/60);inactiveIntervalMinMin.value=Math.round((cfg.value.inactive_interval_min??7200)/60);inactiveIntervalMaxMin.value=Math.round((cfg.value.inactive_interval_max??14400)/60);syncFilterInputsFromConfig()}
+const ensureAutoUploadProfileSelections=()=>{const profiles=uploadSettings.value.profiles||[];const fallback=uploadSettings.value.task_profile||profiles[0]?.key||'';if(!cfg.value.static_upload_profile)cfg.value.static_upload_profile=fallback;if(!cfg.value.dynamic_upload_profile)cfg.value.dynamic_upload_profile=cfg.value.static_upload_profile||fallback}
+const applyConfig=remote=>{cfg.value=normalizeAutoPilotConfig(remote);activeIntervalMinMin.value=Math.round((cfg.value.active_interval_min??1800)/60);activeIntervalMaxMin.value=Math.round((cfg.value.active_interval_max??7200)/60);inactiveIntervalMinMin.value=Math.round((cfg.value.inactive_interval_min??7200)/60);inactiveIntervalMaxMin.value=Math.round((cfg.value.inactive_interval_max??14400)/60);syncFilterInputsFromConfig();ensureAutoUploadProfileSelections()}
 const isHourActive=hour=>{const start=cfg.value.active_start,end=cfg.value.active_end;return start<=end?hour>=start&&hour<end:hour>=start||hour<end}
 const isHourInactive=hour=>!isHourActive(hour)&&cfg.value.inactive_enabled
 const hourCellClass=hour=>hour===currentHour.value?'hour-cell--now':isHourActive(hour)?'hour-cell--active':isHourInactive(hour)?'hour-cell--inactive':'hour-cell--sleep'
 const syncIntervalInputsToConfig=()=>{[activeIntervalMinMin.value,activeIntervalMaxMin.value]=normalizeRange(activeIntervalMinMin.value,activeIntervalMaxMin.value,30,120,1);[inactiveIntervalMinMin.value,inactiveIntervalMaxMin.value]=normalizeRange(inactiveIntervalMinMin.value,inactiveIntervalMaxMin.value,120,240,1);cfg.value.active_interval_min=activeIntervalMinMin.value*60;cfg.value.active_interval_max=activeIntervalMaxMin.value*60;cfg.value.inactive_interval_min=inactiveIntervalMinMin.value*60;cfg.value.inactive_interval_max=inactiveIntervalMaxMin.value*60}
 const normalizeConfigState=()=>{syncIntervalInputsToConfig();cfg.value=normalizeAutoPilotConfig(cfg.value)}
-const buildPayload=()=>{normalizeConfigState();return{...cfg.value,categories:parseCsvInput(categoriesInput.value),color_themes:parseCsvInput(colorsInput.value),tag_blacklist:parseCsvInput(blacklistInput.value)}}
+const buildPayload=()=>{normalizeConfigState();ensureAutoUploadProfileSelections();return{...cfg.value,static_upload_profile:resolveAutoUploadProfileKey('static'),dynamic_upload_profile:resolveAutoUploadProfileKey('dynamic'),categories:parseCsvInput(categoriesInput.value),color_themes:parseCsvInput(colorsInput.value),tag_blacklist:parseCsvInput(blacklistInput.value)}}
 const buildUploadSettingsPayload=()=>{const normalized=normalizeUploadSettings(uploadSettings.value);return{task_profile:normalized.task_profile,gallery_default_format:normalized.gallery_default_format,profiles:cloneUploadProfiles(normalized.profiles)}}
 const buildMediaSettingsPayload=()=>{const normalized=normalizeMediaSettings(mediaSettings.value);return{auto_convert:!!normalized.auto_convert,max_concurrent:normalized.max_concurrent||1,video:{...normalized.video,enabled:false},image:{...normalized.image}}}
 const applyResolutionPreset=(width,height)=>{cfg.value.min_width=width;cfg.value.min_height=height;onCfgChange()}
@@ -587,10 +659,12 @@ const clearResolutionPreset=()=>{cfg.value.min_width=null;cfg.value.min_height=n
 const onActiveIntervalChange=()=>{syncIntervalInputsToConfig();onCfgChange()}
 const onInactiveIntervalChange=()=>{syncIntervalInputsToConfig();onCfgChange()}
 const onDailyLimitModeChange=()=>{if(cfg.value.daily_limit_mode==='manual'&&!cfg.value.manual_daily_limit)cfg.value.manual_daily_limit=status.value.today?.daily_limit||45;onCfgChange()}
-const applyAutoUploadLossless=()=>{if(!selectedAutoUploadProfile.value)return;applyLosslessUploadProfile(selectedAutoUploadProfile.value);onCfgChange()}
-const applyAutoUploadCompressed=()=>{if(!selectedAutoUploadProfile.value)return;applyCompressedUploadProfile(selectedAutoUploadProfile.value);onCfgChange()}
+const setAutoUploadProfile=(type,key)=>{if(type==='dynamic')cfg.value.dynamic_upload_profile=String(key||'').trim();else cfg.value.static_upload_profile=String(key||'').trim();onCfgChange()}
+const applyAutoUploadLossless=type=>{const profile=getAutoUploadProfile(type);if(!profile)return;applyLosslessUploadProfile(profile);onCfgChange()}
+const applyAutoUploadCompressed=type=>{const profile=getAutoUploadProfile(type);if(!profile)return;applyCompressedUploadProfile(profile);onCfgChange()}
+const formatCleanupTime=value=>{if(!value)return'刚刚';const date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('zh-CN',{hour12:false})}
 const showSavedHint=()=>{savedHint.value=true;clearTimeout(savedHintTimer);savedHintTimer=setTimeout(()=>{savedHint.value=false},2000)}
-const loadAutomationSettings=async()=>{const [uploadsResult,mediaResult,systemInfoResult]=await Promise.allSettled([settingsApi.getUploads(),settingsApi.getMediaConvert(),settingsApi.getSystemInfo()]);uploadSettings.value=uploadsResult.status==='fulfilled'?normalizeUploadSettings(uploadsResult.value):normalizeUploadSettings();mediaSettings.value=mediaResult.status==='fulfilled'?normalizeMediaSettings(mediaResult.value):createDefaultMediaSettings();if(systemInfoResult.status==='fulfilled')systemInfo.value=systemInfoResult.value}
+const loadAutomationSettings=async()=>{const [uploadsResult,mediaResult,systemInfoResult]=await Promise.allSettled([settingsApi.getUploads(),settingsApi.getMediaConvert(),settingsApi.getSystemInfo()]);uploadSettings.value=uploadsResult.status==='fulfilled'?normalizeUploadSettings(uploadsResult.value):normalizeUploadSettings();ensureAutoUploadProfileSelections();mediaSettings.value=mediaResult.status==='fulfilled'?normalizeMediaSettings(mediaResult.value):createDefaultMediaSettings();if(systemInfoResult.status==='fulfilled')systemInfo.value=systemInfoResult.value}
 const persistAutomationSettings=async({showHint=true,silent=false}={})=>{try{const [configRes,uploadRes,mediaRes]=await Promise.all([autopilotApi.saveConfig(buildPayload()),settingsApi.setUploads(buildUploadSettingsPayload()),settingsApi.setMediaConvert(buildMediaSettingsPayload())]);if(configRes?.config)applyConfig(configRes.config);if(uploadRes?.uploads)uploadSettings.value=normalizeUploadSettings(uploadRes.uploads);if(mediaRes?.media_convert)mediaSettings.value=normalizeMediaSettings(mediaRes.media_convert);if(showHint)showSavedHint()}catch(error){if(!silent)throw error}}
 const onCfgChange=()=>{normalizeConfigState();persistAutomationSettings({showHint:true,silent:true})}
 const onCategoriesChange=()=>{cfg.value.categories=parseCsvInput(categoriesInput.value);onCfgChange()}
@@ -601,7 +675,7 @@ const togglePower=async()=>{toggling.value=true;try{if(running.value){await auto
 const saveConfig=async()=>{try{await persistAutomationSettings({showHint:true,silent:false})}catch(error){alert('保存配置失败: '+(error?.message||error))}}
 const scrollLogs=()=>{if(logEl.value)logEl.value.scrollTop=logEl.value.scrollHeight}
 const loadStorageStats=async()=>{try{storageInfo.value=await galleryApi.storageStats()}catch{}}
-const runCleanupNow=async()=>{if(cleaningUp.value)return;if(!confirm('确认立即清理？将按当前策略删除符合条件的本地文件，操作不可撤销。'))return;cleaningUp.value=true;cleanupPreview.value=null;try{const r=await galleryApi.cleanupLocal({strategy:cfg.value.storage_strategy,max_count:cfg.value.storage_max_count,keep_days:cfg.value.storage_keep_days,uploaded_only:cfg.value.storage_uploaded_only,dry_run:false});alert(`清理完成：删除 ${r.deleted} 张，剩余 ${r.remaining} 张`);await loadStorageStats()}catch(e){alert('清理失败：'+(e?.message||e))}finally{cleaningUp.value=false}}
+const runCleanupNow=async()=>{if(cleaningUp.value)return;if(!confirm('确认立即清理？将按当前策略删除符合条件的本地文件，操作不可撤销。'))return;cleaningUp.value=true;cleanupPreview.value=null;try{const r=await galleryApi.cleanupLocal({strategy:cfg.value.storage_strategy,max_count:cfg.value.storage_max_count,keep_days:cfg.value.storage_keep_days,uploaded_only:cfg.value.storage_uploaded_only,dry_run:false});cleanupPreview.value=r;alert(`清理完成：删除 ${r.deleted} 张，剩余 ${r.remaining} 张`);await loadStorageStats()}catch(e){alert('清理失败：'+(e?.message||e))}finally{cleaningUp.value=false}}
 const previewCleanup=async()=>{if(cleaningUp.value)return;cleaningUp.value=true;try{const r=await galleryApi.cleanupLocal({strategy:cfg.value.storage_strategy,max_count:cfg.value.storage_max_count,keep_days:cfg.value.storage_keep_days,uploaded_only:cfg.value.storage_uploaded_only,dry_run:true});cleanupPreview.value=r}catch(e){alert('预览失败：'+(e?.message||e))}finally{cleaningUp.value=false}}
 const logLineClass=line=>{if(line.includes('失败')||line.includes('异常')||line.includes('错误'))return'log-err';if(line.includes('警告')||line.includes('上限'))return'log-warn';if(line.includes('完成')||line.includes('成功'))return'log-ok';if(line.includes('[活跃]')||line.includes('会话')||line.includes('开始'))return'log-accent';if(line.includes('[非活跃]'))return'log-inactive';return''}
 const configTabs=[{key:'rhythm',label:'节奏时段'},{key:'content',label:'下载内容'},{key:'upload',label:'处理上传'},{key:'storage',label:'存储管理'}]
@@ -1000,6 +1074,72 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
   margin: 10px 0;
   flex-wrap: wrap;
 }
+.storage-runtime-card {
+  margin: 10px 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+}
+.storage-runtime-card__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 4px 0;
+}
+.storage-runtime-card__hint {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.cleanup-last-result {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+}
+.cleanup-last-result--ok {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+}
+.cleanup-last-result--warn {
+  border-color: color-mix(in srgb, var(--orange, #f39c12) 45%, var(--border));
+}
+.cleanup-last-result--info {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+.cleanup-last-result__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.cleanup-last-result__meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.cleanup-last-result__reason {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+.cleanup-last-result__stats {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+}
 
 /* 清理预览 */
 .cleanup-preview {
@@ -1016,6 +1156,12 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
   border-bottom: 1px solid var(--border);
 }
 .cleanup-preview__row:last-child { border-bottom: none; }
+.cleanup-preview__reason {
+  padding: 10px 14px 0;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
 .cleanup-preview__paths {
   padding: 10px 14px;
   background: var(--bg-hover);
@@ -1051,11 +1197,66 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
   line-height: 1.5;
 }
 
+.upload-strategy-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.upload-strategy-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  padding: 16px;
+}
+.upload-strategy-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.upload-strategy-card__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.upload-strategy-card__subtitle {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+.upload-strategy-card__badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+.upload-strategy-card__summary {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.upload-strategy-card__quick-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
 /* 响应式 */
 @media (max-width: 1100px) {
   .ap-body { grid-template-columns: 1fr; }
   .ap-status { position: static; }
   .cfg-grid-3 { grid-template-columns: 1fr 1fr; }
+  .upload-strategy-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 680px) {
   .cfg-grid, .cfg-grid-3 { grid-template-columns: 1fr; }

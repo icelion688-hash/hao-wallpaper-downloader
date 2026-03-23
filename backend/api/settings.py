@@ -40,6 +40,7 @@ class UploadProfilePayload(BaseModel):
     channel_name: str = ""
     auto_retry: bool = True
     upload_name_type: str = "default"
+    sync_remote_tags: bool = True
     server_compress: bool = False
     folder_landscape: str = ""
     folder_portrait: str = ""

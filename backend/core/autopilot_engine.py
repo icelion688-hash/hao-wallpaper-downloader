@@ -108,6 +108,7 @@ class AutoPilotEngine:
         self._next_session_at: Optional[datetime] = None
         self._current_task_id: Optional[int] = None
         self._cat_index: int = 0
+        self._storage_cleanup_state: Optional[dict] = None
 
     # ── 默认配置 ─────────────────────────────────────────────────────────────
 
@@ -138,6 +139,8 @@ class AutoPilotEngine:
 
             # ── 通用下载参数 ────────────────────────────────────────────────
             "use_imgbed_upload": False,
+            "static_upload_profile": "",
+            "dynamic_upload_profile": "",
             "wallpaper_type": "static",
             "sort_by": "yesterday_hot",
             "categories": [],
@@ -266,6 +269,8 @@ class AutoPilotEngine:
         )
         cfg["inactive_enabled"] = bool(cfg.get("inactive_enabled", False))
         cfg["use_imgbed_upload"] = bool(cfg.get("use_imgbed_upload", False))
+        cfg["static_upload_profile"] = str(cfg.get("static_upload_profile") or "").strip()
+        cfg["dynamic_upload_profile"] = str(cfg.get("dynamic_upload_profile") or "").strip()
         cfg["vip_only"] = bool(cfg.get("vip_only", False))
         cfg["min_hot_score"] = max(0, int(cfg.get("min_hot_score", 0)))
         for key in ("min_width", "min_height"):
@@ -339,6 +344,14 @@ class AutoPilotEngine:
             "current_tz_name": tz_name,
             "is_active_hour": self._is_active_hour(),
             "today": today_payload,
+            "storage": {
+                "enabled": bool(self._config.get("storage_auto_clean")),
+                "strategy": self._config.get("storage_strategy", "keep_count"),
+                "max_count": self._config.get("storage_max_count", 500),
+                "keep_days": self._config.get("storage_keep_days", 30),
+                "uploaded_only": bool(self._config.get("storage_uploaded_only", True)),
+                "last_cleanup": self._storage_cleanup_state,
+            },
             "next_session_at": (
                 self._next_session_at.isoformat() if self._next_session_at else None
             ),
@@ -472,8 +485,16 @@ class AutoPilotEngine:
                 )
 
                 # ── 会话后自动清仓 ────────────────────────────────────────
-                if self._config.get("storage_auto_clean") and downloaded > 0:
-                    await self._run_storage_cleanup()
+                if self._config.get("storage_auto_clean"):
+                    if downloaded > 0:
+                        await self._run_storage_cleanup()
+                    else:
+                        self._record_storage_cleanup_state(
+                            trigger="session",
+                            skipped=True,
+                            reason="本次会话没有新增下载文件，已跳过自动清理",
+                        )
+                        self._log("[存储] 自动清理已跳过 — 本次会话没有新增下载文件")
 
                 if human_ctrl.is_daily_limit_reached():
                     continue
@@ -504,6 +525,27 @@ class AutoPilotEngine:
 
     # ── 存储清仓 ─────────────────────────────────────────────────────────────
 
+    def _record_storage_cleanup_state(
+        self,
+        *,
+        trigger: str,
+        skipped: bool,
+        reason: str,
+        result: Optional[dict] = None,
+    ) -> None:
+        self._storage_cleanup_state = {
+            "ran_at": datetime.now().isoformat(),
+            "trigger": trigger,
+            "skipped": skipped,
+            "reason": reason,
+            "deleted": int((result or {}).get("deleted") or 0),
+            "remaining": (result or {}).get("remaining"),
+            "total_eligible": int((result or {}).get("total_eligible") or 0),
+            "file_fail_count": int((result or {}).get("file_fail_count") or 0),
+            "strategy": (result or {}).get("strategy") or self._config.get("storage_strategy", "keep_count"),
+            "uploaded_only": bool((result or {}).get("uploaded_only", self._config.get("storage_uploaded_only", True))),
+        }
+
     async def _run_storage_cleanup(self) -> None:
         """会话后触发本地存储清仓（在线程池中执行 DB 操作）。"""
         try:
@@ -532,13 +574,27 @@ class AutoPilotEngine:
             result = await asyncio.get_event_loop().run_in_executor(None, _cleanup)
             deleted = result.get("deleted", 0)
             remaining = result.get("remaining", 0)
+            reason = str(result.get("reason") or "").strip()
+            self._record_storage_cleanup_state(
+                trigger="session",
+                skipped=False,
+                reason=reason or "自动清理已执行",
+                result=result,
+            )
             if deleted > 0:
                 self._log(
                     f"[存储] 自动清仓完成 — 删除 {deleted} 张本地文件，"
                     f"剩余 {remaining} 张（策略: {strategy}，"
                     f"{'仅已上传' if uploaded_only else '全部'}）"
                 )
+            else:
+                self._log(f"[存储] 自动清理未删除文件 — {reason or '当前没有符合条件的文件'}")
         except Exception as exc:
+            self._record_storage_cleanup_state(
+                trigger="session",
+                skipped=False,
+                reason=f"自动清理执行失败: {exc}",
+            )
             logger.warning("[AutoPilot] 自动清仓异常: %s", exc)
 
     # ── 会话执行 ─────────────────────────────────────────────────────────────
@@ -560,6 +616,8 @@ class AutoPilotEngine:
             "vip_only": self._config["vip_only"],
             "use_proxy": True,
             "use_imgbed_upload": self._config["use_imgbed_upload"],
+            "static_upload_profile": self._config.get("static_upload_profile", ""),
+            "dynamic_upload_profile": self._config.get("dynamic_upload_profile", ""),
             "min_hot_score": self._config.get("min_hot_score", 0),
             "tag_blacklist": self._config.get("tag_blacklist", []),
             "min_width": self._config.get("min_width"),

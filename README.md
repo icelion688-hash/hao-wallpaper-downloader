@@ -135,6 +135,76 @@ proxies:
   - http://127.0.0.1:7890
 ```
 
+### 图床上传策略说明
+
+- `uploads.task_profile` 是系统默认上传 Profile。
+- 图库手动上传、任务下载上传、AutoPilot 自动上传，都基于 `uploads.profiles` 中定义的 Profile 工作。
+- 每个 Profile 都可以单独配置：
+  - 是否上传后同步标签 `sync_remote_tags`
+  - 横图 / 竖图 / 动态图目录
+  - 路径模板 `folder_pattern`
+  - 上传尺寸门槛 `upload_filter`
+  - 本地预处理和服务端压缩策略
+
+推荐做法：
+
+- 静态图使用 `compressed_webp` 这类压缩 Profile。
+- 动态图使用单独 Profile，并按体积、渠道、目录规则独立配置。
+- 如果 `folder_dynamic` 留空，动态图会自动回退到横图 / 竖图目录分流，而不是固定写入 `bg/dynamic`。
+- 如果 `folder_pattern` 非空，会优先于固定目录，支持的变量包括：
+  - `{type}`
+  - `{orientation}`
+  - `{category}`
+  - `{year}`
+  - `{month}`
+  - `{date}`
+
+示例：
+
+```yaml
+uploads:
+  task_profile: "compressed_webp"
+  profiles:
+    - key: "compressed_webp"
+      sync_remote_tags: true
+      folder_pattern: "wallpaper/{type}/{orientation}/{category}"
+```
+
+---
+
+## 主要工作流
+
+### 图床管理
+
+- “同步元数据标签”现在只同步远端标签，不再移动远端目录。
+- 同步时会优先按历史上传记录、远端文件名、`resource_id` 匹配本地图片，不要求远端目录和本地原目录一致。
+- 执行“一键修复并同步标签”时，会先修复旧的远端路径记录，再同步标签。
+- 标签同步已经支持：
+  - 按相同标签集合批量打标
+  - 批量失败后自动回退到单文件重试
+  - 失败项一键重试
+  - 远端标签回写本地数据库
+
+### AutoPilot 自动驾驶
+
+- AutoPilot 现在支持“静态图 Profile”和“动态图 Profile”分开配置。
+- 自动上传时会根据图片类型自动选择对应 Profile。
+- 上传区已经拆成两张独立策略卡，静态图和动态图的目录、压缩、标签同步互不干扰。
+- AutoPilot 的自动清理支持三种策略：
+  - `keep_count`：保留最新 N 张
+  - `keep_days`：保留最近 N 天
+  - `upload_and_delete`：删除所有已上传本地文件
+- AutoPilot 页面会显示：
+  - 当前清理策略
+  - 下次何时触发
+  - 最近一次自动清理是否执行、为什么跳过、删除了多少文件
+
+### 动态图目录规则
+
+- 图床侧：动态图支持横图 / 竖图分类，与静态图目录语义保持一致。
+- 本地下载侧：动态图不再统一放入单一 `dynamic` 目录，会按分类和横竖方向分流。
+- 如果没有分类，动态图本地目录会至少保留方向层级，例如 `方图/`、`横图/`、`竖图/`。
+
 ---
 
 ## 项目结构

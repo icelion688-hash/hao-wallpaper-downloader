@@ -41,6 +41,7 @@ def build_uploader_from_profile(profile: Optional[dict]) -> Optional[ImgbedUploa
         channel_name=profile.get("channel_name", ""),
         auto_retry=profile.get("auto_retry", True),
         upload_name_type=profile.get("upload_name_type", "default"),
+        sync_remote_tags=profile.get("sync_remote_tags", True),
         image_processing=profile.get("image_processing", {}),
         profile_key=profile.get("key", ""),
         profile_name=profile.get("name", profile.get("key", "upload")),

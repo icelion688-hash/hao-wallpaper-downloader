@@ -52,6 +52,7 @@ export const galleryApi = {
   batchUpload: (data) => http.post('/gallery/upload', data),
   reclassifyUpload: (id, data) => http.post(`/gallery/${id}/reclassify-upload`, data),
   batchReclassifyUpload: (data) => http.post('/gallery/reclassify-upload/batch', data),
+  applyRemoteState: (data) => http.post('/gallery/apply-remote-state', data),
   delete: (id, deleteFile = true) =>
     http.delete(`/gallery/${id}`, { params: { delete_file: deleteFile } }),
   batchDelete: (data) => http.delete('/gallery/batch', { data }),
@@ -60,6 +61,7 @@ export const galleryApi = {
     http.post('/gallery/clean-duplicates', null, { params: { dry_run: dryRun } }),
   // 远端路径匹配本地DB（用于 ImgbedManager 自动补全标签）
   matchRemote: (data) => http.post('/gallery/match-remote', data),
+  reconcileRemoteRecords: (data) => http.post('/gallery/reconcile-remote-records', data),
   // 本地存储滚动清仓
   cleanupLocal: (data) => http.post('/gallery/cleanup-local', data),
   storageStats: () => http.get('/gallery/storage-stats'),

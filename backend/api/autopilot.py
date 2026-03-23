@@ -41,6 +41,8 @@ class AutoPilotConfigRequest(BaseModel):
 
     # ── 通用下载参数 ────────────────────────────────────────────────────────
     use_imgbed_upload: bool = False
+    static_upload_profile: str = ""
+    dynamic_upload_profile: str = ""
     wallpaper_type: str = "static"
     sort_by: str = "yesterday_hot"
     categories: List[str] = []
@@ -51,6 +53,11 @@ class AutoPilotConfigRequest(BaseModel):
     min_width: Optional[int] = None
     min_height: Optional[int] = None
     screen_orientation: str = "all"
+    storage_auto_clean: bool = False
+    storage_max_count: int = Field(default=500, ge=1, le=99999)
+    storage_strategy: str = Field(default="keep_count", pattern="^(keep_count|keep_days|upload_and_delete)$")
+    storage_keep_days: int = Field(default=30, ge=1, le=3650)
+    storage_uploaded_only: bool = True
 
 
 @router.get("/status")

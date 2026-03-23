@@ -40,6 +40,7 @@ from backend.core.crawler import WallpaperCrawler
 from backend.core.downloader import Downloader
 from backend.core.dedup import DedupManager
 from backend.core.imgbed_uploader import ImgbedUploader
+from backend.core.upload_profiles import build_uploader_by_key
 from backend.config import load_config
 from backend.core.media_converter import MediaConverter
 from backend.core.site_auth import probe_login_status
@@ -47,6 +48,7 @@ from backend.core.upload_record_helper import (
     build_upload_record,
     dump_upload_records,
     find_reusable_upload_record,
+    parse_remote_file_id_from_url,
     sync_remote_record_metadata,
     upsert_upload_registry_record,
 )
@@ -125,6 +127,20 @@ def _get_wallpaper_orientation(item: dict) -> str:
 def _should_diversify_static_orientations(cfg: FilterConfig) -> bool:
     """仅在静态图 + 全部方向时启用横竖图补齐。"""
     return cfg.wallpaper_type == "static" and cfg.screen_orientation == "all"
+
+
+def _resolve_upload_profile_key(
+    task_config: dict,
+    wallpaper_type: str,
+    *,
+    fallback_profile_key: str = "",
+) -> str:
+    static_key = str(task_config.get("static_upload_profile") or "").strip()
+    dynamic_key = str(task_config.get("dynamic_upload_profile") or "").strip()
+    normalized_type = str(wallpaper_type or "static").strip().lower()
+    if normalized_type == "dynamic":
+        return dynamic_key or static_key or fallback_profile_key
+    return static_key or dynamic_key or fallback_profile_key
 
 
 def _resolve_source_scopes(cfg: FilterConfig) -> list[str]:
@@ -273,6 +289,7 @@ class CreateTaskRequest(BaseModel):
     vip_only: bool = False
     use_proxy: bool = True
     use_imgbed_upload: bool = False
+    upload_with_tags: bool = True
 
 
 class UpdateTaskNameRequest(BaseModel):
@@ -330,6 +347,7 @@ async def create_task(body: CreateTaskRequest, db: Session = Depends(get_db)):
     task = Task(name=body.name, status="pending", total_count=body.max_count)
     task_config = cfg.to_dict()
     task_config["use_imgbed_upload"] = body.use_imgbed_upload
+    task_config["upload_with_tags"] = body.upload_with_tags
     task.config = task_config
     db.add(task)
     db.commit()
@@ -504,7 +522,13 @@ async def _execute_task(
 
         cfg = FilterConfig.from_dict(task.config)
         upload_enabled = task.config.get("use_imgbed_upload", True)
+        upload_with_tags = task.config.get(
+            "upload_with_tags",
+            getattr(uploader, "sync_remote_tags", True) if uploader else True,
+        )
         effective_uploader = uploader if upload_enabled else None
+        default_profile_key = getattr(effective_uploader, "profile_key", "") if effective_uploader else ""
+        created_uploaders: dict[str, ImgbedUploader] = {}
         resume_start_page = max(1, int(task.config.get("_resume_start_page", 1) or 1))
 
         def log(msg: str):
@@ -556,6 +580,23 @@ async def _execute_task(
         logger.info("[Task] Session Profile UA: %s", _session_profile["ua"][:60])
         if upload_enabled:
             log("图床上传: 已启用")
+            static_profile_key = _resolve_upload_profile_key(
+                task.config,
+                "static",
+                fallback_profile_key=default_profile_key,
+            )
+            dynamic_profile_key = _resolve_upload_profile_key(
+                task.config,
+                "dynamic",
+                fallback_profile_key=default_profile_key,
+            )
+            if static_profile_key == dynamic_profile_key:
+                log(f"上传 Profile: {static_profile_key or '未指定'}")
+            else:
+                log(
+                    f"上传 Profile: 静态图={static_profile_key or '未指定'} / "
+                    f"动态图={dynamic_profile_key or '未指定'}"
+                )
         else:
             log("图床上传: 已关闭，仅保存到本地")
 
@@ -601,6 +642,26 @@ async def _execute_task(
                 _shared_altcha_verified = False
                 _altcha_use_count[0] = 0
             logger.info("[Task] altcha session 已重置，下次将重新验证")
+
+        def resolve_item_uploader(item: dict) -> Optional[ImgbedUploader]:
+            if not upload_enabled:
+                return None
+            profile_key = _resolve_upload_profile_key(
+                task.config,
+                item.get("wallpaper_type", "static"),
+                fallback_profile_key=default_profile_key,
+            )
+            if not profile_key:
+                return effective_uploader
+            if effective_uploader and effective_uploader.profile_key == profile_key:
+                return effective_uploader
+            cached = created_uploaders.get(profile_key)
+            if cached:
+                return cached
+            built = build_uploader_by_key(profile_key)
+            if built:
+                created_uploaders[profile_key] = built
+            return built
 
         async def process_one(item: dict):
             _is_dynamic = item.get("wallpaper_type") == "dynamic"
@@ -754,6 +815,8 @@ async def _execute_task(
                         category=_category,
                         filename=_fname,
                         wallpaper_type=item.get("wallpaper_type", "static"),
+                        width=item.get("width"),
+                        height=item.get("height"),
                         referer_url=item.get("source_url"),
                         session_profile=_session_profile,
                     )
@@ -780,50 +843,58 @@ async def _execute_task(
                     # 上传到图床（失败不影响下载流程）
                     _imgbed_url = None
                     _upload_records = None
-                    if effective_uploader:
+                    item_uploader = resolve_item_uploader(item)
+                    if item_uploader:
                         _reused_record = find_reusable_upload_record(
                             db,
-                            profile_key=effective_uploader.profile_key,
+                            profile_key=item_uploader.profile_key,
                             sha256=sha256,
                             md5=md5,
                             resource_id=resource_id,
-                        ) if effective_uploader.profile_key else None
+                        ) if item_uploader.profile_key else None
                         if _reused_record and _reused_record.get("url"):
                             _reused_record = dict(_reused_record)
-                            _remote_meta = await sync_remote_record_metadata(
-                                effective_uploader,
-                                url=_reused_record["url"],
-                                width=item.get("width"),
-                                height=item.get("height"),
-                                wallpaper_type=item.get("wallpaper_type", "static"),
-                                category=_category or "",
-                                color_theme=_color_name or "",
-                                tags=item.get("tags", ""),
-                            )
-                            if _remote_meta["remote_path"]:
-                                _reused_record["remote_path"] = _remote_meta["remote_path"]
-                            if _remote_meta["remote_tags"]:
-                                _reused_record["remote_tags"] = _remote_meta["remote_tags"]
+                            if upload_with_tags:
+                                _remote_meta = await sync_remote_record_metadata(
+                                    item_uploader,
+                                    url=_reused_record["url"],
+                                    width=item.get("width"),
+                                    height=item.get("height"),
+                                    wallpaper_type=item.get("wallpaper_type", "static"),
+                                    category=_category or "",
+                                    color_theme=_color_name or "",
+                                    tags=item.get("tags", ""),
+                                    sync_tags=True,
+                                )
+                                if _remote_meta["remote_path"]:
+                                    _reused_record["remote_path"] = _remote_meta["remote_path"]
+                                if _remote_meta["remote_tags"]:
+                                    _reused_record["remote_tags"] = _remote_meta["remote_tags"]
+                            else:
+                                _reused_record.setdefault(
+                                    "remote_path",
+                                    parse_remote_file_id_from_url(_reused_record.get("url")) or "",
+                                )
                             _imgbed_url = _reused_record["url"]
                             _upload_records = dump_upload_records({
-                                effective_uploader.profile_key: _reused_record,
+                                item_uploader.profile_key: _reused_record,
                             })
                             upsert_upload_registry_record(
                                 db,
-                                profile_key=effective_uploader.profile_key,
+                                profile_key=item_uploader.profile_key,
                                 format_key=_reused_record.get("format_key"),
                                 url=_imgbed_url,
                                 resource_id=resource_id,
                                 sha256=sha256,
                                 md5=md5,
-                                profile_name=_reused_record.get("profile_name") or effective_uploader.profile_name,
-                                channel=_reused_record.get("channel") or effective_uploader.channel,
+                                profile_name=_reused_record.get("profile_name") or item_uploader.profile_name,
+                                channel=_reused_record.get("channel") or item_uploader.channel,
                                 uploaded_at=_reused_record.get("uploaded_at"),
                                 source_server=_reused_record.get("source_server"),
                             )
                             log(f"图床上传复用成功: {_imgbed_url}")
                         else:
-                            _imgbed_url = await effective_uploader.upload(
+                            _imgbed_url = await item_uploader.upload(
                                 abs_path,
                                 width=item.get("width"),
                                 height=item.get("height"),
@@ -837,9 +908,9 @@ async def _execute_task(
                                 is_original=_is_original_dl,
                             )
                             if _imgbed_url:
-                                if effective_uploader.profile_key:
+                                if item_uploader.profile_key:
                                     _remote_meta = await sync_remote_record_metadata(
-                                        effective_uploader,
+                                        item_uploader,
                                         url=_imgbed_url,
                                         width=item.get("width"),
                                         height=item.get("height"),
@@ -847,27 +918,28 @@ async def _execute_task(
                                         category=_category or "",
                                         color_theme=_color_name or "",
                                         tags=item.get("tags", ""),
+                                        sync_tags=bool(upload_with_tags),
                                     )
                                     _record = build_upload_record(
-                                        profile_key=effective_uploader.profile_key,
-                                        profile_name=effective_uploader.profile_name,
-                                        channel=effective_uploader.channel,
+                                        profile_key=item_uploader.profile_key,
+                                        profile_name=item_uploader.profile_name,
+                                        channel=item_uploader.channel,
                                         url=_imgbed_url,
                                         remote_path=_remote_meta["remote_path"],
                                         remote_tags=_remote_meta["remote_tags"],
                                     )
                                     _upload_records = dump_upload_records({
-                                        effective_uploader.profile_key: _record
+                                        item_uploader.profile_key: _record
                                     })
                                     upsert_upload_registry_record(
                                         db,
-                                        profile_key=effective_uploader.profile_key,
+                                        profile_key=item_uploader.profile_key,
                                         url=_imgbed_url,
                                         resource_id=resource_id,
                                         sha256=sha256,
                                         md5=md5,
-                                        profile_name=effective_uploader.profile_name,
-                                        channel=effective_uploader.channel,
+                                        profile_name=item_uploader.profile_name,
+                                        channel=item_uploader.channel,
                                         uploaded_at=_record.get("uploaded_at"),
                                     )
                                 log(f"图床上传成功: {_imgbed_url}")
@@ -1242,6 +1314,11 @@ async def _execute_task(
         # 关闭任务级共享 client
         try:
             await _shared_client.aclose()
+        except Exception:
+            pass
+        try:
+            for _uploader in created_uploaders.values():
+                await _uploader.aclose()
         except Exception:
             pass
         try:

@@ -179,29 +179,223 @@
         <span class="card-icon">🏷️</span>
         <div>
           <div class="card-title">同步元数据标签</div>
-          <div class="card-desc">将本地数据库中的分类、色系、横/竖屏等信息写入图床标签，方便搜索和筛选</div>
+          <div class="card-desc">根据本地数据库中的分类、色系、横/竖屏等信息，只同步远端标签，不再调整远端目录。</div>
         </div>
       </div>
 
       <div class="action-row">
         <label class="form-label-inline">目录</label>
-        <input class="input input--fill" v-model="tagSyncDir" placeholder="bg（留空则全部）" :disabled="tagSyncing" />
-        <button class="btn btn--primary" @click="syncTagsFromDB" :disabled="tagSyncing || !profileReady">
-          {{ tagSyncing ? ('同步中 ' + tagSyncProgress + '/' + tagSyncTotal + '...') : '同步标签' }}
+        <input class="input input--fill" v-model="tagSyncDir" placeholder="bg（留空则全部）" :disabled="metadataSyncBusy" />
+        <button class="btn btn--primary" @click="repairAndSyncTagsFromDB" :disabled="metadataSyncBusy || !profileReady">
+          {{ metadataSyncing ? ('处理中：' + metadataSyncStage) : '一键修复并同步标签' }}
         </button>
+        <button class="btn" @click="repairRemoteRecords" :disabled="metadataSyncBusy || !profileReady">
+          {{ recordRepairing ? '修复中...' : '修复历史路径记录' }}
+        </button>
+        <button class="btn" @click="syncTagsFromDB" :disabled="metadataSyncBusy || !profileReady">
+          {{ tagSyncing ? ('同步中 ' + tagSyncProgress + '/' + tagSyncTotal + '...') : '开始同步标签' }}
+        </button>
+      </div>
+      <div class="hint" style="margin:-4px 0 10px">
+        匹配时会优先按历史上传记录和图片文件名识别本地图片，不要求远端当前目录必须和本地原目录一致。
+      </div>
+      <div class="hint" style="margin:-2px 0 10px">
+        推荐直接使用“一键修复并同步标签”。它会先修正旧的远端路径记录，再按本地元数据同步远端标签。
+      </div>
+      <div class="hint" style="margin:-2px 0 10px">
+        同步时会自动按相同标签集合分组批量打标；如果某一批失败，会自动回退到单文件重试，尽量减少整批失败带来的影响。
       </div>
 
       <div class="inline-msg inline-msg--error" v-if="tagSyncError">{{ tagSyncError }}</div>
+      <div class="inline-msg inline-msg--error" v-if="recordRepairError">{{ recordRepairError }}</div>
 
       <div class="tag-sync-result" v-if="tagSyncResult">
         <span class="badge badge--ok">✓ 成功 {{ tagSyncResult.success }} 张</span>
+        <span class="badge badge--info" v-if="tagSyncResult.tagged > 0">打标 {{ tagSyncResult.tagged }} 张</span>
+        <span class="badge badge--info" v-if="tagSyncResult.batched_files > 0">批量处理 {{ tagSyncResult.batched_files }} 张</span>
+        <span class="badge" v-if="tagSyncResult.fallback_groups > 0">回退重试 {{ tagSyncResult.fallback_groups }} 组</span>
         <span class="badge" v-if="tagSyncResult.skipped > 0">跳过 {{ tagSyncResult.skipped }} 张（无本地记录）</span>
         <span class="badge badge--warn" v-if="tagSyncResult.failed > 0">失败 {{ tagSyncResult.failed }} 张</span>
       </div>
+      <details class="result-detail-card" v-if="tagSyncResult && (tagSyncFailedItems.length || tagSyncUnmatchedItems.length)">
+        <summary class="result-detail-card__summary">
+          <span>查看同步明细</span>
+          <span class="badge">{{ tagSyncResult.success + tagSyncResult.failed + tagSyncResult.skipped }} 项</span>
+        </summary>
+        <div class="result-detail-card__body">
+          <div class="result-detail-toolbar" v-if="tagSyncFailedItems.length">
+            <div class="result-detail-toolbar__actions">
+              <button class="btn btn--xs" @click="retryFailedTagSyncItems" :disabled="metadataSyncBusy || !profileReady">
+                {{ tagSyncing ? '重试中...' : ('仅重试失败项 ' + tagSyncFailedItems.length + ' 条') }}
+              </button>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="tagSyncFailedItems.length">
+            <div class="result-detail-group__title">同步失败</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in tagSyncFailedItems" :key="'tag-sync-failed-' + item.path + '-' + item.stage">
+                <div class="result-detail-item__head">
+                  <span class="badge badge--warn">{{ item.stage || '失败' }}</span>
+                  <span class="result-detail-item__title">{{ item.path }}</span>
+                </div>
+                <div class="result-detail-item__path" v-if="item.target_path && item.target_path !== item.path">目标路径：{{ item.target_path }}</div>
+                <div class="result-detail-item__meta">{{ item.reason || '未知错误' }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="tagSyncUnmatchedItems.length">
+            <div class="result-detail-group__title">未命中本地记录</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in tagSyncUnmatchedItems" :key="'tag-sync-unmatched-' + item">
+                <div class="result-detail-item__path">{{ item }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+      <div class="tag-sync-result" v-if="recordRepairResult">
+        <span class="badge badge--ok">记录已修复 {{ recordRepairResult.updated_count }} 条</span>
+        <span class="badge" v-if="recordRepairResult.unchanged_count > 0">无需变更 {{ recordRepairResult.unchanged_count }} 条</span>
+        <span class="badge" v-if="recordRepairResult.unmatched_count > 0">未命中 {{ recordRepairResult.unmatched_count }} 条</span>
+        <span class="badge badge--warn" v-if="recordRepairResult.failed_count > 0">失败 {{ recordRepairResult.failed_count }} 条</span>
+      </div>
+      <details class="result-detail-card" v-if="recordRepairResult && (recordRepairUpdatedItems.length || recordRepairFailedItems.length || recordRepairUnmatchedItems.length)">
+        <summary class="result-detail-card__summary">
+          <span>查看修复明细</span>
+          <span class="badge">{{ (recordRepairUpdatedItems.length + recordRepairFailedItems.length + recordRepairUnmatchedItems.length) }} 项</span>
+        </summary>
+        <div class="result-detail-card__body">
+          <div class="result-detail-group" v-if="recordRepairUpdatedItems.length">
+            <div class="result-detail-group__title">已修复记录</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in recordRepairUpdatedItems" :key="'record-repair-updated-' + item.wallpaper_id + '-' + item.new_path">
+                <div class="result-detail-item__head">
+                  <span class="badge badge--ok">#{{ item.wallpaper_id }}</span>
+                  <span class="result-detail-item__title">{{ item.resource_id || getFileBaseName(item.new_path) }}</span>
+                </div>
+                <div class="result-detail-item__path">{{ item.old_path || '空路径' }} → {{ item.new_path }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="recordRepairFailedItems.length">
+            <div class="result-detail-group__title">修复失败</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in recordRepairFailedItems" :key="'record-repair-failed-' + item.path + '-' + (item.reason || '')">
+                <div class="result-detail-item__head">
+                  <span class="badge badge--warn">失败</span>
+                  <span class="result-detail-item__title">{{ item.path }}</span>
+                </div>
+                <div class="result-detail-item__meta">{{ item.reason || '未知错误' }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="recordRepairUnmatchedItems.length">
+            <div class="result-detail-group__title">未命中</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in recordRepairUnmatchedItems" :key="'record-repair-unmatched-' + item">
+                <div class="result-detail-item__path">{{ item }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+      <div class="tag-sync-result" v-if="localStateSyncResult">
+        <span class="badge badge--info" v-if="localStateSyncContext">{{ localStateSyncContext }}</span>
+        <span class="badge badge--ok">本地已回写 {{ localStateSyncResult.updated_count }} 条</span>
+        <span class="badge badge--info" v-if="localStateSyncResult.local_tags_updated_count > 0">标签已更新 {{ localStateSyncResult.local_tags_updated_count }} 条</span>
+        <span class="badge" v-if="localStateSyncResult.unmatched_count > 0">未命中 {{ localStateSyncResult.unmatched_count }} 条</span>
+        <span class="badge badge--warn" v-if="localStateSyncResult.failed_count > 0">失败 {{ localStateSyncResult.failed_count }} 条</span>
+      </div>
+      <details class="result-detail-card" v-if="localStateSyncResult && (localStateSyncResult.items?.length || localStateSyncResult.failed_items?.length || localStateSyncResult.unmatched?.length)">
+        <summary class="result-detail-card__summary">
+          <span>查看本地回写明细</span>
+          <span class="badge">{{ (localStateSyncResult.items || []).length }} 条记录</span>
+        </summary>
+        <div class="result-detail-card__body">
+          <div class="result-detail-toolbar">
+            <div class="result-detail-toolbar__filters">
+              <button class="btn btn--xs" :class="{ 'btn--primary': localStateSyncView === 'all' }" @click="localStateSyncView = 'all'">全部</button>
+              <button class="btn btn--xs" :class="{ 'btn--primary': localStateSyncView === 'updated' }" @click="localStateSyncView = 'updated'">已更新 {{ localStateSyncItems.length }}</button>
+              <button class="btn btn--xs" :class="{ 'btn--primary': localStateSyncView === 'failed' }" @click="localStateSyncView = 'failed'">失败 {{ localStateSyncFailedItems.length }}</button>
+              <button class="btn btn--xs" :class="{ 'btn--primary': localStateSyncView === 'unmatched' }" @click="localStateSyncView = 'unmatched'">未命中 {{ localStateSyncUnmatchedItems.length }}</button>
+            </div>
+            <div class="result-detail-toolbar__actions">
+              <input class="input input--sm result-detail-toolbar__search" v-model="localStateSyncSearch" placeholder="搜索路径 / 标签 / resource_id" />
+              <button class="btn btn--xs" @click="copyLocalStateSyncResult" :disabled="!localStateSyncCopyText">
+                {{ localStateSyncCopyLabel }}
+              </button>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="showLocalStateSyncUpdated">
+            <div class="result-detail-group__title">已更新</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in localStateSyncItems" :key="'local-updated-' + item.wallpaper_id + '-' + item.path">
+                <div class="result-detail-item__head">
+                  <span class="badge badge--ok">#{{ item.wallpaper_id }}</span>
+                  <span class="result-detail-item__title">{{ item.resource_id || getFileBaseName(item.path) }}</span>
+                </div>
+                <div class="result-detail-item__path" v-if="item.source_path && item.source_path !== item.path">{{ item.source_path }} → {{ item.path }}</div>
+                <div class="result-detail-item__path" v-else>{{ item.path }}</div>
+                <div class="result-detail-item__meta" v-if="item.local_tags">本地标签：{{ item.local_tags }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="showLocalStateSyncFailed">
+            <div class="result-detail-group__title">失败</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in localStateSyncFailedItems" :key="'local-failed-' + item.path + '-' + (item.reason || '')">
+                <div class="result-detail-item__head">
+                  <span class="badge badge--warn">失败</span>
+                  <span class="result-detail-item__title">{{ item.path }}</span>
+                </div>
+                <div class="result-detail-item__meta">{{ item.reason || '未知错误' }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="result-detail-group" v-if="showLocalStateSyncUnmatched">
+            <div class="result-detail-group__title">未命中</div>
+            <div class="result-detail-list">
+              <div class="result-detail-item" v-for="item in localStateSyncUnmatchedItems" :key="'local-unmatched-' + item">
+                <div class="result-detail-item__path">{{ item }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="result-detail-empty" v-if="!showLocalStateSyncUpdated && !showLocalStateSyncFailed && !showLocalStateSyncUnmatched">
+            当前筛选条件下没有匹配结果。
+          </div>
+        </div>
+      </details>
 
       <div class="progress-wrap" style="margin-top:8px" v-if="tagSyncing && tagSyncTotal > 0">
         <div class="progress-fill" :style="{ width: (tagSyncProgress / tagSyncTotal * 100) + '%' }"></div>
       </div>
+    </div>
+
+    <div class="card cleanup-card" v-if="cleanupState.sourcePaths.length || cleanupState.sourceDirs.length">
+      <div class="card-head">
+        <span class="card-icon">🧹</span>
+        <div>
+          <div class="card-title">转移后清理</div>
+          <div class="card-desc">用于处理“移动后源文件或源目录还残留”的情况。会优先清理本次迁移遗留的源文件，再尝试删除已经空掉的源目录。</div>
+        </div>
+      </div>
+
+      <div class="cleanup-summary">
+        <span class="badge badge--info">{{ cleanupState.context || '最近一次迁移' }}</span>
+        <span class="badge">源文件 {{ cleanupState.sourcePaths.length }} 个</span>
+        <span class="badge">源目录 {{ cleanupState.sourceDirs.length }} 个</span>
+      </div>
+
+      <div class="cleanup-actions">
+        <button class="btn btn--sm btn--danger" @click="cleanupMovedSourceFiles" :disabled="cleanupDeletingFiles || !cleanupState.sourcePaths.length">
+          {{ cleanupDeletingFiles ? '删除源文件中...' : ('删除源文件 ' + cleanupState.sourcePaths.length + ' 个') }}
+        </button>
+        <button class="btn btn--sm" @click="cleanupEmptySourceDirs" :disabled="cleanupDeletingDirs || !cleanupState.sourceDirs.length">
+          {{ cleanupDeletingDirs ? '清理目录中...' : ('清理空目录 ' + cleanupState.sourceDirs.length + ' 个') }}
+        </button>
+        <button class="btn btn--sm" @click="clearCleanupState" :disabled="cleanupDeletingFiles || cleanupDeletingDirs">清空记录</button>
+      </div>
+      <div class="hint">目录清理会先检查目录是否已经为空，避免误删仍有内容的目录。</div>
     </div>
 
     <!-- ═══ 文件浏览器（折叠，高级操作） ═══ -->
@@ -1086,6 +1280,20 @@ const tagSyncProgress = ref(0)
 const tagSyncTotal = ref(0)
 const tagSyncResult = ref(null)
 const tagSyncError = ref('')
+const metadataSyncing = ref(false)
+const metadataSyncStage = ref('')
+const recordRepairing = ref(false)
+const recordRepairResult = ref(null)
+const recordRepairError = ref('')
+const localStateSyncResult = ref(null)
+const localStateSyncContext = ref('')
+const localStateSyncView = ref('all')
+const localStateSyncSearch = ref('')
+
+// ── 转移后清理 ──────────────────────────────────────────────────
+const cleanupState = ref(createCleanupState())
+const cleanupDeletingFiles = ref(false)
+const cleanupDeletingDirs = ref(false)
 
 // ── 文件浏览器 ──────────────────────────────────────────────────
 const browserOpen = ref(false)
@@ -1120,6 +1328,7 @@ const templateLockPresetHistory = ref([])
 const templateLockStateHistory = ref([])
 const templateLockPresetEditingId = ref('')
 const templateLockPresetEditingName = ref('')
+const metadataSyncBusy = computed(() => metadataSyncing.value || tagSyncing.value || recordRepairing.value)
 const templateLockPresetSearch = ref('')
 const templateLockPresetImportOpen = ref(false)
 const templateLockPresetImportText = ref('')
@@ -1351,6 +1560,110 @@ const pageWorkflowSteps = computed(() => ([
     done: Boolean(selectedFile.value),
   },
 ]))
+const tagSyncFailedItems = computed(() => (
+  Array.isArray(tagSyncResult.value?.failed_items) ? tagSyncResult.value.failed_items : []
+))
+const tagSyncUnmatchedItems = computed(() => (
+  Array.isArray(tagSyncResult.value?.unmatched_paths) ? tagSyncResult.value.unmatched_paths : []
+))
+const tagSyncRetryPaths = computed(() => (
+  tagSyncFailedItems.value
+    .map((item) => String(item?.path || '').trim())
+    .filter(Boolean)
+))
+const recordRepairUpdatedItems = computed(() => (
+  Array.isArray(recordRepairResult.value?.items) ? recordRepairResult.value.items : []
+))
+const recordRepairFailedItems = computed(() => (
+  Array.isArray(recordRepairResult.value?.failed_items) ? recordRepairResult.value.failed_items : []
+))
+const recordRepairUnmatchedItems = computed(() => (
+  Array.isArray(recordRepairResult.value?.unmatched) ? recordRepairResult.value.unmatched : []
+))
+const localStateSyncKeyword = computed(() => String(localStateSyncSearch.value || '').trim().toLowerCase())
+const localStateSyncItems = computed(() => {
+  const items = Array.isArray(localStateSyncResult.value?.items) ? localStateSyncResult.value.items : []
+  const keyword = localStateSyncKeyword.value
+  if (!keyword) return items
+  return items.filter((item) => {
+    const haystack = [
+      item?.resource_id,
+      item?.path,
+      item?.source_path,
+      item?.local_tags,
+    ].map((value) => String(value || '').toLowerCase()).join(' ')
+    return haystack.includes(keyword)
+  })
+})
+const localStateSyncFailedItems = computed(() => {
+  const items = Array.isArray(localStateSyncResult.value?.failed_items) ? localStateSyncResult.value.failed_items : []
+  const keyword = localStateSyncKeyword.value
+  if (!keyword) return items
+  return items.filter((item) => {
+    const haystack = [
+      item?.path,
+      item?.reason,
+      item?.wallpaper_id,
+    ].map((value) => String(value || '').toLowerCase()).join(' ')
+    return haystack.includes(keyword)
+  })
+})
+const localStateSyncUnmatchedItems = computed(() => {
+  const items = Array.isArray(localStateSyncResult.value?.unmatched) ? localStateSyncResult.value.unmatched : []
+  const keyword = localStateSyncKeyword.value
+  if (!keyword) return items
+  return items.filter((item) => String(item || '').toLowerCase().includes(keyword))
+})
+const showLocalStateSyncUpdated = computed(() => (localStateSyncView.value === 'all' || localStateSyncView.value === 'updated') && localStateSyncItems.value.length > 0)
+const showLocalStateSyncFailed = computed(() => (localStateSyncView.value === 'all' || localStateSyncView.value === 'failed') && localStateSyncFailedItems.value.length > 0)
+const showLocalStateSyncUnmatched = computed(() => (localStateSyncView.value === 'all' || localStateSyncView.value === 'unmatched') && localStateSyncUnmatchedItems.value.length > 0)
+const localStateSyncCopyLabel = computed(() => {
+  switch (localStateSyncView.value) {
+    case 'updated':
+      return '复制已更新'
+    case 'failed':
+      return '复制失败项'
+    case 'unmatched':
+      return '复制未命中'
+    default:
+      return '复制当前结果'
+  }
+})
+const localStateSyncCopyText = computed(() => {
+  const sections = []
+  if (localStateSyncView.value === 'all' || localStateSyncView.value === 'updated') {
+    const updatedLines = localStateSyncItems.value.map((item) => {
+      const title = item?.resource_id || getFileBaseName(item?.path || '')
+      const pathText = item?.source_path && item.source_path !== item.path
+        ? `${item.source_path} -> ${item.path}`
+        : String(item?.path || '')
+      const tagText = item?.local_tags ? ` | 本地标签: ${item.local_tags}` : ''
+      return `${title} | ${pathText}${tagText}`
+    })
+    if (updatedLines.length) sections.push(['[已更新]', ...updatedLines].join('\n'))
+  }
+  if (localStateSyncView.value === 'all' || localStateSyncView.value === 'failed') {
+    const failedLines = localStateSyncFailedItems.value.map((item) => `${item?.path || ''} | ${item?.reason || '未知错误'}`)
+    if (failedLines.length) sections.push(['[失败]', ...failedLines].join('\n'))
+  }
+  if (localStateSyncView.value === 'all' || localStateSyncView.value === 'unmatched') {
+    const unmatchedLines = localStateSyncUnmatchedItems.value.map((item) => String(item || ''))
+    if (unmatchedLines.length) sections.push(['[未命中]', ...unmatchedLines].join('\n'))
+  }
+  return sections.join('\n\n')
+})
+
+function formatOperationError(err, fallback = '未知错误') {
+  const message = String(err?.message || err || '').trim() || fallback
+  if (message.includes('无法连接图床管理接口')) {
+    return `${message} 建议检查图床地址、Cloudflare Pages 连通性，或稍后重试。`
+  }
+  if (message.includes('TLS') || message.includes('IPv6')) {
+    return `${message} 这通常是图床 HTTPS 握手或网络兼容问题。`
+  }
+  return message
+}
+
 const organizeOverviewFacts = computed(() => ([
   {
     label: '扫描目录',
@@ -1391,6 +1704,10 @@ function createAssistantForm() {
   return { wallpaperType: 'static', orientation: 'landscape', category: '', colorTheme: '', customTags: '', targetDirectory: '' }
 }
 
+function createCleanupState() {
+  return { sourcePaths: [], sourceDirs: [], targetDirs: [], context: '', updatedAt: 0 }
+}
+
 function createTemplateFieldLocks() {
   return { wallpaperType: false, orientation: false, category: false, colorTheme: false, customTags: false }
 }
@@ -1408,6 +1725,32 @@ function pickPreferredProfileKey(list, currentKey) {
 
 function splitTags(value) {
   return String(value || '').split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+function normalizeWallpaperTypeValue(value) {
+  return String(value || '').trim().toLowerCase() === 'dynamic' || String(value || '').trim() === '动态图'
+    ? 'dynamic'
+    : 'static'
+}
+
+function normalizeOrientationValue(value, fallback = 'unknown') {
+  const text = String(value || '').trim().toLowerCase()
+  if (!text) return fallback
+  if (['portrait', 'vertical', '竖图', '竖屏'].includes(text)) return 'portrait'
+  if (['landscape', 'horizontal', '横图', '横屏'].includes(text)) return 'landscape'
+  if (['square', '方图'].includes(text)) return 'square'
+  return fallback
+}
+
+function createAssistantFormFromMatch(meta, fileName = '') {
+  return {
+    wallpaperType: normalizeWallpaperTypeValue(meta?.wallpaper_type),
+    orientation: normalizeOrientationValue(meta?.orientation, inferOrientationFromPath(fileName)),
+    category: String(meta?.category || '').trim(),
+    colorTheme: String(meta?.color_theme || '').trim(),
+    customTags: String(meta?.tags || '').trim(),
+    targetDirectory: '',
+  }
 }
 
 function uniqueTags(items) {
@@ -1442,11 +1785,13 @@ function buildQuickOptionItems(values, { emptyLabel, limit = 6 } = {}) {
 }
 
 function buildTemplateQuickGroups({ form, categories, colors }) {
+  const wallpaperType = normalizeWallpaperTypeValue(form.wallpaperType)
+  const orientation = normalizeOrientationValue(form.orientation, 'landscape')
   return [
     {
       key: 'wallpaperType',
       label: '类型',
-      currentValue: form.wallpaperType || 'static',
+      currentValue: wallpaperType,
       options: [
         { value: 'static', label: '静态图' },
         { value: 'dynamic', label: '动态图' },
@@ -1455,7 +1800,7 @@ function buildTemplateQuickGroups({ form, categories, colors }) {
     {
       key: 'orientation',
       label: '方向',
-      currentValue: form.orientation || 'landscape',
+      currentValue: orientation,
       options: [
         { value: 'landscape', label: '横图' },
         { value: 'portrait', label: '竖图' },
@@ -1481,8 +1826,8 @@ function buildTemplateQuickGroups({ form, categories, colors }) {
 }
 
 function formatTemplateLockValue(field, value) {
-  if (field === 'wallpaperType') return value === 'dynamic' ? '动态图' : '静态图'
-  if (field === 'orientation') return ORIENTATION_LABELS[value] || ORIENTATION_LABELS.unknown
+  if (field === 'wallpaperType') return normalizeWallpaperTypeValue(value) === 'dynamic' ? '动态图' : '静态图'
+  if (field === 'orientation') return ORIENTATION_LABELS[normalizeOrientationValue(value)] || ORIENTATION_LABELS.unknown
   if (field === 'category') return value || '空分类'
   if (field === 'colorTheme') return value || '空颜色'
   if (field === 'customTags') return value || '空标签'
@@ -1600,8 +1945,8 @@ function getTemplateQuickFieldLabel(field) {
 }
 
 function getTemplateQuickOptionLabel(field, value) {
-  if (field === 'wallpaperType') return value === 'dynamic' ? '动态图' : '静态图'
-  if (field === 'orientation') return value === 'portrait' ? '竖图' : '横图'
+  if (field === 'wallpaperType') return normalizeWallpaperTypeValue(value) === 'dynamic' ? '动态图' : '静态图'
+  if (field === 'orientation') return normalizeOrientationValue(value) === 'portrait' ? '竖图' : '横图'
   if (field === 'category') return value || '清空分类'
   if (field === 'colorTheme') return value || '清空颜色'
   return value || '空值'
@@ -1662,11 +2007,11 @@ function buildTemplateValueSources(form, fileName) {
   return {
     type: {
       label: '来自类型字段',
-      text: `取自“类型”字段，当前按${form.wallpaperType === 'dynamic' ? '动态图' : '静态图'}展开。`,
+      text: `取自“类型”字段，当前按${normalizeWallpaperTypeValue(form.wallpaperType) === 'dynamic' ? '动态图' : '静态图'}展开。`,
     },
     orientation: {
       label: '来自方向字段',
-      text: `取自“方向”字段，当前按${ORIENTATION_LABELS[form.orientation] || ORIENTATION_LABELS.unknown}展开。`,
+      text: `取自“方向”字段，当前按${ORIENTATION_LABELS[normalizeOrientationValue(form.orientation)] || ORIENTATION_LABELS.unknown}展开。`,
     },
     category: {
       label: '来自分类字段',
@@ -1923,6 +2268,34 @@ function getFileBaseName(path) {
   return parts[parts.length - 1] || path
 }
 
+function normalizeTagSyncTags(tags) {
+  if (!Array.isArray(tags)) return []
+  const seen = new Set()
+  const result = []
+  for (const raw of tags) {
+    const text = String(raw || '').trim()
+    if (!text) continue
+    const key = text.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(text)
+  }
+  return result
+}
+
+function createTagSyncGroups(entries) {
+  const groups = new Map()
+  for (const [path, meta] of entries) {
+    const tags = normalizeTagSyncTags(meta?.suggested_tags)
+    const signature = JSON.stringify(tags)
+    if (!groups.has(signature)) {
+      groups.set(signature, { tags, paths: [] })
+    }
+    groups.get(signature).paths.push(path)
+  }
+  return Array.from(groups.values()).sort((a, b) => b.paths.length - a.paths.length)
+}
+
 function getFileNameWithoutExt(path) {
   const base = getFileBaseName(path)
   const dotIdx = base.lastIndexOf('.')
@@ -1952,7 +2325,7 @@ function formatRemoteSize(value) {
 }
 
 function inferTypeFromPath(path) {
-  return /dynamic|gif|webp/i.test(normalizeRemotePath(path)) ? 'dynamic' : 'static'
+  return /(^|\/)(dynamic|video)(\/|$)|\.(gif|mp4|webm)$/i.test(normalizeRemotePath(path)) ? 'dynamic' : 'static'
 }
 
 function inferOrientationFromPath(path) {
@@ -1963,8 +2336,8 @@ function inferOrientationFromPath(path) {
 }
 
 function buildPreviewTags(form) {
-  const typeTag = form.wallpaperType === 'dynamic' ? '动态图' : '静态图'
-  const orientTag = ORIENTATION_LABELS[form.orientation] || ORIENTATION_LABELS.unknown
+  const typeTag = normalizeWallpaperTypeValue(form.wallpaperType) === 'dynamic' ? '动态图' : '静态图'
+  const orientTag = ORIENTATION_LABELS[normalizeOrientationValue(form.orientation)] || ORIENTATION_LABELS.unknown
   const userTags = [
     ...(form.category ? [form.category] : []),
     ...(form.colorTheme ? [form.colorTheme] : []),
@@ -1977,9 +2350,11 @@ function buildTemplateValues(form, fileName) {
   const now = new Date()
   const customTags = splitTags(form.customTags).map((tag) => safePathSegment(tag, '')).filter(Boolean)
   const resourceName = safePathSegment(getFileNameWithoutExt(fileName || ''), 'unknown-resource')
+  const wallpaperType = normalizeWallpaperTypeValue(form.wallpaperType)
+  const orientation = normalizeOrientationValue(form.orientation)
   return {
-    type: form.wallpaperType === 'dynamic' ? 'dynamic' : 'static',
-    orientation: form.orientation || 'unknown',
+    type: wallpaperType,
+    orientation,
     category: safePathSegment(form.category, 'uncategorized'),
     type_id: safePathSegment(form.category, 'unknown-type'),
     color: safePathSegment(form.colorTheme, 'uncolored'),
@@ -2018,8 +2393,10 @@ function resolveTemplateUntilKey(pattern, values, stopKey) {
 
 function computeFixedDirectory(profile, form) {
   const p = profile || {}
-  if (form.wallpaperType === 'dynamic') return normalizeRemotePath(p.folder_dynamic || 'bg/dynamic')
-  if (form.orientation === 'portrait') return normalizeRemotePath(p.folder_portrait || 'bg/mb')
+  if (normalizeWallpaperTypeValue(form.wallpaperType) === 'dynamic' && String(p.folder_dynamic || '').trim()) {
+    return normalizeRemotePath(p.folder_dynamic || 'bg/dynamic')
+  }
+  if (normalizeOrientationValue(form.orientation) === 'portrait') return normalizeRemotePath(p.folder_portrait || 'bg/mb')
   return normalizeRemotePath(p.folder_landscape || 'bg/pc')
 }
 
@@ -2317,6 +2694,7 @@ function resetRemoteState() {
   remoteNotice.value = ''
   remoteIndexInfo.value = null
   remoteCapabilities.value = null
+  clearCleanupState()
 }
 
 function resetQuery() {
@@ -2335,6 +2713,95 @@ function buildMovedFilePath(oldPath, targetDirectory) {
   const normalizedTarget = normalizeRemotePath(targetDirectory)
   const fileName = getFileBaseName(oldPath)
   return normalizedTarget ? normalizedTarget + '/' + fileName : fileName
+}
+
+function rememberCleanupCandidates(movedItems, context = '') {
+  const sourcePaths = uniqueTags((movedItems || []).map((item) => normalizeRemotePath(item?.sourcePath)).filter(Boolean))
+  const sourceDirs = uniqueTags((movedItems || []).map((item) => normalizeRemotePath(item?.sourceDir)).filter(Boolean))
+  const targetDirs = uniqueTags((movedItems || []).map((item) => normalizeRemotePath(item?.targetDir)).filter(Boolean))
+  if (!sourcePaths.length && !sourceDirs.length) return
+  cleanupState.value = {
+    sourcePaths,
+    sourceDirs,
+    targetDirs,
+    context: context || '最近一次迁移',
+    updatedAt: Date.now(),
+  }
+}
+
+function clearCleanupState() {
+  cleanupState.value = createCleanupState()
+}
+
+function isMissingRemotePathError(err) {
+  const text = String(err?.message || err || '').toLowerCase()
+  return text.includes('404') || text.includes('not found') || text.includes('不存在')
+}
+
+async function cleanupMovedSourceFiles() {
+  const sourcePaths = [...cleanupState.value.sourcePaths]
+  if (!activeProfile.value?.key || !sourcePaths.length) return
+  if (!window.confirm('确认删除本次迁移遗留的 ' + sourcePaths.length + ' 个源文件吗？这会永久移除旧路径中的副本。')) return
+
+  cleanupDeletingFiles.value = true
+  globalError.value = ''
+  globalNotice.value = ''
+  let success = 0
+  let skipped = 0
+  let failed = 0
+
+  for (const path of sourcePaths) {
+    try {
+      await imgbedApi.deletePath(activeProfile.value.key, { path, folder: false })
+      success++
+    } catch (err) {
+      if (isMissingRemotePathError(err)) skipped++
+      else failed++
+    }
+  }
+
+  cleanupDeletingFiles.value = false
+  cleanupState.value.sourcePaths = []
+  globalNotice.value = '源文件清理完成：成功 ' + success + ' 个，已不存在 ' + skipped + ' 个，失败 ' + failed + ' 个。'
+  if (!cleanupState.value.sourceDirs.length) clearCleanupState()
+  if (browserOpen.value) await loadRemoteList()
+}
+
+async function cleanupEmptySourceDirs() {
+  const sourceDirs = [...cleanupState.value.sourceDirs]
+  if (!activeProfile.value?.key || !sourceDirs.length) return
+  if (!window.confirm('确认检查并删除本次迁移留下的空目录吗？只有确认为空的目录才会被删除。')) return
+
+  cleanupDeletingDirs.value = true
+  globalError.value = ''
+  globalNotice.value = ''
+  let success = 0
+  let skipped = 0
+  let failed = 0
+
+  for (const dir of sourceDirs) {
+    try {
+      const res = await imgbedApi.list(activeProfile.value.key, { dir, recursive: false, count: 1 })
+      const data = res?.data || res || {}
+      const files = Array.isArray(data.files) ? data.files : []
+      const directories = Array.isArray(data.directories) ? data.directories : []
+      if (files.length || directories.length) {
+        skipped++
+        continue
+      }
+      await imgbedApi.deletePath(activeProfile.value.key, { path: dir, folder: true })
+      success++
+    } catch (err) {
+      if (isMissingRemotePathError(err)) skipped++
+      else failed++
+    }
+  }
+
+  cleanupDeletingDirs.value = false
+  cleanupState.value.sourceDirs = []
+  globalNotice.value = '空目录清理完成：成功 ' + success + ' 个，跳过 ' + skipped + ' 个，失败 ' + failed + ' 个。'
+  if (!cleanupState.value.sourcePaths.length) clearCleanupState()
+  if (browserOpen.value) await loadRemoteList()
 }
 
 // ── 整理向导 ─────────────────────────────────────────────────────
@@ -2370,11 +2837,7 @@ async function analyzeOrganize() {
     const needsMove = []
     for (const [path, meta] of Object.entries(matched)) {
       const currentDir = normalizeRemotePath(getDirectoryName(path))
-      const targetDir = computeSuggestedDirectory(
-        activeProfile.value,
-        { wallpaperType: meta.wallpaper_type || 'static', orientation: meta.orientation || 'landscape', category: meta.category || '', colorTheme: meta.color_theme || '', customTags: '' },
-        path,
-      )
+      const targetDir = computeSuggestedDirectory(activeProfile.value, createAssistantFormFromMatch(meta, path), path)
       if (currentDir === normalizeRemotePath(targetDir)) {
         correct.push({ path, meta, currentDir, targetDir })
       } else {
@@ -2401,11 +2864,18 @@ async function executeOrganize() {
   organizeNotice.value = ''
   let successCount = 0
   let failCount = 0
+  const movedItems = []
 
   for (const item of organizeResult.value.needsMove) {
     try {
       await imgbedApi.movePath(activeProfile.value.key, { path: item.path, dist: item.targetDir })
       successCount++
+      movedItems.push({
+        sourcePath: item.path,
+        sourceDir: item.currentDir,
+        targetDir: item.targetDir,
+        targetPath: buildMovedFilePath(item.path, item.targetDir),
+      })
     } catch (err) {
       failCount++
       console.warn('[整理] 移动失败：', item.path, err?.message)
@@ -2419,37 +2889,76 @@ async function executeOrganize() {
     for (const dir of targetDirs) {
       rememberRecentDirectory(dir, '来自批量整理执行')
     }
+    rememberCleanupCandidates(movedItems, '来自自动整理目录')
   }
   organizeNotice.value = failCount === 0
-    ? ('整理完成！共移动 ' + successCount + ' 张文件。')
-    : ('完成：成功 ' + successCount + ' 张，失败 ' + failCount + ' 张')
+    ? ('整理完成！共移动 ' + successCount + ' 张文件。若源路径还有残留，可继续使用下方“转移后清理”。')
+    : ('完成：成功 ' + successCount + ' 张，失败 ' + failCount + ' 张。若源路径仍有残留，可继续使用下方“转移后清理”。')
   organizeResult.value = null
 }
 
 // ── 标签同步 ─────────────────────────────────────────────────────
-async function syncTagsFromDB() {
+async function syncRemoteStateToLocal(items, { syncLocalTags = true, context = '' } = {}) {
+  if (!profileReady.value) return null
+  const payloadItems = (Array.isArray(items) ? items : [])
+    .map((item) => ({
+      path: normalizeRemotePath(item?.path || item?.targetPath || ''),
+      source_path: normalizeRemotePath(item?.sourcePath || ''),
+      tags: Array.isArray(item?.tags) ? item.tags : [],
+    }))
+    .filter((item) => item.path)
+  if (!payloadItems.length) return null
+  const result = await galleryApi.applyRemoteState({
+    profile_key: activeProfile.value.key,
+    base_url: activeProfile.value.base_url || '',
+    sync_local_tags: syncLocalTags,
+    items: payloadItems,
+  })
+  localStateSyncResult.value = result?.data || result || null
+  localStateSyncContext.value = context
+  localStateSyncView.value = 'all'
+  localStateSyncSearch.value = ''
+  return localStateSyncResult.value
+}
+
+function ensureTagSyncOptionsSelected() {
+  return true
+}
+
+async function listTagSyncPaths(emptyMessage) {
+  const listRes = await imgbedApi.list(activeProfile.value.key, {
+    dir: tagSyncDir.value || '',
+    recursive: true,
+    count: -1,
+  })
+  const files = listRes?.data?.files || listRes?.files || []
+  const paths = files.map((file) => file?.name).filter(Boolean)
+  if (!paths.length) throw new Error(emptyMessage)
+  return paths
+}
+
+async function syncTagsFromDB(paths = null, options = {}) {
+  const { throwOnError = false, preserveResult = false } = options
   if (!profileReady.value) return
+  if (!ensureTagSyncOptionsSelected()) return
   tagSyncing.value = true
   tagSyncProgress.value = 0
   tagSyncTotal.value = 0
-  tagSyncResult.value = null
+  if (!preserveResult) tagSyncResult.value = null
   tagSyncError.value = ''
+  if (!preserveResult) {
+    localStateSyncResult.value = null
+    localStateSyncContext.value = ''
+    localStateSyncView.value = 'all'
+    localStateSyncSearch.value = ''
+  }
 
   try {
-    const listRes = await imgbedApi.list(activeProfile.value.key, {
-      dir: tagSyncDir.value || '',
-      recursive: true,
-      count: -1,
-    })
-    const files = listRes?.data?.files || listRes?.files || []
-    if (!files.length) {
-      tagSyncError.value = '该目录没有找到文件，请确认目录名称正确。'
-      return
-    }
-
-    const paths = files.map((f) => f.name)
+    const remotePaths = Array.isArray(paths) && paths.length
+      ? paths
+      : await listTagSyncPaths('该目录没有找到文件，请确认目录名称正确。')
     const matchRes = await galleryApi.matchRemote({
-      paths,
+      paths: remotePaths,
       base_url: activeProfile.value.base_url || '',
     })
     const matched = matchRes?.matched || matchRes?.data?.matched || {}
@@ -2459,22 +2968,143 @@ async function syncTagsFromDB() {
     tagSyncTotal.value = entries.length
     let success = 0
     let failed = 0
+    let tagged = 0
+    let batchedFiles = 0
+    let fallbackGroups = 0
+    const appliedItems = []
+    const failedItems = []
 
-    for (const [path, meta] of entries) {
-      try {
-        await imgbedApi.setTags(activeProfile.value.key, { path, tags: meta.suggested_tags || [], action: 'set' })
-        success++
-      } catch {
-        failed++
+    for (const group of createTagSyncGroups(entries)) {
+      const tags = group.tags
+      const pathsInGroup = group.paths
+      if (pathsInGroup.length > 1) {
+        try {
+          await imgbedApi.batchTags(activeProfile.value.key, { paths: pathsInGroup, tags, action: 'set' })
+          batchedFiles += pathsInGroup.length
+          tagged += pathsInGroup.length
+          success += pathsInGroup.length
+          for (const path of pathsInGroup) {
+            appliedItems.push({
+              path,
+              sourcePath: path,
+              tags,
+            })
+            tagSyncProgress.value++
+          }
+          continue
+        } catch (err) {
+          fallbackGroups++
+        }
       }
-      tagSyncProgress.value++
+
+      for (const path of pathsInGroup) {
+        let currentStage = pathsInGroup.length > 1 ? '批量失败后单文件重试' : '同步标签'
+        try {
+          await imgbedApi.setTags(activeProfile.value.key, { path, tags, action: 'set' })
+          tagged++
+          appliedItems.push({
+            path,
+            sourcePath: path,
+            tags,
+          })
+          success++
+        } catch (err) {
+          failed++
+          failedItems.push({
+            path,
+            stage: currentStage,
+            reason: formatOperationError(err),
+          })
+        }
+        tagSyncProgress.value++
+      }
     }
 
-    tagSyncResult.value = { success, failed, skipped: unmatchedPaths.length }
+    if (appliedItems.length) {
+      await syncRemoteStateToLocal(appliedItems, { syncLocalTags: true, context: '来自元数据标签同步' })
+    }
+    tagSyncResult.value = {
+      success,
+      failed,
+      skipped: unmatchedPaths.length,
+      tagged,
+      batched_files: batchedFiles,
+      fallback_groups: fallbackGroups,
+      failed_items: failedItems,
+      unmatched_paths: unmatchedPaths,
+    }
+    return tagSyncResult.value
   } catch (err) {
-    tagSyncError.value = '同步失败：' + (err?.message || String(err))
+    tagSyncError.value = '同步失败：' + formatOperationError(err)
+    if (throwOnError) throw err
   } finally {
     tagSyncing.value = false
+  }
+}
+
+async function retryFailedTagSyncItems() {
+  const retryPaths = Array.from(new Set(tagSyncRetryPaths.value))
+  if (!retryPaths.length) return
+  globalNotice.value = ''
+  await syncTagsFromDB(retryPaths, { preserveResult: false })
+  if (!tagSyncError.value) {
+    globalNotice.value = `失败项重试完成：成功 ${tagSyncResult.value?.success || 0} 张，失败 ${tagSyncResult.value?.failed || 0} 张。`
+  }
+}
+
+async function repairRemoteRecords(paths = null, options = {}) {
+  const { throwOnError = false } = options
+  if (!profileReady.value) return
+  recordRepairing.value = true
+  recordRepairResult.value = null
+  recordRepairError.value = ''
+  try {
+    const remotePaths = Array.isArray(paths) && paths.length
+      ? paths
+      : await listTagSyncPaths('该目录没有找到文件，无法修复历史路径记录。')
+    const result = await galleryApi.reconcileRemoteRecords({
+      profile_key: activeProfile.value.key,
+      paths: remotePaths,
+      base_url: activeProfile.value.base_url || '',
+    })
+    recordRepairResult.value = result?.data || result || null
+    globalNotice.value = `历史路径修复完成：更新 ${recordRepairResult.value?.updated_count || 0} 条。`
+    return recordRepairResult.value
+  } catch (err) {
+    recordRepairError.value = '修复历史路径记录失败：' + formatOperationError(err)
+    if (throwOnError) throw err
+  } finally {
+    recordRepairing.value = false
+  }
+}
+
+async function repairAndSyncTagsFromDB() {
+  if (!profileReady.value) return
+  if (!ensureTagSyncOptionsSelected()) return
+  metadataSyncing.value = true
+  metadataSyncStage.value = '扫描远端文件'
+  tagSyncError.value = ''
+  recordRepairError.value = ''
+  localStateSyncResult.value = null
+  localStateSyncContext.value = ''
+  localStateSyncView.value = 'all'
+  localStateSyncSearch.value = ''
+  globalNotice.value = ''
+
+  try {
+    const remotePaths = await listTagSyncPaths('该目录没有找到文件，请确认目录名称正确。')
+    metadataSyncStage.value = '修复历史路径记录'
+    await repairRemoteRecords(remotePaths, { throwOnError: true })
+    metadataSyncStage.value = '同步标签'
+    await syncTagsFromDB(remotePaths, { throwOnError: true })
+    globalNotice.value = `已完成一键修复并同步标签：修复 ${recordRepairResult.value?.updated_count || 0} 条历史记录，同步 ${tagSyncResult.value?.success || 0} 张文件。`
+  } catch (err) {
+    if (!recordRepairError.value && !tagSyncError.value) {
+      tagSyncError.value = '一键修复并同步标签失败：' + formatOperationError(err)
+    }
+  } finally {
+    metadataSyncing.value = false
+    metadataSyncStage.value = ''
   }
 }
 
@@ -2508,6 +3138,17 @@ function openRemoteFile(file) {
 function copySelectedPath() {
   if (!selectedFile.value) return
   navigator.clipboard?.writeText(selectedFile.value.name).catch(() => {})
+}
+
+async function copyLocalStateSyncResult() {
+  const text = localStateSyncCopyText.value
+  if (!text) return
+  try {
+    await navigator.clipboard?.writeText(text)
+    globalNotice.value = `${localStateSyncCopyLabel.value}已复制到剪贴板。`
+  } catch {
+    globalError.value = '复制结果失败，请检查浏览器剪贴板权限。'
+  }
 }
 
 async function loadSettings() {
@@ -2654,6 +3295,8 @@ async function applyClassificationToPaths(paths) {
   if (!syncDirectory && !syncTags) { remoteError.value = '请至少选择"修改目录"或"修改标签"中的一个。'; return }
   if (syncDirectory && !targetDirectory) { remoteError.value = '目标目录不能为空。'; return }
   const finalPaths = []
+  const movedItems = []
+  const appliedItems = []
   for (const originalPath of paths) {
     const currentDirectory = getDirectoryName(originalPath)
     const movedPath = syncDirectory ? buildMovedFilePath(originalPath, targetDirectory) : originalPath
@@ -2661,16 +3304,30 @@ async function applyClassificationToPaths(paths) {
     try {
       if (needsMove) {
         await imgbedApi.movePath(activeProfile.value.key, { path: originalPath, dist: targetDirectory })
+        movedItems.push({
+          sourcePath: originalPath,
+          sourceDir: normalizeRemotePath(currentDirectory),
+          targetDir: targetDirectory,
+          targetPath: movedPath,
+        })
       }
       if (syncTags) {
         await imgbedApi.setTags(activeProfile.value.key, { path: movedPath, tags, action: 'set' })
       }
+      appliedItems.push({
+        path: movedPath,
+        sourcePath: originalPath,
+        tags: syncTags ? tags : [],
+      })
       finalPaths.push(movedPath)
     } catch (err) {
       remoteError.value = '处理 ' + getFileBaseName(originalPath) + ' 失败：' + (err?.message || err)
     }
   }
-  return finalPaths
+  if (appliedItems.length) {
+    await syncRemoteStateToLocal(appliedItems, { syncLocalTags: syncTags, context: paths.length > 1 ? '来自批量重分类' : '来自手动重分类' })
+  }
+  return { finalPaths, movedItems }
 }
 
 async function applyReclassifyToCurrent() {
@@ -2679,11 +3336,12 @@ async function applyReclassifyToCurrent() {
   remoteError.value = ''
   remoteNotice.value = ''
   try {
-    const finalPaths = await applyClassificationToPaths([selectedFile.value.name])
-    const focusPath = finalPaths?.[0] || selectedFile.value.name
+    const result = await applyClassificationToPaths([selectedFile.value.name])
+    const focusPath = result?.finalPaths?.[0] || selectedFile.value.name
     if (reclassifyOptions.value.syncDirectory && normalizedTargetDirectory.value) {
       rememberRecentDirectory(normalizedTargetDirectory.value, '来自当前文件应用')
     }
+    if (result?.movedItems?.length) rememberCleanupCandidates(result.movedItems, '来自手动重分类')
     remoteNotice.value = '已应用新的目录和标签。'
     await loadRemoteList()
     const newFile = remoteFiles.value.find((f) => f.name === focusPath)
@@ -2704,10 +3362,11 @@ async function applyReclassifyToBatch() {
   remoteError.value = ''
   remoteNotice.value = ''
   try {
-    await applyClassificationToPaths([...selectedPaths.value])
+    const result = await applyClassificationToPaths([...selectedPaths.value])
     if (reclassifyOptions.value.syncDirectory && normalizedTargetDirectory.value) {
       rememberRecentDirectory(normalizedTargetDirectory.value, '来自批量应用')
     }
+    if (result?.movedItems?.length) rememberCleanupCandidates(result.movedItems, '来自批量重分类')
     remoteNotice.value = '已对 ' + count + ' 张图片应用新的目录和标签。'
     selectedPaths.value = []
     await loadRemoteList()
@@ -2751,9 +3410,11 @@ async function applyAutoTags() {
   autoTagApplyProgress.value = 0
   let success = 0
   let failed = 0
+  const appliedItems = []
   for (const [path, meta] of entries) {
     try {
       await imgbedApi.setTags(activeProfile.value.key, { path, tags: meta.suggested_tags || [], action: 'add' })
+      appliedItems.push({ path, sourcePath: path, tags: meta.suggested_tags || [] })
       success++
     } catch {
       failed++
@@ -2763,6 +3424,9 @@ async function applyAutoTags() {
   autoTagApplying.value = false
   autoTagPanel.value.applyResult = { success, failed }
   if (success > 0) remoteNotice.value = '标签补全完成：成功 ' + success + ' 张，失败 ' + failed + ' 张。'
+  if (appliedItems.length) {
+    await syncRemoteStateToLocal(appliedItems, { syncLocalTags: true, context: '来自自动补全标签' })
+  }
   await loadRemoteList()
 }
 
@@ -3018,6 +3682,102 @@ onMounted(async () => {
 
 /* ── 标签同步 ── */
 .tag-sync-result { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.result-detail-card {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  overflow: hidden;
+}
+.result-detail-card__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.result-detail-card__body {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.result-detail-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.result-detail-toolbar__filters {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.result-detail-toolbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 320px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.result-detail-toolbar__search {
+  min-width: min(280px, 100%);
+  flex: 1 1 240px;
+}
+.result-detail-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.result-detail-group__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.result-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.result-detail-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg-subtle, #f8f8f8);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.result-detail-item__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.result-detail-item__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+}
+.result-detail-item__path,
+.result-detail-item__meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+  line-height: 1.5;
+}
+.result-detail-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px 2px 2px;
+}
 .badge { display: inline-flex; align-items: center; font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--bg-subtle, #eee); color: var(--text-muted); }
 .badge--info { background: var(--primary-light, #eef4ff); color: var(--primary, #4f8ef7); }
 .badge--ok   { background: #eafaf1; color: #1e8449; }
@@ -3901,6 +4661,18 @@ details[open] .browser-summary::before { transform: rotate(90deg); }
   background: color-mix(in srgb, var(--bg-card) 72%, white 28%);
   border: 1px solid var(--border);
   flex-wrap: wrap;
+}
+.cleanup-card {
+  background:
+    linear-gradient(180deg, rgba(245, 166, 35, 0.08), transparent 26%),
+    var(--bg-card);
+}
+.cleanup-summary,
+.cleanup-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
 }
 .apply-btns { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
 

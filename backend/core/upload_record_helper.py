@@ -18,6 +18,7 @@ from backend.models.upload_registry import UploadRegistry
 from backend.models.wallpaper import Wallpaper
 
 logger = logging.getLogger(__name__)
+_REMOTE_TAG_INVALID_CHARS = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+")
 
 DEFAULT_UPLOAD_FORMAT = "profile"
 SUPPORTED_UPLOAD_FORMATS = {
@@ -146,11 +147,20 @@ def split_remote_tags(value: str | list[str] | tuple[str, ...] | None) -> list[s
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+def normalize_remote_tag(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = _REMOTE_TAG_INVALID_CHARS.sub("_", text)
+    text = re.sub(r"_+", "_", text).strip("_-")
+    return text
+
+
 def unique_remote_tags(items: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for item in items:
-        text = str(item or "").strip()
+        text = normalize_remote_tag(item)
         if not text:
             continue
         key = text.lower()
@@ -193,6 +203,29 @@ def build_remote_tags(
     )
 
 
+def extract_local_tags_from_remote(
+    *,
+    width: Optional[int],
+    height: Optional[int],
+    wallpaper_type: str,
+    category: str,
+    color_theme: str,
+    remote_tags: str | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    structured_tags = set(
+        build_remote_tags(
+            width=width,
+            height=height,
+            wallpaper_type=wallpaper_type,
+            category=category,
+            color_theme=color_theme,
+            tags=None,
+        )
+    )
+    candidates = unique_remote_tags(split_remote_tags(remote_tags))
+    return [item for item in candidates if item not in structured_tags]
+
+
 async def sync_remote_record_metadata(
     uploader,
     *,
@@ -203,20 +236,24 @@ async def sync_remote_record_metadata(
     category: str,
     color_theme: str,
     tags: str | list[str] | tuple[str, ...] | None,
+    sync_tags: bool = True,
 ) -> dict:
     remote_path = parse_remote_file_id_from_url(url) or ""
-    remote_tags = build_remote_tags(
-        width=width,
-        height=height,
-        wallpaper_type=wallpaper_type,
-        category=category,
-        color_theme=color_theme,
-        tags=tags,
+    remote_tags = (
+        build_remote_tags(
+            width=width,
+            height=height,
+            wallpaper_type=wallpaper_type,
+            category=category,
+            color_theme=color_theme,
+            tags=tags,
+        )
+        if sync_tags else []
     )
     synced = False
     error = ""
 
-    if remote_path and remote_tags:
+    if sync_tags and remote_path and remote_tags:
         try:
             await uploader.set_remote_tags(remote_path, remote_tags, action="set")
             synced = True

@@ -62,6 +62,27 @@ class AutoPilotConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((config["inactive_session_min"], config["inactive_session_max"]), (2, 10))
         self.assertEqual((config["inactive_interval_min"], config["inactive_interval_max"]), (120, 14400))
 
+    def test_update_config_keeps_storage_and_upload_profile_fields(self):
+        engine = AutoPilotEngine(data_dir=self.tmpdir)
+
+        config = engine.update_config({
+            "use_imgbed_upload": True,
+            "static_upload_profile": "compressed_webp",
+            "dynamic_upload_profile": "original_lossless",
+            "storage_auto_clean": True,
+            "storage_strategy": "keep_days",
+            "storage_keep_days": 14,
+            "storage_uploaded_only": False,
+        })
+
+        self.assertTrue(config["use_imgbed_upload"])
+        self.assertEqual(config["static_upload_profile"], "compressed_webp")
+        self.assertEqual(config["dynamic_upload_profile"], "original_lossless")
+        self.assertTrue(config["storage_auto_clean"])
+        self.assertEqual(config["storage_strategy"], "keep_days")
+        self.assertEqual(config["storage_keep_days"], 14)
+        self.assertFalse(config["storage_uploaded_only"])
+
     async def test_update_config_interrupts_waiting_sleep(self):
         engine = AutoPilotEngine(data_dir=self.tmpdir)
         engine._status = "running"
@@ -75,6 +96,43 @@ class AutoPilotConfigTests(unittest.IsolatedAsyncioTestCase):
 
         interrupted = await asyncio.wait_for(sleep_task, timeout=1)
         self.assertTrue(interrupted)
+
+    def test_get_status_includes_storage_cleanup_state(self):
+        engine = AutoPilotEngine(data_dir=self.tmpdir)
+        engine._record_storage_cleanup_state(
+            trigger="session",
+            skipped=False,
+            reason="将保留最新 500 张，其余符合条件的本地文件会被清理",
+            result={
+                "strategy": "keep_count",
+                "uploaded_only": True,
+                "deleted": 12,
+                "remaining": 88,
+                "total_eligible": 100,
+                "file_fail_count": 0,
+            },
+        )
+
+        status = engine.get_status()
+
+        self.assertIn("storage", status)
+        self.assertEqual(status["storage"]["strategy"], "keep_count")
+        self.assertEqual(status["storage"]["last_cleanup"]["deleted"], 12)
+        self.assertEqual(status["storage"]["last_cleanup"]["remaining"], 88)
+        self.assertFalse(status["storage"]["last_cleanup"]["skipped"])
+
+    def test_get_status_includes_storage_cleanup_skip_reason(self):
+        engine = AutoPilotEngine(data_dir=self.tmpdir)
+        engine._record_storage_cleanup_state(
+            trigger="session",
+            skipped=True,
+            reason="本次会话没有新增下载文件，已跳过自动清理",
+        )
+
+        status = engine.get_status()
+
+        self.assertTrue(status["storage"]["last_cleanup"]["skipped"])
+        self.assertIn("跳过", status["storage"]["last_cleanup"]["reason"])
 
 
 if __name__ == "__main__":

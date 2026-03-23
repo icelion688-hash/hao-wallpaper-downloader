@@ -273,6 +273,10 @@
                 <input type="checkbox" v-model="form.use_imgbed_upload" />
                 下载后自动上传到图床
               </label>
+              <label class="check-label" v-if="form.use_imgbed_upload">
+                <input type="checkbox" v-model="form.upload_with_tags" />
+                上传时同步标签到图床
+              </label>
             </div>
           </div>
 
@@ -374,6 +378,7 @@ function defaultForm() {
     vip_only: false,
     use_proxy: true,
     use_imgbed_upload: false,
+    upload_with_tags: true,
   }
 }
 
@@ -398,6 +403,7 @@ function configTags(t) {
   if (cfg.categories?.length) tags.push(cfg.categories.slice(0, 2).join(' · '))
   if (cfg.min_width)          tags.push(`宽≥${cfg.min_width}`)
   if (cfg.use_imgbed_upload === false) tags.push('仅本地保存')
+  if (cfg.use_imgbed_upload !== false && cfg.upload_with_tags === false) tags.push('上传不带标签')
   return tags
 }
 
@@ -540,6 +546,7 @@ function openCreate(sourceTask) {
       vip_only:           cfg.vip_only           || false,
       use_proxy:          cfg.use_proxy !== false,
       use_imgbed_upload:  cfg.use_imgbed_upload !== false,
+      upload_with_tags:   cfg.upload_with_tags !== false,
     }
     categoriesStr.value = (cfg.categories   || []).join(', ')
     blacklistStr.value  = (cfg.tag_blacklist || []).join(', ')
@@ -561,6 +568,7 @@ function openCreate(sourceTask) {
           vip_only:           p.vip_only           || false,
           use_proxy:          p.use_proxy !== false,
           use_imgbed_upload:  p.use_imgbed_upload === true,
+          upload_with_tags:   p.upload_with_tags !== false,
         }
         const savedCats = p.categories || []
         const isUuid = savedCats.length > 0 && savedCats[0].length === 32 && /^[0-9a-f]+$/.test(savedCats[0])
