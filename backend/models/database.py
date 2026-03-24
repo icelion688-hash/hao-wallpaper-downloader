@@ -50,6 +50,8 @@ def _migrate_db():
     migrations = [
         "ALTER TABLE wallpapers ADD COLUMN imgbed_url VARCHAR(512)",
         "ALTER TABLE wallpapers ADD COLUMN upload_records TEXT",
+        "ALTER TABLE wallpapers ADD COLUMN upload_status VARCHAR(32)",
+        "ALTER TABLE wallpapers ADD COLUMN upload_note VARCHAR(255)",
         "ALTER TABLE wallpapers ADD COLUMN type_id VARCHAR(64)",
         "ALTER TABLE wallpapers ADD COLUMN color_id VARCHAR(64)",
         "ALTER TABLE wallpapers ADD COLUMN favor_count INTEGER",

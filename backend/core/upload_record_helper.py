@@ -68,6 +68,27 @@ def dump_upload_records(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def infer_upload_state(
+    *,
+    imgbed_url: Optional[str],
+    upload_records: Optional[str],
+    upload_status: Optional[str] = None,
+    upload_note: Optional[str] = None,
+    is_original: Optional[bool] = None,
+    current_profile_only_original: bool = False,
+) -> tuple[str, str]:
+    explicit_status = str(upload_status or "").strip()
+    explicit_note = str(upload_note or "").strip()
+    has_remote = bool(str(imgbed_url or "").strip()) or bool(parse_upload_records(upload_records))
+    if has_remote:
+        return "uploaded", explicit_note
+    if explicit_status:
+        return explicit_status, explicit_note
+    if current_profile_only_original and is_original is False:
+        return "skipped", "当前文件是预览图，当前图床配置仅上传原图"
+    return "pending", explicit_note or "未上传到图床"
+
+
 def build_remote_file_url(base_url: str, remote_path: str) -> str:
     normalized_base = str(base_url or "").rstrip("/")
     normalized_path = str(remote_path or "").strip("/")

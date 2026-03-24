@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # 默认 challenge 接口地址
 DEFAULT_CHALLENGE_URL = "https://haowallpaper.com/link/pc/certify/challenge"
-# PoW 验证提交接口（POST ?payload=<base64_solution>）
+# PoW 验证提交接口（POST JSON {"payload": "<base64_solution>"}）
 VERIFY_URL = "https://haowallpaper.com/link/pc/certify/verify"
 
 
@@ -51,6 +51,21 @@ class AltchaSolver:
         extra_headers: Optional[dict] = None,
         ua: Optional[str] = None,
     ) -> Optional[str]:
+        solution, _ = await self.solve_detail(
+            client,
+            cookie,
+            extra_headers=extra_headers,
+            ua=ua,
+        )
+        return solution
+
+    async def solve_detail(
+        self,
+        client: httpx.AsyncClient,
+        cookie: str,
+        extra_headers: Optional[dict] = None,
+        ua: Optional[str] = None,
+    ) -> tuple[Optional[str], str]:
         """
         完整求解流程：获取 challenge → 计算 PoW → 返回 altcha 字段值
 
@@ -65,12 +80,14 @@ class AltchaSolver:
             失败时返回 None
         """
         headers = self._build_headers(cookie, extra_headers, ua=ua)
+        last_error = ""
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 # Step 1: 获取 challenge
-                challenge_data = await self._fetch_challenge(client, headers)
+                challenge_data, fetch_error = await self._fetch_challenge(client, headers)
                 if not challenge_data:
+                    last_error = fetch_error or "challenge 获取失败"
                     logger.warning(f"[Altcha] 第 {attempt} 次获取 challenge 失败")
                     continue
 
@@ -80,17 +97,19 @@ class AltchaSolver:
                 elapsed = time.perf_counter() - t0
 
                 if solution is None:
+                    last_error = "PoW 求解失败"
                     logger.warning(f"[Altcha] 第 {attempt} 次 PoW 求解失败")
                     continue
 
                 logger.info(f"[Altcha] PoW 求解成功，耗时 {elapsed:.3f}s，nonce={solution['number']}")
-                return self._encode_solution(solution)
+                return self._encode_solution(solution), ""
 
             except Exception as e:
+                last_error = str(e)
                 logger.error(f"[Altcha] 第 {attempt} 次异常: {e}")
 
         logger.error("[Altcha] 所有重试均失败")
-        return None
+        return None, last_error or "未知 altcha 异常"
 
     async def verify_download(
         self,
@@ -99,6 +118,21 @@ class AltchaSolver:
         extra_headers: Optional[dict] = None,
         ua: Optional[str] = None,
     ) -> bool:
+        verified, _ = await self.verify_download_detail(
+            client,
+            cookie,
+            extra_headers=extra_headers,
+            ua=ua,
+        )
+        return verified
+
+    async def verify_download_detail(
+        self,
+        client: httpx.AsyncClient,
+        cookie: str,
+        extra_headers: Optional[dict] = None,
+        ua: Optional[str] = None,
+    ) -> tuple[bool, str]:
         """
         完整验证流程：获取 challenge → 计算 PoW → POST /certify/verify
 
@@ -111,16 +145,21 @@ class AltchaSolver:
         Returns:
             True 表示验证成功，False 表示失败
         """
-        solution = await self.solve(client, cookie, extra_headers=extra_headers, ua=ua)
+        solution, solve_error = await self.solve_detail(
+            client,
+            cookie,
+            extra_headers=extra_headers,
+            ua=ua,
+        )
         if not solution:
             logger.error("[Altcha] verify_download: PoW 求解失败")
-            return False
+            return False, solve_error or "PoW 求解失败"
 
         headers = self._build_headers(cookie, extra=extra_headers, ua=ua)
         try:
             resp = await client.post(
                 VERIFY_URL,
-                params={"payload": solution},
+                json={"payload": solution},
                 headers=headers,
                 timeout=self.timeout,
             )
@@ -128,12 +167,15 @@ class AltchaSolver:
             data = resp.json()
             if data.get("status") == 200 and data.get("data") == "ok":
                 logger.info("[Altcha] 人机验证成功")
-                return True
+                return True, ""
             logger.warning("[Altcha] 验证接口返回非成功: %s", data)
-            return False
+            return False, str(data.get("msg") or "验证接口返回非成功")
+        except httpx.HTTPStatusError as e:
+            logger.error("[Altcha] verify_download HTTP 异常: %s", e)
+            return False, f"verify HTTP {e.response.status_code}"
         except Exception as e:
             logger.error("[Altcha] verify_download 异常: %s", e)
-            return False
+            return False, str(e)
 
     # ------------------------------------------------------------------ #
     #  内部方法
@@ -141,7 +183,7 @@ class AltchaSolver:
 
     async def _fetch_challenge(
         self, client: httpx.AsyncClient, headers: dict
-    ) -> Optional[dict]:
+    ) -> tuple[Optional[dict], str]:
         """GET challengeurl 获取 challenge 参数"""
         try:
             resp = await client.get(
@@ -162,16 +204,16 @@ class AltchaSolver:
             required = {"challenge", "salt", "algorithm"}
             if not required.issubset(data.keys()):
                 logger.error(f"[Altcha] challenge 响应缺少必要字段: {data}")
-                return None
+                return None, "challenge 响应缺少必要字段"
 
-            return data
+            return data, ""
 
         except httpx.HTTPStatusError as e:
             logger.error(f"[Altcha] challenge 请求失败: HTTP {e.response.status_code}")
-            return None
+            return None, f"challenge 请求失败: HTTP {e.response.status_code}"
         except Exception as e:
             logger.error(f"[Altcha] challenge 请求异常: {e}")
-            return None
+            return None, str(e)
 
     def _compute_pow(self, challenge_data: dict) -> Optional[dict]:
         """

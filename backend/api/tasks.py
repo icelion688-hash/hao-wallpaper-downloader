@@ -15,9 +15,11 @@ api/tasks.py — 任务管理 API
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import subprocess
+import time
 from collections import deque
 from datetime import datetime
 from typing import Optional, AsyncIterator
@@ -40,7 +42,7 @@ from backend.core.crawler import WallpaperCrawler
 from backend.core.downloader import Downloader
 from backend.core.dedup import DedupManager
 from backend.core.imgbed_uploader import ImgbedUploader
-from backend.core.upload_profiles import build_uploader_by_key
+from backend.core.upload_profiles import build_uploader_by_key, get_upload_profile, is_upload_profile_available
 from backend.config import load_config
 from backend.core.media_converter import MediaConverter
 from backend.core.site_auth import probe_login_status
@@ -124,6 +126,66 @@ def _get_wallpaper_orientation(item: dict) -> str:
     return "landscape" if width >= height else "portrait"
 
 
+def _classify_static_preview_fallback(
+    *,
+    account_type: str,
+    login_valid: Optional[bool],
+) -> str:
+    """
+    判断静态图未拿到原图时应如何处理。
+
+    返回值：
+      - invalid_login: 登录态无效，应终止并停用账号
+      - downgrade_preview: VIP 登录态仍有效，但只能拿到预览图，允许降级继续下载
+      - allow_preview: 非 VIP 账号正常使用预览图
+    """
+    if login_valid is False:
+        return "invalid_login"
+    if str(account_type or "").strip().lower() == "vip":
+        return "downgrade_preview"
+    return "allow_preview"
+
+
+def _summarize_original_failure_reason(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    if not normalized:
+        return "原因未知"
+    if normalized.startswith("原图链路冷却中"):
+        return normalized
+    if "challenge 请求失败: HTTP 305" in normalized:
+        return "altcha challenge 被站点限流(305)"
+    if "verify HTTP 305" in normalized:
+        return "altcha verify 被站点限流(305)"
+    if "getCompleteUrl HTTP 305" in normalized or "getCompleteUrl status=305" in normalized:
+        return "getCompleteUrl 被站点限流(305)"
+    if "altcha" in normalized.lower():
+        return normalized
+    if "getCompleteUrl" in normalized:
+        return normalized
+    return normalized
+
+
+def _should_skip_original_retry(reason: str) -> bool:
+    normalized = str(reason or "").strip()
+    return normalized.startswith("原图链路冷却中") or "challenge 请求失败: HTTP 305" in normalized
+
+
+def _determine_original_cooldown_seconds(reason: str) -> int:
+    normalized = str(reason or "").strip()
+    if "challenge 请求失败: HTTP 305" in normalized:
+        return 180
+    if "verify HTTP 305" in normalized:
+        return 120
+    if "getCompleteUrl HTTP 305" in normalized or "getCompleteUrl status=305" in normalized:
+        return 90
+    return 0
+
+
+def _build_original_cooldown_message(reason: str, remaining_seconds: float) -> str:
+    seconds = max(1, int(math.ceil(max(0.0, remaining_seconds))))
+    return f"原图链路冷却中，剩余 {seconds} 秒 | {_summarize_original_failure_reason(reason)}"
+
+
 def _should_diversify_static_orientations(cfg: FilterConfig) -> bool:
     """仅在静态图 + 全部方向时启用横竖图补齐。"""
     return cfg.wallpaper_type == "static" and cfg.screen_orientation == "all"
@@ -141,6 +203,51 @@ def _resolve_upload_profile_key(
     if normalized_type == "dynamic":
         return dynamic_key or static_key or fallback_profile_key
     return static_key or dynamic_key or fallback_profile_key
+
+
+def _resolve_active_upload_profile_key(
+    task_config: dict,
+    wallpaper_type: str,
+    *,
+    fallback_profile_key: str = "",
+    profile_available_checker=None,
+) -> tuple[str, str]:
+    preferred_key = _resolve_upload_profile_key(
+        task_config,
+        wallpaper_type,
+        fallback_profile_key=fallback_profile_key,
+    )
+    checker = profile_available_checker or is_upload_profile_available
+    if preferred_key and checker(preferred_key):
+        return preferred_key, ""
+    if (
+        preferred_key
+        and fallback_profile_key
+        and fallback_profile_key != preferred_key
+        and checker(fallback_profile_key)
+    ):
+        return fallback_profile_key, preferred_key
+    return preferred_key, ""
+
+
+def _is_original_only_upload_profile(profile_key: str) -> bool:
+    profile = get_upload_profile(profile_key)
+    upload_filter = profile.get("upload_filter", {}) if isinstance(profile, dict) else {}
+    return bool(upload_filter.get("only_original", False))
+
+
+def _resolve_upload_channel_override(
+    task_config: dict,
+    wallpaper_type: str,
+) -> tuple[str, str]:
+    static_channel = str(task_config.get("static_upload_channel") or "").strip()
+    static_channel_name = str(task_config.get("static_upload_channel_name") or "").strip()
+    dynamic_channel = str(task_config.get("dynamic_upload_channel") or "").strip()
+    dynamic_channel_name = str(task_config.get("dynamic_upload_channel_name") or "").strip()
+    normalized_type = str(wallpaper_type or "static").strip().lower()
+    if normalized_type == "dynamic":
+        return dynamic_channel, dynamic_channel_name
+    return static_channel, static_channel_name
 
 
 def _resolve_source_scopes(cfg: FilterConfig) -> list[str]:
@@ -288,6 +395,7 @@ class CreateTaskRequest(BaseModel):
     concurrency: int = 3
     vip_only: bool = False
     use_proxy: bool = True
+    strict_original: bool = False
     use_imgbed_upload: bool = False
     upload_with_tags: bool = True
 
@@ -343,6 +451,7 @@ async def create_task(body: CreateTaskRequest, db: Session = Depends(get_db)):
         concurrency=body.concurrency,
         vip_only=body.vip_only,
         use_proxy=body.use_proxy,
+        strict_original=body.strict_original,
     )
     task = Task(name=body.name, status="pending", total_count=body.max_count)
     task_config = cfg.to_dict()
@@ -510,6 +619,9 @@ async def _execute_task(
     # 用列表以便嵌套闭包直接修改（无需 nonlocal）
     # 站点每次 altcha 验证仅允许 2 次 getCompleteUrl，满 2 次须重新验证
     _altcha_use_count = [0]
+    _original_cooldown_until = [0.0]
+    _original_cooldown_reason = [""]
+    _session_end_requested = [False]
     _account_clients: dict[int, httpx.AsyncClient] = {}  # 保留兼容，finally 统一关闭
 
     # 任务级 Session Profile：整个任务使用同一 UA/sec-ch-ua/平台，保持浏览器指纹一致性
@@ -526,9 +638,11 @@ async def _execute_task(
             "upload_with_tags",
             getattr(uploader, "sync_remote_tags", True) if uploader else True,
         )
+        strict_original = bool(task.config.get("strict_original", cfg.strict_original))
         effective_uploader = uploader if upload_enabled else None
         default_profile_key = getattr(effective_uploader, "profile_key", "") if effective_uploader else ""
         created_uploaders: dict[str, ImgbedUploader] = {}
+        upload_profile_warning_keys: set[str] = set()
         resume_start_page = max(1, int(task.config.get("_resume_start_page", 1) or 1))
 
         def log(msg: str):
@@ -590,15 +704,75 @@ async def _execute_task(
                 "dynamic",
                 fallback_profile_key=default_profile_key,
             )
-            if static_profile_key == dynamic_profile_key:
-                log(f"上传 Profile: {static_profile_key or '未指定'}")
+            static_active_profile_key, static_fallback_from = _resolve_active_upload_profile_key(
+                task.config,
+                "static",
+                fallback_profile_key=default_profile_key,
+            )
+            dynamic_active_profile_key, dynamic_fallback_from = _resolve_active_upload_profile_key(
+                task.config,
+                "dynamic",
+                fallback_profile_key=default_profile_key,
+            )
+            static_channel, static_channel_name = _resolve_upload_channel_override(task.config, "static")
+            dynamic_channel, dynamic_channel_name = _resolve_upload_channel_override(task.config, "dynamic")
+            static_channel_label = static_channel or "跟随 Profile"
+            dynamic_channel_label = dynamic_channel or "跟随 Profile"
+            if static_channel_name:
+                static_channel_label = f"{static_channel_label}/{static_channel_name}"
+            if dynamic_channel_name:
+                dynamic_channel_label = f"{dynamic_channel_label}/{dynamic_channel_name}"
+            if static_fallback_from:
+                log(
+                    f"上传 Profile 不可用，静态图已回退到默认图床: "
+                    f"{static_fallback_from} -> {static_active_profile_key}"
+                )
+            elif static_profile_key and not is_upload_profile_available(static_profile_key):
+                log(f"上传 Profile 不可用，静态图将跳过图床上传: {static_profile_key}")
+            if dynamic_fallback_from and dynamic_fallback_from != static_fallback_from:
+                log(
+                    f"上传 Profile 不可用，动态图已回退到默认图床: "
+                    f"{dynamic_fallback_from} -> {dynamic_active_profile_key}"
+                )
+            elif (
+                dynamic_profile_key
+                and dynamic_profile_key != static_profile_key
+                and not is_upload_profile_available(dynamic_profile_key)
+            ):
+                log(f"上传 Profile 不可用，动态图将跳过图床上传: {dynamic_profile_key}")
+            if (
+                static_active_profile_key == dynamic_active_profile_key
+                and static_channel_label == dynamic_channel_label
+            ):
+                log(
+                    f"上传 Profile: {static_active_profile_key or static_profile_key or '未指定'} | "
+                    f"渠道: {static_channel_label}"
+                )
             else:
                 log(
-                    f"上传 Profile: 静态图={static_profile_key or '未指定'} / "
-                    f"动态图={dynamic_profile_key or '未指定'}"
+                    f"上传策略: 静态图={static_active_profile_key or static_profile_key or '未指定'} @ {static_channel_label} / "
+                    f"动态图={dynamic_active_profile_key or dynamic_profile_key or '未指定'} @ {dynamic_channel_label}"
+                )
+            risky_profiles = []
+            if not strict_original:
+                if static_active_profile_key and _is_original_only_upload_profile(static_active_profile_key):
+                    risky_profiles.append(f"静态图={static_active_profile_key}")
+                if dynamic_active_profile_key and _is_original_only_upload_profile(dynamic_active_profile_key):
+                    marker = f"动态图={dynamic_active_profile_key}"
+                    if marker not in risky_profiles:
+                        risky_profiles.append(marker)
+            if risky_profiles:
+                log(
+                    "提醒: 当前允许预览图降级，但上传 Profile 仅接收原图，"
+                    f"降级后的文件会只保存在本地，不会上传图床（{' / '.join(risky_profiles)}）"
                 )
         else:
             log("图床上传: 已关闭，仅保存到本地")
+        log(
+            "原图策略: 严格原图，未拿到原图则跳过资源"
+            if strict_original
+            else "原图策略: 允许降级预览图"
+        )
 
         sem = asyncio.Semaphore(cfg.concurrency)
         # 动态视频单张 50-100 MB，并发下载占用大量带宽，独立限制最多 2 个并发
@@ -608,18 +782,38 @@ async def _execute_task(
         # _shared_client / _shared_altcha_verified 已在函数顶部初始化
         _altcha_lock = asyncio.Lock()
 
-        async def _ensure_altcha_ready(cookie: str) -> bool:
+        def _get_original_cooldown_message() -> str:
+            remaining = _original_cooldown_until[0] - time.monotonic()
+            if remaining <= 0:
+                return ""
+            return _build_original_cooldown_message(_original_cooldown_reason[0], remaining)
+
+        def _apply_original_cooldown(reason: str) -> int:
+            cooldown_seconds = _determine_original_cooldown_seconds(reason)
+            if cooldown_seconds <= 0:
+                return 0
+            until = time.monotonic() + cooldown_seconds
+            current_until = _original_cooldown_until[0]
+            _original_cooldown_until[0] = max(current_until, until)
+            _original_cooldown_reason[0] = reason
+            return cooldown_seconds
+
+        async def _ensure_altcha_ready(cookie: str) -> tuple[bool, str]:
             """确保共享 client 已通过 altcha 验证。
             altcha challenge 有 IP 级频率限制，多账号轮询时不能每账号独立验证。
             返回 True=已验证可用 skip_altcha，False=验证失败只能用 previewFileImg。
             """
             nonlocal _shared_altcha_verified
             if _shared_altcha_verified:
-                return True
+                return True, ""
             async with _altcha_lock:
                 if _shared_altcha_verified:  # double-check after lock
-                    return True
-                verified = await captcha.verify_download(
+                    return True, ""
+                cooldown_msg = _get_original_cooldown_message()
+                if cooldown_msg:
+                    logger.info("[Task] %s", cooldown_msg)
+                    return False, cooldown_msg
+                verified, verify_reason = await captcha.verify_download_detail(
                     _shared_client, cookie, ua=_session_profile["ua"]
                 )
                 if verified:
@@ -630,8 +824,15 @@ async def _execute_task(
                     # 避免 verify→getCompleteUrl 时序过于精确被 WAF 识别为自动化
                     await asyncio.sleep(random.uniform(0.8, 2.0))
                 else:
-                    logger.warning("[Task] altcha 验证失败")
-                return _shared_altcha_verified
+                    logger.warning("[Task] altcha 验证失败: %s", verify_reason)
+                    cooldown_seconds = _apply_original_cooldown(verify_reason)
+                    if cooldown_seconds > 0:
+                        log(
+                            f"原图链路进入冷却 {cooldown_seconds} 秒："
+                            f"{_summarize_original_failure_reason(verify_reason)}"
+                        )
+                    return False, verify_reason
+                return _shared_altcha_verified, ""
 
         async def invalidate_altcha() -> None:
             """重置 altcha 会话，下次 _ensure_altcha_ready 将强制重新验证。
@@ -646,22 +847,64 @@ async def _execute_task(
         def resolve_item_uploader(item: dict) -> Optional[ImgbedUploader]:
             if not upload_enabled:
                 return None
-            profile_key = _resolve_upload_profile_key(
+            wallpaper_type = item.get("wallpaper_type", "static")
+            profile_key, fallback_from = _resolve_active_upload_profile_key(
                 task.config,
-                item.get("wallpaper_type", "static"),
+                wallpaper_type,
                 fallback_profile_key=default_profile_key,
+            )
+            channel_override, channel_name_override = _resolve_upload_channel_override(
+                task.config,
+                wallpaper_type,
             )
             if not profile_key:
                 return effective_uploader
-            if effective_uploader and effective_uploader.profile_key == profile_key:
+            if (
+                effective_uploader
+                and effective_uploader.profile_key == profile_key
+                and (
+                    not channel_override
+                    or (
+                        effective_uploader.channel == channel_override
+                        and effective_uploader.channel_name == channel_name_override
+                    )
+                )
+            ):
                 return effective_uploader
-            cached = created_uploaders.get(profile_key)
+            cache_key = "::".join([
+                profile_key,
+                channel_override or "",
+                channel_name_override or "",
+            ])
+            cached = created_uploaders.get(cache_key)
             if cached:
                 return cached
-            built = build_uploader_by_key(profile_key)
+            overrides = {}
+            if channel_override:
+                overrides["channel"] = channel_override
+            if channel_name_override:
+                overrides["channel_name"] = channel_name_override
+            built = build_uploader_by_key(profile_key, overrides=overrides or None)
             if built:
-                created_uploaders[profile_key] = built
-            return built
+                created_uploaders[cache_key] = built
+                if fallback_from:
+                    warning_key = "::".join([wallpaper_type, fallback_from, profile_key])
+                    if warning_key not in upload_profile_warning_keys:
+                        upload_profile_warning_keys.add(warning_key)
+                        log(
+                            f"上传 Profile 不可用，{wallpaper_type} 已自动回退: "
+                            f"{fallback_from} -> {profile_key}"
+                        )
+                return built
+            if profile_key:
+                warning_key = "::".join([wallpaper_type, profile_key, channel_override or "", channel_name_override or ""])
+                if warning_key not in upload_profile_warning_keys:
+                    upload_profile_warning_keys.add(warning_key)
+                    log(
+                        f"上传 Profile 不可用，{wallpaper_type} 将跳过图床上传: "
+                        f"{profile_key}"
+                    )
+            return None
 
         async def process_one(item: dict):
             _is_dynamic = item.get("wallpaper_type") == "dynamic"
@@ -715,13 +958,15 @@ async def _execute_task(
                             "is_original":  False,
                         }
                     else:
-                        altcha_ok = await _ensure_altcha_ready(account.cookie)
+                        altcha_ok, altcha_reason = await _ensure_altcha_ready(account.cookie)
                         detail = await crawler.fetch_detail(
                             _shared_client, account.cookie, resource_id,
                             file_id=item.get("file_id", ""),
                             wallpaper_type_id=1 if item.get("wallpaper_type") == "static" else 3,
                             skip_altcha=altcha_ok,
                             session_profile=_session_profile,
+                            attempt_original=altcha_ok,
+                            original_failure_reason=altcha_reason,
                         )
 
                     if not detail or not detail.get("download_url"):
@@ -749,33 +994,56 @@ async def _execute_task(
                         _url_ext = "mp4" if item.get("wallpaper_type") == "dynamic" else "jpg"
                     # 判断是否为原图：getCompleteUrl 返回的 CDN 签名直链含 zfts.haowallpaper.com
                     _is_original_dl = bool(detail.get("is_original"))
+                    _original_failure_reason = str(detail.get("original_failure_reason") or "").strip()
                     # VIP 未拿到原图时，先重置 altcha 重试一次（静态图 + 动态图均适用）
                     # 站点每次 altcha 验证仅允许 2 次 getCompleteUrl（305/3004），重验可恢复
                     _wtype = item.get("wallpaper_type", "static")
                     _wtype_id = 3 if _wtype == "dynamic" else 1
                     if _wtype in ("static", "dynamic") and not _is_original_dl and account.account_type == "vip":
-                        log(f"VIP 未获原图（可能 altcha session 耗尽），重置重试: {resource_id}")
-                        await invalidate_altcha()
-                        altcha_ok_retry = await _ensure_altcha_ready(account.cookie)
-                        detail_retry = await crawler.fetch_detail(
-                            _shared_client, account.cookie, resource_id,
-                            file_id=item.get("file_id", ""),
-                            wallpaper_type_id=_wtype_id,
-                            skip_altcha=altcha_ok_retry,
-                            session_profile=_session_profile,
-                        )
-                        if detail_retry and detail_retry.get("is_original"):
-                            detail = detail_retry
-                            _is_original_dl = True
-                            _dl_url = detail["download_url"]
-                            _url_ext = os.path.splitext(_dl_url.split("?")[0])[1].lstrip(".")
-                            if not _url_ext:
-                                _url_ext = "mp4" if _wtype == "dynamic" else "jpg"
-                            log(f"altcha 重验后成功获原图: {resource_id}")
+                        cooldown_seconds = _apply_original_cooldown(_original_failure_reason)
+                        if cooldown_seconds > 0:
+                            log(
+                                f"原图链路进入冷却 {cooldown_seconds} 秒："
+                                f"{_summarize_original_failure_reason(_original_failure_reason)}"
+                            )
+                        _reason_summary = _summarize_original_failure_reason(_original_failure_reason)
+                        if _should_skip_original_retry(_original_failure_reason):
+                            log(f"VIP 未获原图（{_reason_summary}），本轮跳过重试: {resource_id}")
+                        else:
+                            log(f"VIP 未获原图（{_reason_summary}），重置重试: {resource_id}")
+                            await invalidate_altcha()
+                            altcha_ok_retry, altcha_retry_reason = await _ensure_altcha_ready(account.cookie)
+                            detail_retry = await crawler.fetch_detail(
+                                _shared_client, account.cookie, resource_id,
+                                file_id=item.get("file_id", ""),
+                                wallpaper_type_id=_wtype_id,
+                                skip_altcha=altcha_ok_retry,
+                                session_profile=_session_profile,
+                                attempt_original=altcha_ok_retry,
+                                original_failure_reason=altcha_retry_reason,
+                            )
+                            if detail_retry and detail_retry.get("is_original"):
+                                detail = detail_retry
+                                _is_original_dl = True
+                                _dl_url = detail["download_url"]
+                                _url_ext = os.path.splitext(_dl_url.split("?")[0])[1].lstrip(".")
+                                if not _url_ext:
+                                    _url_ext = "mp4" if _wtype == "dynamic" else "jpg"
+                                log(f"altcha 重验后成功获原图: {resource_id}")
+                            else:
+                                _original_failure_reason = str(
+                                    (detail_retry or {}).get("original_failure_reason")
+                                    or _original_failure_reason
+                                ).strip()
 
+                    preview_policy = "allow_preview"
                     if item.get("wallpaper_type") == "static" and not _is_original_dl:
                         login_valid, login_msg = await probe_login_status(_shared_client, account.cookie)
-                        if login_valid is False:
+                        preview_policy = _classify_static_preview_fallback(
+                            account_type=account.account_type,
+                            login_valid=login_valid,
+                        )
+                        if preview_policy == "invalid_login":
                             account.is_active = False
                             db.commit()
                             task.failed_count += 1
@@ -784,13 +1052,23 @@ async def _execute_task(
                             log(f"失败(账号登录态失效): {resource_id} | account={account.id} | {login_msg}")
                             await pool.release(account, success=False, consume_quota=False)
                             return
-                        if account.account_type == "vip":
-                            task.failed_count += 1
-                            task.update_progress()
-                            db.commit()
-                            log(f"失败(VIP重试后仍未拿到原图): {resource_id} | account={account.id}")
-                            await pool.release(account, success=False, consume_quota=False)
-                            return
+                    if strict_original and not _is_original_dl:
+                        task.skip_count += 1
+                        task.update_progress()
+                        db.commit()
+                        log(
+                            f"跳过(严格原图模式，仅接受原图): {resource_id} | "
+                            f"{_summarize_original_failure_reason(_original_failure_reason)}"
+                        )
+                        await pool.release(account, success=False, consume_quota=False)
+                        return
+                    if item.get("wallpaper_type") == "static" and not _is_original_dl:
+                        if preview_policy == "downgrade_preview":
+                            _reason_summary = _summarize_original_failure_reason(_original_failure_reason)
+                            log(
+                                f"警告(VIP未拿到原图，原因: {_reason_summary}，已降级预览图下载): "
+                                f"{resource_id} | account={account.id}"
+                            )
                     if _tags:
                         _label = "_".join(_tags[:2])
                         _fname = f"{_label}_{_w}x{_h}.{_url_ext}" if (_w and _h) else f"{_label}.{_url_ext}"
@@ -843,6 +1121,8 @@ async def _execute_task(
                     # 上传到图床（失败不影响下载流程）
                     _imgbed_url = None
                     _upload_records = None
+                    _upload_status = "disabled" if not upload_enabled else "pending"
+                    _upload_note = "任务未启用图床上传" if not upload_enabled else "等待上传结果"
                     item_uploader = resolve_item_uploader(item)
                     if item_uploader:
                         _reused_record = find_reusable_upload_record(
@@ -892,21 +1172,33 @@ async def _execute_task(
                                 uploaded_at=_reused_record.get("uploaded_at"),
                                 source_server=_reused_record.get("source_server"),
                             )
+                            _upload_status = "uploaded"
+                            _upload_note = "复用现有图床链接"
                             log(f"图床上传复用成功: {_imgbed_url}")
                         else:
-                            _imgbed_url = await item_uploader.upload(
-                                abs_path,
-                                width=item.get("width"),
-                                height=item.get("height"),
-                                wallpaper_type=item.get("wallpaper_type", "static"),
-                                category=_category or "",
-                                type_id=_type_id or "",
-                                color_theme=_color_name or "",
-                                color_id=_color_id or "",
-                                tags=item.get("tags", ""),
-                                resource_id=resource_id,
-                                is_original=_is_original_dl,
+                            _can_upload, _skip_reason = item_uploader.check_upload_eligibility(
+                                item.get("width"),
+                                item.get("height"),
+                                _is_original_dl,
                             )
+                            if not _can_upload:
+                                _upload_status = "skipped"
+                                _upload_note = _skip_reason
+                                log(f"图床上传跳过: {resource_id} | {_skip_reason}")
+                            else:
+                                _imgbed_url = await item_uploader.upload(
+                                    abs_path,
+                                    width=item.get("width"),
+                                    height=item.get("height"),
+                                    wallpaper_type=item.get("wallpaper_type", "static"),
+                                    category=_category or "",
+                                    type_id=_type_id or "",
+                                    color_theme=_color_name or "",
+                                    color_id=_color_id or "",
+                                    tags=item.get("tags", ""),
+                                    resource_id=resource_id,
+                                    is_original=_is_original_dl,
+                                )
                             if _imgbed_url:
                                 if item_uploader.profile_key:
                                     _remote_meta = await sync_remote_record_metadata(
@@ -942,9 +1234,16 @@ async def _execute_task(
                                         channel=item_uploader.channel,
                                         uploaded_at=_record.get("uploaded_at"),
                                     )
+                                _upload_status = "uploaded"
+                                _upload_note = "图床上传成功"
                                 log(f"图床上传成功: {_imgbed_url}")
-                            else:
+                            elif _upload_status == "pending":
+                                _upload_status = "failed"
+                                _upload_note = "图床上传失败"
                                 log(f"图床上传失败（不影响本地存储）: {resource_id}")
+                    elif upload_enabled:
+                        _upload_status = "skipped"
+                        _upload_note = "上传 Profile 不可用"
 
                     # 创建壁纸记录
                     _actual_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else None
@@ -984,6 +1283,8 @@ async def _execute_task(
                         video_duration=_video_duration,
                         imgbed_url=_imgbed_url,
                         upload_records=_upload_records,
+                        upload_status=_upload_status,
+                        upload_note=_upload_note,
                         status="done",
                     )
                     db.add(wallpaper)
@@ -1064,10 +1365,16 @@ async def _execute_task(
                     # pool.release 在前：账号尽早归还，不因延迟占用
                     if human_ctrl:
                         human_ctrl.record_download()
-                        _continue = await human_ctrl.post_download_delay(task.success_count)
+                        _continue = await human_ctrl.post_download_delay(
+                            task.success_count,
+                            announce=log,
+                        )
                         if not _continue:
-                            # 层 4 会话结束模拟：长时间暂停后本次迭代继续（下载已完成，只是等待）
-                            log("会话结束模拟完毕，恢复下载")
+                            _session_end_requested[0] = True
+                            log(
+                                "会话结束模拟触发：本轮提前收束，"
+                                "后续交由调度器安排下一次会话"
+                            )
 
                 except asyncio.CancelledError:
                     raise
@@ -1090,12 +1397,13 @@ async def _execute_task(
         selected_candidates: list[dict] = []
         candidate_pool: list[dict] = []
         diversify_static_orientations = _should_diversify_static_orientations(cfg)
-        orientation_scan_limit = max(effective_max, _STATIC_ORIENTATION_SCAN_LIMIT)
         source_scopes = _resolve_source_scopes(cfg)
         primary_source_scope = source_scopes[0]
         last_scanned_page = resume_start_page
         stopped_early = False
         wrapped_scan = False
+        current_resume_page = resume_start_page
+        replenish_round = 0
 
         def flush_prefilter_logs(force: bool = False) -> None:
             nonlocal pending_prefilter_skip, pending_prefilter_existing
@@ -1179,19 +1487,22 @@ async def _execute_task(
                     stopped_early = True
                     return False
 
+                needed_count = max(1, effective_max - task.success_count)
+
                 if not diversify_static_orientations:
-                    if len(source_scopes) == 1 and len(candidate_pool) >= effective_max:
+                    if len(source_scopes) == 1 and len(candidate_pool) >= needed_count:
                         stopped_early = True
                         return False
                     continue
 
-                if len(candidate_pool) < effective_max:
+                if len(candidate_pool) < needed_count:
                     continue
 
                 if _has_mixed_static_orientations(candidate_pool):
                     stopped_early = True
                     return False
 
+                orientation_scan_limit = max(needed_count, _STATIC_ORIENTATION_SCAN_LIMIT)
                 if len(candidate_pool) >= orientation_scan_limit:
                     flush_prefilter_logs(force=True)
                     log(
@@ -1214,74 +1525,121 @@ async def _execute_task(
         try:
             if len(source_scopes) > 1:
                 log(f"资源入口: 同时扫描 {' / '.join(source_scopes)}")
+            while task.status == "running" and task.success_count < effective_max:
+                replenish_round += 1
+                needed_count = max(1, effective_max - task.success_count)
+                selected_candidates = []
+                candidate_pool = []
+                last_scanned_page = current_resume_page
+                stopped_early = False
+                wrapped_scan = False
 
-            for index, source_scope in enumerate(source_scopes):
-                scope_resume_page = resume_start_page if index == 0 else 1
-                per_scope_limit = effective_max if len(source_scopes) > 1 else None
-                fully_scanned = await scan_candidate_range(
-                    source_scope=source_scope,
-                    start_page=scope_resume_page,
-                    max_candidates_for_scope=per_scope_limit,
-                )
-                if (
-                    index == 0
-                    and fully_scanned
-                    and task.status == "running"
-                    and resume_start_page > 1
-                    and len(candidate_pool) < effective_max
-                ):
-                    wrapped_scan = True
-                    log(
-                        f"查询游标已到末页: 从第 1 页回补到第 {resume_start_page - 1} 页"
-                    )
-                    await scan_candidate_range(
+                for index, source_scope in enumerate(source_scopes):
+                    scope_resume_page = current_resume_page if index == 0 else 1
+                    per_scope_limit = needed_count if len(source_scopes) > 1 else None
+                    fully_scanned = await scan_candidate_range(
                         source_scope=source_scope,
-                        start_page=1,
-                        end_page=resume_start_page - 1,
+                        start_page=scope_resume_page,
                         max_candidates_for_scope=per_scope_limit,
                     )
+                    if (
+                        index == 0
+                        and fully_scanned
+                        and task.status == "running"
+                        and current_resume_page > 1
+                        and len(candidate_pool) < needed_count
+                    ):
+                        wrapped_scan = True
+                        log(
+                            f"查询游标已到末页: 从第 1 页回补到第 {current_resume_page - 1} 页"
+                        )
+                        await scan_candidate_range(
+                            source_scope=source_scope,
+                            start_page=1,
+                            end_page=current_resume_page - 1,
+                            max_candidates_for_scope=per_scope_limit,
+                        )
+                    if task.status != "running":
+                        break
+
+                flush_prefilter_logs(force=True)
+
+                next_resume_page = 1 if not stopped_early else max(1, last_scanned_page)
+                update_runtime_config(
+                    _resume_start_page=resume_start_page,
+                    _resume_next_page=next_resume_page,
+                    _resume_wrapped=wrapped_scan,
+                )
+                current_resume_page = next_resume_page
+
+                if diversify_static_orientations:
+                    selected_candidates = _select_diversified_candidates(candidate_pool, needed_count)
+                    selected_portraits = sum(
+                        1 for item in selected_candidates
+                        if _get_wallpaper_orientation(item) == "portrait"
+                    )
+                    selected_landscapes = sum(
+                        1 for item in selected_candidates
+                        if _get_wallpaper_orientation(item) == "landscape"
+                    )
+                    if selected_portraits and selected_landscapes:
+                        log(
+                            f"方向补齐成功: 候选池 {len(candidate_pool)} 张 | "
+                            f"已选横图 {selected_landscapes} 张、竖图 {selected_portraits} 张"
+                        )
+                else:
+                    selected_candidates = candidate_pool[:needed_count]
+
+                if not selected_candidates:
+                    if task.success_count == 0:
+                        log("候选不足: 当前未找到可实际下载的新图片")
+                    else:
+                        log(
+                            f"补齐结束: 已成功下载 {task.success_count} 张，"
+                            "后续未找到更多可下载的新图片"
+                        )
+                    break
+
+                if len(selected_candidates) < needed_count:
+                    log(
+                        f"候选不足: 本轮仅找到 {len(selected_candidates)} 张可补齐候选，"
+                        f"仍需 {needed_count} 张"
+                    )
+
+                before_success = task.success_count
+                worker_tasks = [
+                    asyncio.create_task(process_one(item))
+                    for item in selected_candidates
+                ]
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+
                 if task.status != "running":
                     break
 
-            flush_prefilter_logs(force=True)
-
-            next_resume_page = 1 if not stopped_early else max(1, last_scanned_page)
-            update_runtime_config(
-                _resume_start_page=resume_start_page,
-                _resume_next_page=next_resume_page,
-                _resume_wrapped=wrapped_scan,
-            )
-
-            if diversify_static_orientations:
-                selected_candidates = _select_diversified_candidates(candidate_pool, effective_max)
-                selected_portraits = sum(
-                    1 for item in selected_candidates
-                    if _get_wallpaper_orientation(item) == "portrait"
-                )
-                selected_landscapes = sum(
-                    1 for item in selected_candidates
-                    if _get_wallpaper_orientation(item) == "landscape"
-                )
-                if selected_portraits and selected_landscapes:
+                if _session_end_requested[0]:
                     log(
-                        f"方向补齐成功: 候选池 {len(candidate_pool)} 张 | "
-                        f"已选横图 {selected_landscapes} 张、竖图 {selected_portraits} 张"
+                        f"会话收束: 已成功下载 {task.success_count}/{effective_max} 张，"
+                        "本轮提前结束"
                     )
-            else:
-                selected_candidates = candidate_pool[:effective_max]
+                    break
 
-            if len(selected_candidates) < effective_max:
-                task.total_count = len(selected_candidates)
-                db.commit()
-                log(
-                    f"候选不足: 仅找到 {len(selected_candidates)} 张符合条件且未下载的图片"
-                )
+                if task.success_count >= effective_max:
+                    break
 
-            worker_tasks = [
-                asyncio.create_task(process_one(item))
-                for item in selected_candidates
-            ]
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
+                if task.success_count == before_success:
+                    cooldown_message = _get_original_cooldown_message()
+                    log(
+                        f"下载补齐未命中: 本轮新增 0 张，当前仍需 "
+                        f"{effective_max - task.success_count} 张"
+                    )
+                    if cooldown_message:
+                        log(f"补齐停止: {cooldown_message}")
+                        break
+                else:
+                    log(
+                        f"下载补齐继续: 已成功 {task.success_count}/{effective_max} 张，"
+                        "继续向后扫描"
+                    )
 
         finally:
             # 爬取列表只读数据，不消耗下载配额

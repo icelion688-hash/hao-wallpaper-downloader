@@ -62,6 +62,9 @@ class FilterConfig:
     # 是否启用代理
     use_proxy: bool = True
 
+    # 严格原图模式：未拿到原图则跳过，不接受预览图降级
+    strict_original: bool = False
+
     @classmethod
     def from_dict(cls, d: dict) -> "FilterConfig":
         """从字典反序列化（来自任务配置 JSON）"""
@@ -82,6 +85,7 @@ class FilterConfig:
             concurrency=d.get("concurrency", 3),
             vip_only=d.get("vip_only", False),
             use_proxy=d.get("use_proxy", True),
+            strict_original=d.get("strict_original", False),
         )
 
     def to_dict(self) -> dict:
@@ -103,6 +107,7 @@ class FilterConfig:
             "concurrency": self.concurrency,
             "vip_only": self.vip_only,
             "use_proxy": self.use_proxy,
+            "strict_original": self.strict_original,
         }
 
 

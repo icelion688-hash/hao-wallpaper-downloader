@@ -18,6 +18,12 @@
           <span class="active-tag" v-if="filters.wallpaper_type" @click="setFilter('wallpaper_type', '')">
             {{ filters.wallpaper_type === 'static' ? '静态' : '动态' }} ×
           </span>
+          <span class="active-tag" v-if="filters.original_quality" @click="setFilter('original_quality', '')">
+            {{ filters.original_quality === 'original' ? '原图' : '预览图' }} ×
+          </span>
+          <span class="active-tag" v-if="filters.upload_state" @click="setFilter('upload_state', '')">
+            {{ filters.upload_state === 'uploaded' ? '已上传图床' : '未上传图床' }} ×
+          </span>
           <span class="active-tag" v-if="filters.category" @click="setFilter('category', '')">
             {{ filters.category }} ×
           </span>
@@ -76,6 +82,26 @@
             <button class="chip" :class="{ 'chip--active': filters.min_height === 2160 }" @click="setResolution(2160, '4K')">
               <span class="chip-icon res-dot res-dot--4k"></span>4K+
             </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="filter-row">
+        <div class="filter-group">
+          <span class="filter-label">画质</span>
+          <div class="chip-group">
+            <button class="chip" :class="{ 'chip--active': !filters.original_quality }" @click="setFilter('original_quality', '')">全部</button>
+            <button class="chip" :class="{ 'chip--active': filters.original_quality === 'original' }" @click="setFilter('original_quality', 'original')">原图</button>
+            <button class="chip" :class="{ 'chip--active': filters.original_quality === 'preview' }" @click="setFilter('original_quality', 'preview')">预览图</button>
+          </div>
+        </div>
+        <div class="filter-divider"></div>
+        <div class="filter-group">
+          <span class="filter-label">图床状态</span>
+          <div class="chip-group">
+            <button class="chip" :class="{ 'chip--active': !filters.upload_state }" @click="setFilter('upload_state', '')">全部</button>
+            <button class="chip" :class="{ 'chip--active': filters.upload_state === 'uploaded' }" @click="setFilter('upload_state', 'uploaded')">已上传到图床</button>
+            <button class="chip" :class="{ 'chip--active': filters.upload_state === 'not_uploaded' }" @click="setFilter('upload_state', 'not_uploaded')">未上传到图床</button>
           </div>
         </div>
       </div>
@@ -440,6 +466,7 @@ const deleteResult         = ref(null)
 const filters = ref({
   search: '', wallpaper_type: '', category: '', color_theme: '',
   screen_orientation: '', resolution_preset: '', min_height: null,
+  original_quality: '', upload_state: '',
 })
 
 const confirmModal = ref({ visible: false, title: '', message: '', confirmText: '确认', resolve: null })
@@ -457,7 +484,8 @@ const reclassifyForm = ref({
 const totalPages = computed(() => Math.ceil(total.value / pageSize))
 const activeFilterCount = computed(() =>
   [filters.value.wallpaper_type, filters.value.category, filters.value.color_theme,
-   filters.value.screen_orientation, filters.value.min_height].filter(Boolean).length
+   filters.value.screen_orientation, filters.value.min_height,
+   filters.value.original_quality, filters.value.upload_state].filter(Boolean).length
 )
 
 // ── 色系颜色映射 ─────────────────────────────────
@@ -668,6 +696,7 @@ function clearAllFilters() {
   Object.assign(filters.value, {
     wallpaper_type:'', category:'', color_theme:'',
     screen_orientation:'', min_height:null, resolution_preset:'', search:'',
+    original_quality:'', upload_state:'',
   })
   resetAndLoad()
 }
@@ -684,6 +713,8 @@ async function loadGallery() {
       color_theme:    filters.value.color_theme        || undefined,
       screen_orientation: filters.value.screen_orientation || undefined,
       min_height:     filters.value.min_height          || undefined,
+      original_quality: filters.value.original_quality || undefined,
+      upload_state:   filters.value.upload_state       || undefined,
     })
     wallpapers.value = res.wallpapers
     total.value      = res.total

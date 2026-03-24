@@ -27,7 +27,7 @@ from typing import Optional
 
 import httpx
 from PIL import Image, ImageOps
-from backend.core.upload_record_helper import normalize_remote_tag
+from backend.core.upload_record_helper import get_orientation_tag, normalize_remote_tag
 
 logger = logging.getLogger(__name__)
 
@@ -384,16 +384,15 @@ class ImgbedUploader:
         resource_id: str,
     ) -> dict[str, str]:
         now = datetime.now()
-        orientation = _get_orientation(width, height)
         normalized_tags = [_safe_path_segment(item) for item in _normalize_tags(tags)]
         primary_tag = normalized_tags[0] if normalized_tags else "untagged"
         return {
             "type": wallpaper_type or "static",
-            "category": _safe_path_segment(category) if category else "uncategorized",
+            "category": normalize_remote_tag(category) if category else "uncategorized",
             "type_id": _safe_path_segment(type_id) if type_id else "unknown-type",
             "color": _safe_path_segment(color_theme) if color_theme else "uncolored",
             "color_id": _safe_path_segment(color_id) if color_id else "unknown-color",
-            "orientation": orientation,
+            "orientation": get_orientation_tag(width, height),
             "primary_tag": primary_tag,
             "tags": _trim_joined_segment(normalized_tags[:5], "untagged"),
             "originality": "original" if is_original else "preview",
@@ -621,7 +620,7 @@ class ImgbedUploader:
             return None
 
         # 上传过滤检查
-        ok, reason = self.upload_filter.check(width, height, is_original)
+        ok, reason = self.check_upload_eligibility(width, height, is_original)
         if not ok:
             logger.info("[Imgbed] 跳过上传 file=%s reason=%s", os.path.basename(local_path), reason)
             return None
@@ -721,6 +720,14 @@ class ImgbedUploader:
                     os.remove(temp_path)
                 except OSError:
                     logger.warning("[Imgbed] failed to remove temp file: %s", temp_path)
+
+    def check_upload_eligibility(
+        self,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        is_original: bool = False,
+    ) -> tuple[bool, str]:
+        return self.upload_filter.check(width, height, is_original)
 
     def _prepare_upload_file(
         self,

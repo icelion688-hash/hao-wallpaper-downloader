@@ -249,6 +249,8 @@ class WallpaperCrawler:
         wallpaper_type_id: int = 1,
         skip_altcha: bool = False,
         session_profile: Optional[dict] = None,
+        attempt_original: bool = True,
+        original_failure_reason: str = "",
     ) -> Optional[dict]:
         """
         构造/获取壁纸下载直链。
@@ -269,10 +271,32 @@ class WallpaperCrawler:
         Returns:
             包含 download_url 的字典，或 None
         """
+        if not attempt_original:
+            fallback_reason = original_failure_reason or "altcha 未就绪，已跳过原图请求"
+            if wallpaper_type_id not in STATIC_TYPES:
+                if file_id:
+                    logger.warning("[Crawler] 动态图跳过原图请求，直接回退: %s | %s", resource_id, fallback_reason)
+                    return {
+                        "resource_id": resource_id,
+                        "download_url": f"{BASE_URL}{VIDEO_URL}/{file_id}",
+                        "is_original": False,
+                        "original_failure_reason": fallback_reason,
+                    }
+                return None
+            if file_id:
+                logger.warning("[Crawler] 静态图跳过原图请求，直接回退: %s | %s", resource_id, fallback_reason)
+                return {
+                    "resource_id": resource_id,
+                    "download_url": f"{BASE_URL}{PREVIEW_URL}/{file_id}",
+                    "is_original": False,
+                    "original_failure_reason": fallback_reason,
+                }
+            return None
+
         # 视频：优先走 altcha + getCompleteUrl 获取原始高质量 MP4
         # 若验证失败，回退到 getVideoReduce（低质量压缩版）
         if wallpaper_type_id not in STATIC_TYPES:
-            complete = await self._fetch_complete_url(
+            complete, complete_reason = await self._fetch_complete_url(
                 client, cookie, resource_id,
                 skip_altcha=skip_altcha,
                 session_profile=session_profile,
@@ -286,11 +310,12 @@ class WallpaperCrawler:
                     "resource_id": resource_id,
                     "download_url": f"{BASE_URL}{VIDEO_URL}/{file_id}",
                     "is_original": False,
+                    "original_failure_reason": complete_reason,
                 }
             return None
 
         # 静态图：优先走 altcha + getCompleteUrl 获取原图
-        complete = await self._fetch_complete_url(
+        complete, complete_reason = await self._fetch_complete_url(
             client, cookie, resource_id,
             skip_altcha=skip_altcha,
             session_profile=session_profile,
@@ -305,6 +330,7 @@ class WallpaperCrawler:
                 "resource_id": resource_id,
                 "download_url": f"{BASE_URL}{PREVIEW_URL}/{file_id}",
                 "is_original": False,
+                "original_failure_reason": complete_reason,
             }
 
         return None
@@ -316,7 +342,7 @@ class WallpaperCrawler:
         resource_id: str,
         skip_altcha: bool = False,
         session_profile: Optional[dict] = None,
-    ) -> Optional[dict]:
+    ) -> tuple[Optional[dict], str]:
         """
         altcha 人机验证 → getCompleteUrl 获取原图签名直链。
 
@@ -343,13 +369,17 @@ class WallpaperCrawler:
         # Step 1: altcha 验证（skip_altcha=True 时跳过，复用已有 session）
         if not skip_altcha:
             if self.captcha:
-                verified = await self.captcha.verify_download(client, cookie)
+                verified, verify_reason = await self.captcha.verify_download_detail(
+                    client,
+                    cookie,
+                    ua=session_profile.get("ua") if session_profile else None,
+                )
                 if not verified:
-                    logger.warning("[Crawler] altcha 验证失败，无法获取原图: %s", resource_id)
-                    return None
+                    logger.warning("[Crawler] altcha 验证失败，无法获取原图: %s | %s", resource_id, verify_reason)
+                    return None, verify_reason or "altcha 验证失败"
             else:
                 logger.debug("[Crawler] 未配置 captcha_solver，跳过验证")
-                return None
+                return None, "未配置 captcha_solver"
 
         # Step 2: getCompleteUrl（验证后立即调用，签名 URL 很快过期）
         # 轻量延迟：模拟 JS 处理 altcha 结果后发起后续请求的时序，避免毫秒级触发
@@ -371,13 +401,14 @@ class WallpaperCrawler:
                         "resource_id": resource_id,
                         "download_url": download_url,
                         "is_original": True,
-                    }
+                    }, ""
+                return None, str(wrapper.get("msg") or f"getCompleteUrl status={wrapper.get('status')}")
             logger.warning("[Crawler] getCompleteUrl %s 返回: status=%s body=%s",
                            resource_id, resp.status_code, resp.text[:100])
+            return None, f"getCompleteUrl HTTP {resp.status_code}"
         except Exception as e:
             logger.error("[Crawler] getCompleteUrl %s 异常: %s", resource_id, e)
-
-        return None
+            return None, str(e)
 
     # ── 数据规范化 ────────────────────────────────────────────────────────────
 

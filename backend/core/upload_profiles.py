@@ -26,35 +26,53 @@ def get_upload_profile(profile_key: str) -> Optional[dict]:
     return None
 
 
-def build_uploader_from_profile(profile: Optional[dict]) -> Optional[ImgbedUploader]:
+def is_upload_profile_available(profile_key: str) -> bool:
+    profile = get_upload_profile(profile_key)
+    if not profile:
+        return False
+    if not profile.get("enabled", True):
+        return False
+    return bool(str(profile.get("api_token") or "").strip())
+
+
+def build_uploader_from_profile(
+    profile: Optional[dict],
+    *,
+    overrides: Optional[dict] = None,
+) -> Optional[ImgbedUploader]:
     if not profile:
         return None
-    if not profile.get("enabled", True):
+    merged = {**profile, **(overrides or {})}
+    if not merged.get("enabled", True):
         return None
-    if not profile.get("api_token"):
+    if not merged.get("api_token"):
         return None
     return ImgbedUploader(
-        base_url=profile.get("base_url", "https://imgbed.lacexr.com"),
-        api_token=profile.get("api_token", ""),
-        compress=profile.get("server_compress", False),
-        channel=profile.get("channel", "telegram"),
-        channel_name=profile.get("channel_name", ""),
-        auto_retry=profile.get("auto_retry", True),
-        upload_name_type=profile.get("upload_name_type", "default"),
-        sync_remote_tags=profile.get("sync_remote_tags", True),
-        image_processing=profile.get("image_processing", {}),
-        profile_key=profile.get("key", ""),
-        profile_name=profile.get("name", profile.get("key", "upload")),
-        folder_landscape=profile.get("folder_landscape", ""),
-        folder_portrait=profile.get("folder_portrait", ""),
-        folder_dynamic=profile.get("folder_dynamic", ""),
-        folder_pattern=profile.get("folder_pattern", ""),
-        upload_filter=profile.get("upload_filter", {}),
+        base_url=merged.get("base_url", "https://imgbed.lacexr.com"),
+        api_token=merged.get("api_token", ""),
+        compress=merged.get("server_compress", False),
+        channel=merged.get("channel", "telegram"),
+        channel_name=merged.get("channel_name", ""),
+        auto_retry=merged.get("auto_retry", True),
+        upload_name_type=merged.get("upload_name_type", "default"),
+        sync_remote_tags=merged.get("sync_remote_tags", True),
+        image_processing=merged.get("image_processing", {}),
+        profile_key=merged.get("key", ""),
+        profile_name=merged.get("name", merged.get("key", "upload")),
+        folder_landscape=merged.get("folder_landscape", ""),
+        folder_portrait=merged.get("folder_portrait", ""),
+        folder_dynamic=merged.get("folder_dynamic", ""),
+        folder_pattern=merged.get("folder_pattern", ""),
+        upload_filter=merged.get("upload_filter", {}),
     )
 
 
-def build_uploader_by_key(profile_key: str) -> Optional[ImgbedUploader]:
-    return build_uploader_from_profile(get_upload_profile(profile_key))
+def build_uploader_by_key(
+    profile_key: str,
+    *,
+    overrides: Optional[dict] = None,
+) -> Optional[ImgbedUploader]:
+    return build_uploader_from_profile(get_upload_profile(profile_key), overrides=overrides)
 
 
 def build_task_uploader() -> Optional[ImgbedUploader]:

@@ -69,6 +69,11 @@ class AutoPilotConfigTests(unittest.IsolatedAsyncioTestCase):
             "use_imgbed_upload": True,
             "static_upload_profile": "compressed_webp",
             "dynamic_upload_profile": "original_lossless",
+            "static_upload_channel": "telegram",
+            "static_upload_channel_name": "tg-a",
+            "dynamic_upload_channel": "s3",
+            "dynamic_upload_channel_name": "bucket-a",
+            "strict_original": True,
             "storage_auto_clean": True,
             "storage_strategy": "keep_days",
             "storage_keep_days": 14,
@@ -76,12 +81,29 @@ class AutoPilotConfigTests(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertTrue(config["use_imgbed_upload"])
-        self.assertEqual(config["static_upload_profile"], "compressed_webp")
+        self.assertEqual(config["static_upload_profile"], "original_lossless")
         self.assertEqual(config["dynamic_upload_profile"], "original_lossless")
+        self.assertEqual(config["static_upload_channel"], "telegram")
+        self.assertEqual(config["static_upload_channel_name"], "tg-a")
+        self.assertEqual(config["dynamic_upload_channel"], "s3")
+        self.assertEqual(config["dynamic_upload_channel_name"], "bucket-a")
+        self.assertTrue(config["strict_original"])
         self.assertTrue(config["storage_auto_clean"])
         self.assertEqual(config["storage_strategy"], "keep_days")
         self.assertEqual(config["storage_keep_days"], 14)
         self.assertFalse(config["storage_uploaded_only"])
+
+    def test_update_config_falls_back_to_available_task_profile(self):
+        engine = AutoPilotEngine(data_dir=self.tmpdir)
+
+        config = engine.update_config({
+            "use_imgbed_upload": True,
+            "static_upload_profile": "compressed_webp",
+            "dynamic_upload_profile": "",
+        })
+
+        self.assertEqual(config["static_upload_profile"], "original_lossless")
+        self.assertEqual(config["dynamic_upload_profile"], "original_lossless")
 
     async def test_update_config_interrupts_waiting_sleep(self):
         engine = AutoPilotEngine(data_dir=self.tmpdir)

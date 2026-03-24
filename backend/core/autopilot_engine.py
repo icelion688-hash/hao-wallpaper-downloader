@@ -26,6 +26,8 @@ import random
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from backend.core.upload_profiles import get_upload_settings, is_upload_profile_available
+
 logger = logging.getLogger(__name__)
 
 # 支持的常用时区列表（前端下拉选项）
@@ -107,6 +109,7 @@ class AutoPilotEngine:
 
         self._next_session_at: Optional[datetime] = None
         self._current_task_id: Optional[int] = None
+        self._last_session_summary: Optional[dict] = None
         self._cat_index: int = 0
         self._storage_cleanup_state: Optional[dict] = None
 
@@ -141,6 +144,11 @@ class AutoPilotEngine:
             "use_imgbed_upload": False,
             "static_upload_profile": "",
             "dynamic_upload_profile": "",
+            "static_upload_channel": "",
+            "static_upload_channel_name": "",
+            "dynamic_upload_channel": "",
+            "dynamic_upload_channel_name": "",
+            "strict_original": False,
             "wallpaper_type": "static",
             "sort_by": "yesterday_hot",
             "categories": [],
@@ -231,6 +239,21 @@ class AutoPilotEngine:
         safe_max = max(lower_bound, int(max_value))
         return (safe_min, safe_max) if safe_min <= safe_max else (safe_max, safe_min)
 
+    @staticmethod
+    def _resolve_available_upload_profile(profile_key: str, fallback_key: str = "") -> str:
+        preferred = str(profile_key or "").strip()
+        fallback = str(fallback_key or "").strip()
+        if preferred and is_upload_profile_available(preferred):
+            return preferred
+        if fallback and is_upload_profile_available(fallback):
+            return fallback
+        uploads = get_upload_settings()
+        for profile in uploads.get("profiles", []):
+            key = str(profile.get("key") or "").strip()
+            if key and is_upload_profile_available(key):
+                return key
+        return fallback or preferred
+
     @classmethod
     def _normalize_config(cls, raw_cfg: dict) -> dict:
         cfg = {**cls._default_config(), **(raw_cfg or {})}
@@ -269,8 +292,23 @@ class AutoPilotEngine:
         )
         cfg["inactive_enabled"] = bool(cfg.get("inactive_enabled", False))
         cfg["use_imgbed_upload"] = bool(cfg.get("use_imgbed_upload", False))
-        cfg["static_upload_profile"] = str(cfg.get("static_upload_profile") or "").strip()
-        cfg["dynamic_upload_profile"] = str(cfg.get("dynamic_upload_profile") or "").strip()
+        uploads = get_upload_settings()
+        default_task_profile = str(uploads.get("task_profile") or "").strip()
+        static_profile = str(cfg.get("static_upload_profile") or "").strip()
+        dynamic_profile = str(cfg.get("dynamic_upload_profile") or "").strip()
+        cfg["static_upload_profile"] = cls._resolve_available_upload_profile(
+            static_profile,
+            default_task_profile,
+        )
+        cfg["dynamic_upload_profile"] = cls._resolve_available_upload_profile(
+            dynamic_profile or cfg["static_upload_profile"],
+            cfg["static_upload_profile"] or default_task_profile,
+        )
+        cfg["static_upload_channel"] = str(cfg.get("static_upload_channel") or "").strip()
+        cfg["static_upload_channel_name"] = str(cfg.get("static_upload_channel_name") or "").strip()
+        cfg["dynamic_upload_channel"] = str(cfg.get("dynamic_upload_channel") or "").strip()
+        cfg["dynamic_upload_channel_name"] = str(cfg.get("dynamic_upload_channel_name") or "").strip()
+        cfg["strict_original"] = bool(cfg.get("strict_original", False))
         cfg["vip_only"] = bool(cfg.get("vip_only", False))
         cfg["min_hot_score"] = max(0, int(cfg.get("min_hot_score", 0)))
         for key in ("min_width", "min_height"):
@@ -320,6 +358,8 @@ class AutoPilotEngine:
         tz_name = self._config.get("timezone", "Asia/Shanghai")
         now_tz = _now_in_tz(tz_name)
         human_ctrl = getattr(self._app_state, "human_ctrl", None) if self._app_state else None
+        if not self._last_session_summary:
+            self._last_session_summary = self._load_last_session_summary_from_db()
         today_payload = {
             "sessions": self._today_sessions,
             "downloaded": self._today_downloaded,
@@ -356,8 +396,75 @@ class AutoPilotEngine:
                 self._next_session_at.isoformat() if self._next_session_at else None
             ),
             "current_task_id": self._current_task_id,
+            "last_session": self._last_session_summary,
             "logs": list(self._logs[-200:]),
         }
+
+    @staticmethod
+    def _build_session_summary_from_task(task, planned_count: Optional[int] = None) -> dict:
+        log_lines = [line.strip() for line in str(task.log_text or "").splitlines() if line.strip()]
+        session_reason = "本轮已完成"
+        session_reason_type = "completed"
+        if any("会话收束:" in line for line in log_lines):
+            session_reason = "命中会话结束模拟，本轮提前收束"
+            session_reason_type = "session_end_simulated"
+        elif any("补齐停止:" in line for line in log_lines):
+            line = next((item for item in reversed(log_lines) if "补齐停止:" in item), "")
+            session_reason = line.split("补齐停止:", 1)[-1].strip() or "本轮补齐已停止"
+            session_reason_type = "replenish_stopped"
+        elif any("补齐结束:" in line for line in log_lines):
+            session_reason = "当前轮次未找到更多可下载的新图片"
+            session_reason_type = "candidate_exhausted"
+        elif task.status == "failed":
+            session_reason = str(task.error_msg or "任务执行失败").strip()
+            session_reason_type = "failed"
+        elif task.status == "paused":
+            session_reason = "任务被暂停"
+            session_reason_type = "paused"
+        elif task.status == "cancelled":
+            session_reason = "任务已取消"
+            session_reason_type = "cancelled"
+        task_cfg = task.config if hasattr(task, "config") else {}
+        next_page = max(1, int(task_cfg.get("_resume_next_page", 1) or 1))
+        planned = int(planned_count if planned_count is not None else (task.total_count or 0))
+        return {
+            "task_id": task.id,
+            "task_name": task.name,
+            "status": task.status,
+            "planned_count": planned,
+            "success_count": int(task.success_count or 0),
+            "failed_count": int(task.failed_count or 0),
+            "skip_count": int(task.skip_count or 0),
+            "progress": float(task.progress or 0.0),
+            "started_at": task.started_at.isoformat() if task.started_at else None,
+            "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+            "resume_next_page": next_page,
+            "reason": session_reason,
+            "reason_type": session_reason_type,
+        }
+
+    @classmethod
+    def _load_last_session_summary_from_db(cls) -> Optional[dict]:
+        try:
+            from backend.models.database import SessionLocal
+            from backend.models.task import Task as TaskModel
+
+            db = SessionLocal()
+            try:
+                task = (
+                    db.query(TaskModel)
+                    .filter(TaskModel.name.like("AutoPilot %"))
+                    .order_by(TaskModel.created_at.desc(), TaskModel.id.desc())
+                    .first()
+                )
+                if not task:
+                    return None
+                return cls._build_session_summary_from_task(task)
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("[AutoPilot] 最近一轮摘要回填失败: %s", exc)
+            return None
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
@@ -618,6 +725,11 @@ class AutoPilotEngine:
             "use_imgbed_upload": self._config["use_imgbed_upload"],
             "static_upload_profile": self._config.get("static_upload_profile", ""),
             "dynamic_upload_profile": self._config.get("dynamic_upload_profile", ""),
+            "static_upload_channel": self._config.get("static_upload_channel", ""),
+            "static_upload_channel_name": self._config.get("static_upload_channel_name", ""),
+            "dynamic_upload_channel": self._config.get("dynamic_upload_channel", ""),
+            "dynamic_upload_channel_name": self._config.get("dynamic_upload_channel_name", ""),
+            "strict_original": self._config.get("strict_original", False),
             "min_hot_score": self._config.get("min_hot_score", 0),
             "tag_blacklist": self._config.get("tag_blacklist", []),
             "min_width": self._config.get("min_width"),
@@ -677,6 +789,10 @@ class AutoPilotEngine:
                 self._cursor_state[cursor_key] = next_page
                 self._save_cursor_state()
                 self._log(f"查询游标: 下次从第 {next_page} 页开始")
+                self._last_session_summary = self._build_session_summary_from_task(
+                    t,
+                    planned_count=count,
+                )
             return t.success_count if t else 0
         finally:
             db.close()

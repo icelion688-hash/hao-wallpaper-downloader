@@ -62,6 +62,7 @@ export const galleryApi = {
   // 远端路径匹配本地DB（用于 ImgbedManager 自动补全标签）
   matchRemote: (data) => http.post('/gallery/match-remote', data),
   reconcileRemoteRecords: (data) => http.post('/gallery/reconcile-remote-records', data),
+  auditUploadConsistency: (data) => http.post('/gallery/audit-upload-consistency', data),
   // 本地存储滚动清仓
   cleanupLocal: (data) => http.post('/gallery/cleanup-local', data),
   storageStats: () => http.get('/gallery/storage-stats'),

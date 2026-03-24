@@ -84,6 +84,27 @@
           </div>
         </div>
 
+        <div class="card session-summary-card" v-if="lastSession">
+          <div class="card-header">
+            最近一轮
+            <span class="session-summary-badge" :class="lastSessionBadgeClass">{{ lastSessionBadgeText }}</span>
+          </div>
+          <div class="session-summary-meta">
+            <div>任务 #{{ lastSession.task_id }}{{ lastSession.task_name ? ` · ${lastSession.task_name}` : '' }}</div>
+            <div v-if="lastSession.finished_at">结束于 {{ formatSessionTime(lastSession.finished_at) }}</div>
+          </div>
+          <div class="session-summary-stats">
+            <span>计划 {{ lastSession.planned_count }} 张</span>
+            <span>成功 {{ lastSession.success_count }} 张</span>
+            <span v-if="lastSession.failed_count">失败 {{ lastSession.failed_count }} 张</span>
+            <span v-if="lastSession.skip_count">跳过 {{ lastSession.skip_count }} 张</span>
+          </div>
+          <div class="session-summary-reason" :class="lastSessionReasonClass">{{ lastSession.reason }}</div>
+          <div class="session-summary-hint" v-if="lastSession.resume_next_page">
+            下次将从第 {{ lastSession.resume_next_page }} 页继续扫描
+          </div>
+        </div>
+
         <!-- 运行日志 -->
         <div class="card log-card">
           <div class="card-header">
@@ -348,6 +369,18 @@
                 <div class="strategy-note">
                   静态图和动态图各自绑定独立上传策略，修改不会互相覆盖；建议按文件体积、压缩方式和目录规则分别配置。
                 </div>
+                <div class="cfg-grid section-top-gap">
+                  <div class="form-row form-row--full">
+                    <label>原图获取策略</label>
+                    <select class="select" :value="originalDownloadPolicy" @change="setOriginalDownloadPolicy($event.target.value)">
+                      <option value="prefer_original">优先原图，失败降级预览图</option>
+                      <option value="strict_original">严格原图，失败直接跳过</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="form-help">
+                  {{ originalDownloadPolicyHint }}
+                </div>
                 <div class="upload-strategy-grid section-top-gap">
                   <div
                     v-for="card in autoUploadCards"
@@ -372,6 +405,19 @@
                             {{ profile.name }} / {{ profile.channel }}
                           </option>
                         </select>
+                      </div>
+                      <div class="form-row">
+                        <label>上传渠道</label>
+                        <select class="select" :value="card.channel" @change="setAutoUploadChannel(card.type, $event.target.value)">
+                          <option value="">跟随 Profile 默认渠道</option>
+                          <option v-for="option in autoUploadChannelOptions" :key="`${card.type}-channel-${option.value}`" :value="option.value">
+                            {{ option.label }}
+                          </option>
+                        </select>
+                      </div>
+                      <div class="form-row">
+                        <label>指定渠道名</label>
+                        <input class="input" :value="card.channelName" placeholder="可选，多渠道时指定具体渠道名" @change="setAutoUploadChannelName(card.type, $event.target.value)" />
                       </div>
                       <div class="form-row form-row--full">
                         <label>路径模板</label>
@@ -496,6 +542,12 @@
               <div class="storage-actions">
                 <button class="btn btn--sm" @click="loadStorageStats" :disabled="cleaningUp">刷新统计</button>
               </div>
+              <div v-if="storageInfo?.pending_upload_reasons?.length" class="form-help">
+                未上传原因：
+                <span v-for="item in storageInfo.pending_upload_reasons" :key="`${item.reason}-${item.count}`">
+                  {{ item.reason }}（{{ item.count }}）
+                </span>
+              </div>
               <div class="form-help">本地文件夹只是暂存区，图片最终归宿是图床。建议定期清理以释放磁盘空间。</div>
             </div>
 
@@ -607,24 +659,28 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { autopilotApi, galleryApi, settingsApi } from '../api'
-import { applyCompressedUploadProfile, applyLosslessUploadProfile, isLosslessUploadProfile, normalizeUploadSettings } from '../utils/uploadProfiles'
-const createDefaultAutoPilotConfig=()=>({timezone:'Asia/Shanghai',active_start:8,active_end:23,daily_limit_mode:'auto',manual_daily_limit:null,active_session_min:5,active_session_max:15,active_interval_min:1800,active_interval_max:7200,inactive_enabled:false,inactive_session_min:2,inactive_session_max:5,inactive_interval_min:7200,inactive_interval_max:14400,wallpaper_type:'static',screen_orientation:'all',sort_by:'yesterday_hot',min_hot_score:0,vip_only:false,categories:[],color_themes:[],tag_blacklist:[],min_width:null,min_height:null,use_imgbed_upload:false,static_upload_profile:'',dynamic_upload_profile:'',storage_auto_clean:false,storage_max_count:500,storage_strategy:'keep_count',storage_keep_days:30,storage_uploaded_only:true})
+import { applyCompressedUploadProfile, applyLosslessUploadProfile, getAvailableUploadProfiles, isLosslessUploadProfile, normalizeUploadSettings, resolveAvailableUploadProfileKey } from '../utils/uploadProfiles'
+const autoUploadChannelOptions=[{value:'telegram',label:'telegram'},{value:'cfr2',label:'cfr2'},{value:'s3',label:'s3'},{value:'discord',label:'discord'},{value:'huggingface',label:'huggingface'}]
+const createDefaultAutoPilotConfig=()=>({timezone:'Asia/Shanghai',active_start:8,active_end:23,daily_limit_mode:'auto',manual_daily_limit:null,active_session_min:5,active_session_max:15,active_interval_min:1800,active_interval_max:7200,inactive_enabled:false,inactive_session_min:2,inactive_session_max:5,inactive_interval_min:7200,inactive_interval_max:14400,wallpaper_type:'static',screen_orientation:'all',sort_by:'yesterday_hot',min_hot_score:0,vip_only:false,categories:[],color_themes:[],tag_blacklist:[],min_width:null,min_height:null,use_imgbed_upload:false,static_upload_profile:'',dynamic_upload_profile:'',static_upload_channel:'',static_upload_channel_name:'',dynamic_upload_channel:'',dynamic_upload_channel_name:'',strict_original:false,storage_auto_clean:false,storage_max_count:500,storage_strategy:'keep_count',storage_keep_days:30,storage_uploaded_only:true})
 const createDefaultMediaSettings=()=>({auto_convert:false,max_concurrent:1,video:{enabled:false,output_format:'webp',fps:0,max_frames:0,width:0,max_width:0,quality:100,delete_original:false,timeout_seconds:300,cpu_nice:5},image:{enabled:false,output_format:'webp',quality:100,delete_original:false,timeout_seconds:120,cpu_nice:5}})
 const normalizeMediaSettings=(remote={})=>{const defaults=createDefaultMediaSettings();return{...defaults,...remote,video:{...defaults.video,...(remote.video||{})},image:{...defaults.image,...(remote.image||{})}}}
 const parseCsvInput=value=>value?value.split(',').map(item=>item.trim()).filter(Boolean):[]
 const clampNumber=(value,fallback,min)=>{const numeric=Number(value);if(!Number.isFinite(numeric))return fallback;return Math.max(min,Math.round(numeric))}
 const normalizeRange=(minValue,maxValue,fallbackMin,fallbackMax,minLimit)=>{const safeMin=clampNumber(minValue,fallbackMin,minLimit),safeMax=clampNumber(maxValue,fallbackMax,minLimit);return safeMin<=safeMax?[safeMin,safeMax]:[safeMax,safeMin]}
-const normalizeAutoPilotConfig=remote=>{const merged={...createDefaultAutoPilotConfig(),...(remote||{})};merged.daily_limit_mode=String(merged.daily_limit_mode||'auto').toLowerCase()==='manual'?'manual':'auto';merged.manual_daily_limit=merged.manual_daily_limit?Math.min(500,Math.max(1,Number(merged.manual_daily_limit)||0)):null;[merged.active_session_min,merged.active_session_max]=normalizeRange(merged.active_session_min,merged.active_session_max,5,15,1);[merged.inactive_session_min,merged.inactive_session_max]=normalizeRange(merged.inactive_session_min,merged.inactive_session_max,2,5,1);merged.active_interval_min=clampNumber(merged.active_interval_min,1800,60);merged.active_interval_max=clampNumber(merged.active_interval_max,7200,60);merged.inactive_interval_min=clampNumber(merged.inactive_interval_min,7200,60);merged.inactive_interval_max=clampNumber(merged.inactive_interval_max,14400,60);merged.min_hot_score=clampNumber(merged.min_hot_score,0,0);merged.static_upload_profile=String(merged.static_upload_profile||'').trim();merged.dynamic_upload_profile=String(merged.dynamic_upload_profile||'').trim();merged.storage_auto_clean=Boolean(merged.storage_auto_clean);merged.storage_max_count=Math.max(1,Math.min(99999,Number(merged.storage_max_count)||500));merged.storage_keep_days=Math.max(1,Math.min(3650,Number(merged.storage_keep_days)||30));merged.storage_uploaded_only=Boolean(merged.storage_uploaded_only!==false);const strategy=String(merged.storage_strategy||'keep_count').toLowerCase();merged.storage_strategy=['keep_count','keep_days','upload_and_delete'].includes(strategy)?strategy:'keep_count';return merged}
+const normalizeAutoPilotConfig=remote=>{const merged={...createDefaultAutoPilotConfig(),...(remote||{})};merged.daily_limit_mode=String(merged.daily_limit_mode||'auto').toLowerCase()==='manual'?'manual':'auto';merged.manual_daily_limit=merged.manual_daily_limit?Math.min(500,Math.max(1,Number(merged.manual_daily_limit)||0)):null;[merged.active_session_min,merged.active_session_max]=normalizeRange(merged.active_session_min,merged.active_session_max,5,15,1);[merged.inactive_session_min,merged.inactive_session_max]=normalizeRange(merged.inactive_session_min,merged.inactive_session_max,2,5,1);merged.active_interval_min=clampNumber(merged.active_interval_min,1800,60);merged.active_interval_max=clampNumber(merged.active_interval_max,7200,60);merged.inactive_interval_min=clampNumber(merged.inactive_interval_min,7200,60);merged.inactive_interval_max=clampNumber(merged.inactive_interval_max,14400,60);merged.min_hot_score=clampNumber(merged.min_hot_score,0,0);merged.static_upload_profile=String(merged.static_upload_profile||'').trim();merged.dynamic_upload_profile=String(merged.dynamic_upload_profile||'').trim();merged.static_upload_channel=String(merged.static_upload_channel||'').trim();merged.static_upload_channel_name=String(merged.static_upload_channel_name||'').trim();merged.dynamic_upload_channel=String(merged.dynamic_upload_channel||'').trim();merged.dynamic_upload_channel_name=String(merged.dynamic_upload_channel_name||'').trim();merged.strict_original=Boolean(merged.strict_original);merged.storage_auto_clean=Boolean(merged.storage_auto_clean);merged.storage_max_count=Math.max(1,Math.min(99999,Number(merged.storage_max_count)||500));merged.storage_keep_days=Math.max(1,Math.min(3650,Number(merged.storage_keep_days)||30));merged.storage_uploaded_only=Boolean(merged.storage_uploaded_only!==false);const strategy=String(merged.storage_strategy||'keep_count').toLowerCase();merged.storage_strategy=['keep_count','keep_days','upload_and_delete'].includes(strategy)?strategy:'keep_count';return merged}
 const cloneUploadProfiles=profiles=>(profiles||[]).map(profile=>({...profile,image_processing:{...(profile.image_processing||{})},upload_filter:{...(profile.upload_filter||{})}}))
 const status=ref({}),toggling=ref(false),logs=ref([]),logEl=ref(null),savedHint=ref(false),supportedTimezones=ref(['Asia/Shanghai']),cfg=ref(createDefaultAutoPilotConfig()),uploadSettings=ref(normalizeUploadSettings()),mediaSettings=ref(createDefaultMediaSettings()),systemInfo=ref(null),categoriesInput=ref(''),colorsInput=ref(''),blacklistInput=ref(''),activeIntervalMinMin=ref(30),activeIntervalMaxMin=ref(120),inactiveIntervalMinMin=ref(120),inactiveIntervalMaxMin=ref(240),currentHour=ref(new Date().getHours()),storageInfo=ref(null),cleaningUp=ref(false),cleanupPreview=ref(null),activeConfigTab=ref('rhythm')
 const running=computed(()=>status.value.status==='running')
 const storageRuntime=computed(()=>status.value.storage||null)
-const resolveAutoUploadProfileKey=type=>{const profiles=uploadSettings.value.profiles||[];const fallback=uploadSettings.value.task_profile||profiles[0]?.key||'';if(type==='dynamic')return cfg.value.dynamic_upload_profile||cfg.value.static_upload_profile||fallback;return cfg.value.static_upload_profile||cfg.value.dynamic_upload_profile||fallback}
-const getAutoUploadProfile=type=>{const profiles=uploadSettings.value.profiles||[];return profiles.find(profile=>profile.key===resolveAutoUploadProfileKey(type))||profiles[0]||null}
-const formatUploadProfileSummary=profile=>{if(!profile)return'未找到可用上传 Profile';const mode=isLosslessUploadProfile(profile)?'原图直传':'本地 WebP 预处理';const tagMode=profile.sync_remote_tags===false?'上传不带标签':'上传后同步标签';const folderSummary=profile.folder_pattern?`路径模板 ${profile.folder_pattern}`:[profile.folder_landscape,profile.folder_portrait,profile.folder_dynamic].filter(Boolean).join(' / ');return[mode,tagMode,profile.channel,folderSummary].filter(Boolean).join(' · ')}
+const resolveAutoUploadProfileKey=type=>{const profiles=uploadSettings.value.profiles||[];const fallback=resolveAvailableUploadProfileKey(uploadSettings.value,uploadSettings.value.task_profile,profiles[0]?.key||'');if(type==='dynamic')return resolveAvailableUploadProfileKey(uploadSettings.value,cfg.value.dynamic_upload_profile||cfg.value.static_upload_profile,fallback);return resolveAvailableUploadProfileKey(uploadSettings.value,cfg.value.static_upload_profile||cfg.value.dynamic_upload_profile,fallback)}
+const resolveAutoUploadChannelConfig=type=>{if(type==='dynamic')return{channel:cfg.value.dynamic_upload_channel||'',channelName:cfg.value.dynamic_upload_channel_name||''};return{channel:cfg.value.static_upload_channel||'',channelName:cfg.value.static_upload_channel_name||''}}
+const originalDownloadPolicy=computed(()=>cfg.value.strict_original?'strict_original':'prefer_original')
+const originalDownloadPolicyHint=computed(()=>cfg.value.strict_original?'开启后，静态图和动态图只接受原图；遇到站点限流、权限不足或 altcha 失败时会直接跳过，不再降级预览图。':'默认策略：优先尝试原图；如果站点临时拿不到原图，会自动降级为预览图继续下载，整体成功率更高。')
+const getAutoUploadProfile=type=>{const profiles=uploadSettings.value.profiles||[];return profiles.find(profile=>profile.key===resolveAutoUploadProfileKey(type))||getAvailableUploadProfiles(uploadSettings.value)[0]||profiles[0]||null}
+const formatUploadProfileSummary=(profile,channelConfig={channel:'',channelName:''})=>{if(!profile)return'未找到可用上传 Profile';const mode=isLosslessUploadProfile(profile)?'原图直传':'本地 WebP 预处理';const tagMode=profile.sync_remote_tags===false?'上传不带标签':'上传后同步标签';const channelSummary=channelConfig.channel?`渠道 ${channelConfig.channel}${channelConfig.channelName?`/${channelConfig.channelName}`:''}（任务覆盖）`:`渠道 ${profile.channel}${profile.channel_name?`/${profile.channel_name}`:''}`;const folderSummary=profile.folder_pattern?`路径模板 ${profile.folder_pattern}`:[profile.folder_landscape,profile.folder_portrait,profile.folder_dynamic].filter(Boolean).join(' / ');return[mode,tagMode,channelSummary,folderSummary].filter(Boolean).join(' · ')}
 const autoUploadCards=computed(()=>[
-  {type:'static',title:'静态图上传策略',subtitle:'适合原图、PNG、WebP 等单张壁纸。',badge:'STATIC',selectedKey:resolveAutoUploadProfileKey('static'),profile:getAutoUploadProfile('static'),summary:formatUploadProfileSummary(getAutoUploadProfile('static')),dynamicFolderHint:'通常留空即可；仅当这个 Profile 也会被其他入口复用上传动态图时，才需要单独指定。'},
-  {type:'dynamic',title:'动态图上传策略',subtitle:'适合 GIF、动态壁纸等大体积文件。',badge:'DYNAMIC',selectedKey:resolveAutoUploadProfileKey('dynamic'),profile:getAutoUploadProfile('dynamic'),summary:formatUploadProfileSummary(getAutoUploadProfile('dynamic')),dynamicFolderHint:'留空时会按横图/竖图目录分流；如果动态图需要单独图床目录，可以在这里覆盖。'},
+  {type:'static',title:'静态图上传策略',subtitle:'适合原图、PNG、WebP 等单张壁纸。',badge:'STATIC',selectedKey:resolveAutoUploadProfileKey('static'),channel:resolveAutoUploadChannelConfig('static').channel,channelName:resolveAutoUploadChannelConfig('static').channelName,profile:getAutoUploadProfile('static'),summary:formatUploadProfileSummary(getAutoUploadProfile('static'),resolveAutoUploadChannelConfig('static')),dynamicFolderHint:'通常留空即可；仅当这个 Profile 也会被其他入口复用上传动态图时，才需要单独指定。'},
+  {type:'dynamic',title:'动态图上传策略',subtitle:'适合 GIF、动态壁纸等大体积文件。',badge:'DYNAMIC',selectedKey:resolveAutoUploadProfileKey('dynamic'),channel:resolveAutoUploadChannelConfig('dynamic').channel,channelName:resolveAutoUploadChannelConfig('dynamic').channelName,profile:getAutoUploadProfile('dynamic'),summary:formatUploadProfileSummary(getAutoUploadProfile('dynamic'),resolveAutoUploadChannelConfig('dynamic')),dynamicFolderHint:'留空时会按横图/竖图目录分流；如果动态图需要单独图床目录，可以在这里覆盖。'},
 ].filter(card=>card.profile))
 const describeStorageStrategy=(strategy,maxCount,keepDays)=>({keep_count:`保留最新 ${maxCount || 500} 张`,keep_days:`保留最近 ${keepDays || 30} 天`,upload_and_delete:'删除所有已上传本地文件'}[strategy]||'按当前策略清理')
 const describeStorageScope=uploadedOnly=>uploadedOnly?'仅已上传文件':'包含未上传文件'
@@ -637,6 +693,10 @@ const cleanupLastResultSummary=computed(()=>{if(!lastCleanup.value)return'';if(l
 const backendLimitReady=computed(()=>Number.isFinite(Number(status.value.today?.daily_limit))&&Number.isFinite(Number(status.value.today?.remaining)))
 const dailyLimitDisplay=computed(()=>backendLimitReady.value?status.value.today.daily_limit:'待刷新')
 const remainingLimitDisplay=computed(()=>backendLimitReady.value?status.value.today.remaining:'待刷新')
+const lastSession=computed(()=>status.value.last_session||null)
+const lastSessionBadgeText=computed(()=>({session_end_simulated:'提前收束',replenish_stopped:'补齐停止',candidate_exhausted:'候选不足',failed:'失败',paused:'已暂停',cancelled:'已取消',completed:'已完成'}[lastSession.value?.reason_type]||'最近一轮'))
+const lastSessionBadgeClass=computed(()=>({session_end_simulated:'session-summary-badge--warn',replenish_stopped:'session-summary-badge--warn',candidate_exhausted:'session-summary-badge--info',failed:'session-summary-badge--err',paused:'session-summary-badge--muted',cancelled:'session-summary-badge--muted',completed:'session-summary-badge--ok'}[lastSession.value?.reason_type]||'session-summary-badge--info'))
+const lastSessionReasonClass=computed(()=>({session_end_simulated:'session-summary-reason--warn',replenish_stopped:'session-summary-reason--warn',failed:'session-summary-reason--err',completed:'session-summary-reason--ok'}[lastSession.value?.reason_type]||''))
 const dailyLimitHint=computed(()=>{const effectiveLimit=status.value.today?.daily_limit;const remaining=status.value.today?.remaining;if(!backendLimitReady.value)return'当前后台还没有返回今日统计数据，通常是刚启动或网络异常。正常运行后会显示自动值和剩余数取值。';if(cfg.value.daily_limit_mode==='manual'){const manualLimit=cfg.value.manual_daily_limit||effectiveLimit||'--';return`手动模式：今天的硬上限，当前有效 ${manualLimit} 张，剩余 ${remaining??'--'} 张。如当天已触达上限，AutoPilot 将停止下载直到翌日。`}return`自动模式：当前有效 ${effectiveLimit} 张，今日剩余 ${remaining??'--'} 张。自动值基于当前账号池的每日配额，实际可用量会随账号变动。`})
 const statusTag=computed(()=>!running.value?{cls:'tag--grey',text:'IDLE'}:({session:{cls:'tag--ok',text:'SESSION'},waiting:{cls:'tag--info',text:'WAITING'},sleeping:{cls:'tag--warn',text:'SLEEPING'},daily_limit:{cls:'tag--warn',text:'DAILY LIMIT'},starting:{cls:'tag--info',text:'STARTING'}}[status.value.phase]||{cls:'tag--ok',text:'RUNNING'}))
 const phaseLabel=computed(()=>({session:'正在执行下载会话',waiting:'会话间等待中',sleeping:'等待活跃时段开始',daily_limit:'今日配额已用完，等待明天',starting:'初始化中...'}[status.value.phase]||'运行中'))
@@ -644,7 +704,7 @@ const nextSessionLabel=computed(()=>{if(!running.value)return'—';if(status.val
 const nextSessionClass=computed(()=>status.value.phase==='session'?'stat-num--active':'')
 let savedHintTimer=null,pollTimer=null,configLoaded=false
 const syncFilterInputsFromConfig=()=>{categoriesInput.value=(cfg.value.categories||[]).join(', ');colorsInput.value=(cfg.value.color_themes||[]).join(', ');blacklistInput.value=(cfg.value.tag_blacklist||[]).join(', ')}
-const ensureAutoUploadProfileSelections=()=>{const profiles=uploadSettings.value.profiles||[];const fallback=uploadSettings.value.task_profile||profiles[0]?.key||'';if(!cfg.value.static_upload_profile)cfg.value.static_upload_profile=fallback;if(!cfg.value.dynamic_upload_profile)cfg.value.dynamic_upload_profile=cfg.value.static_upload_profile||fallback}
+const ensureAutoUploadProfileSelections=()=>{const profiles=uploadSettings.value.profiles||[];const fallback=resolveAvailableUploadProfileKey(uploadSettings.value,uploadSettings.value.task_profile,profiles[0]?.key||'');cfg.value.static_upload_profile=resolveAvailableUploadProfileKey(uploadSettings.value,cfg.value.static_upload_profile||cfg.value.dynamic_upload_profile,fallback);cfg.value.dynamic_upload_profile=resolveAvailableUploadProfileKey(uploadSettings.value,cfg.value.dynamic_upload_profile||cfg.value.static_upload_profile,cfg.value.static_upload_profile||fallback)}
 const applyConfig=remote=>{cfg.value=normalizeAutoPilotConfig(remote);activeIntervalMinMin.value=Math.round((cfg.value.active_interval_min??1800)/60);activeIntervalMaxMin.value=Math.round((cfg.value.active_interval_max??7200)/60);inactiveIntervalMinMin.value=Math.round((cfg.value.inactive_interval_min??7200)/60);inactiveIntervalMaxMin.value=Math.round((cfg.value.inactive_interval_max??14400)/60);syncFilterInputsFromConfig();ensureAutoUploadProfileSelections()}
 const isHourActive=hour=>{const start=cfg.value.active_start,end=cfg.value.active_end;return start<=end?hour>=start&&hour<end:hour>=start||hour<end}
 const isHourInactive=hour=>!isHourActive(hour)&&cfg.value.inactive_enabled
@@ -659,10 +719,14 @@ const clearResolutionPreset=()=>{cfg.value.min_width=null;cfg.value.min_height=n
 const onActiveIntervalChange=()=>{syncIntervalInputsToConfig();onCfgChange()}
 const onInactiveIntervalChange=()=>{syncIntervalInputsToConfig();onCfgChange()}
 const onDailyLimitModeChange=()=>{if(cfg.value.daily_limit_mode==='manual'&&!cfg.value.manual_daily_limit)cfg.value.manual_daily_limit=status.value.today?.daily_limit||45;onCfgChange()}
+const setOriginalDownloadPolicy=value=>{cfg.value.strict_original=String(value||'')==='strict_original';onCfgChange()}
 const setAutoUploadProfile=(type,key)=>{if(type==='dynamic')cfg.value.dynamic_upload_profile=String(key||'').trim();else cfg.value.static_upload_profile=String(key||'').trim();onCfgChange()}
+const setAutoUploadChannel=(type,value)=>{if(type==='dynamic')cfg.value.dynamic_upload_channel=String(value||'').trim();else cfg.value.static_upload_channel=String(value||'').trim();onCfgChange()}
+const setAutoUploadChannelName=(type,value)=>{if(type==='dynamic')cfg.value.dynamic_upload_channel_name=String(value||'').trim();else cfg.value.static_upload_channel_name=String(value||'').trim();onCfgChange()}
 const applyAutoUploadLossless=type=>{const profile=getAutoUploadProfile(type);if(!profile)return;applyLosslessUploadProfile(profile);onCfgChange()}
 const applyAutoUploadCompressed=type=>{const profile=getAutoUploadProfile(type);if(!profile)return;applyCompressedUploadProfile(profile);onCfgChange()}
 const formatCleanupTime=value=>{if(!value)return'刚刚';const date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('zh-CN',{hour12:false})}
+const formatSessionTime=value=>{if(!value)return'--';const date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('zh-CN',{hour12:false})}
 const showSavedHint=()=>{savedHint.value=true;clearTimeout(savedHintTimer);savedHintTimer=setTimeout(()=>{savedHint.value=false},2000)}
 const loadAutomationSettings=async()=>{const [uploadsResult,mediaResult,systemInfoResult]=await Promise.allSettled([settingsApi.getUploads(),settingsApi.getMediaConvert(),settingsApi.getSystemInfo()]);uploadSettings.value=uploadsResult.status==='fulfilled'?normalizeUploadSettings(uploadsResult.value):normalizeUploadSettings();ensureAutoUploadProfileSelections();mediaSettings.value=mediaResult.status==='fulfilled'?normalizeMediaSettings(mediaResult.value):createDefaultMediaSettings();if(systemInfoResult.status==='fulfilled')systemInfo.value=systemInfoResult.value}
 const persistAutomationSettings=async({showHint=true,silent=false}={})=>{try{const [configRes,uploadRes,mediaRes]=await Promise.all([autopilotApi.saveConfig(buildPayload()),settingsApi.setUploads(buildUploadSettingsPayload()),settingsApi.setMediaConvert(buildMediaSettingsPayload())]);if(configRes?.config)applyConfig(configRes.config);if(uploadRes?.uploads)uploadSettings.value=normalizeUploadSettings(uploadRes.uploads);if(mediaRes?.media_convert)mediaSettings.value=normalizeMediaSettings(mediaRes.media_convert);if(showHint)showSavedHint()}catch(error){if(!silent)throw error}}
@@ -677,7 +741,7 @@ const scrollLogs=()=>{if(logEl.value)logEl.value.scrollTop=logEl.value.scrollHei
 const loadStorageStats=async()=>{try{storageInfo.value=await galleryApi.storageStats()}catch{}}
 const runCleanupNow=async()=>{if(cleaningUp.value)return;if(!confirm('确认立即清理？将按当前策略删除符合条件的本地文件，操作不可撤销。'))return;cleaningUp.value=true;cleanupPreview.value=null;try{const r=await galleryApi.cleanupLocal({strategy:cfg.value.storage_strategy,max_count:cfg.value.storage_max_count,keep_days:cfg.value.storage_keep_days,uploaded_only:cfg.value.storage_uploaded_only,dry_run:false});cleanupPreview.value=r;alert(`清理完成：删除 ${r.deleted} 张，剩余 ${r.remaining} 张`);await loadStorageStats()}catch(e){alert('清理失败：'+(e?.message||e))}finally{cleaningUp.value=false}}
 const previewCleanup=async()=>{if(cleaningUp.value)return;cleaningUp.value=true;try{const r=await galleryApi.cleanupLocal({strategy:cfg.value.storage_strategy,max_count:cfg.value.storage_max_count,keep_days:cfg.value.storage_keep_days,uploaded_only:cfg.value.storage_uploaded_only,dry_run:true});cleanupPreview.value=r}catch(e){alert('预览失败：'+(e?.message||e))}finally{cleaningUp.value=false}}
-const logLineClass=line=>{if(line.includes('失败')||line.includes('异常')||line.includes('错误'))return'log-err';if(line.includes('警告')||line.includes('上限'))return'log-warn';if(line.includes('完成')||line.includes('成功'))return'log-ok';if(line.includes('[活跃]')||line.includes('会话')||line.includes('开始'))return'log-accent';if(line.includes('[非活跃]'))return'log-inactive';return''}
+const logLineClass=line=>{if(line.includes('失败')||line.includes('异常')||line.includes('错误'))return'log-err';if(line.includes('会话结束模拟触发')||line.includes('会话收束')||line.includes('警告')||line.includes('上限')||line.includes('休息中'))return'log-warn';if(line.includes('完成')||line.includes('成功'))return'log-ok';if(line.includes('[活跃]')||line.includes('会话')||line.includes('开始'))return'log-accent';if(line.includes('[非活跃]'))return'log-inactive';return''}
 const configTabs=[{key:'rhythm',label:'节奏时段'},{key:'content',label:'下载内容'},{key:'upload',label:'处理上传'},{key:'storage',label:'存储管理'}]
 onMounted(async()=>{await Promise.all([poll(),loadAutomationSettings(),loadStorageStats()]);pollTimer=setInterval(poll,3000)})
 onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
@@ -700,6 +764,76 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
 }
 .ap-config {
   min-width: 0;
+}
+
+.session-summary-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.session-summary-badge {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.session-summary-badge--ok {
+  color: #0f766e;
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.2);
+}
+.session-summary-badge--warn {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.22);
+}
+.session-summary-badge--err {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.18);
+}
+.session-summary-badge--info,
+.session-summary-badge--muted {
+  color: var(--text-2);
+  background: rgba(148, 163, 184, 0.12);
+  border-color: rgba(148, 163, 184, 0.2);
+}
+.session-summary-meta {
+  display: grid;
+  gap: 4px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.session-summary-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-1);
+}
+.session-summary-stats span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.12);
+}
+.session-summary-reason {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-1);
+}
+.session-summary-reason--ok {
+  color: #0f766e;
+}
+.session-summary-reason--warn {
+  color: #b45309;
+}
+.session-summary-reason--err {
+  color: #b91c1c;
+}
+.session-summary-hint {
+  font-size: 12px;
+  color: var(--text-3);
 }
 
 /* ── 页头 ── */

@@ -70,6 +70,8 @@ class Wallpaper(Base):
     # 图床上传后的完整 URL（None 表示未上传或上传失败）
     imgbed_url = Column(String(512), nullable=True)
     upload_records = Column(Text, nullable=True)
+    upload_status = Column(String(32), nullable=True, index=True)
+    upload_note = Column(String(255), nullable=True)
 
     # 下载状态: "pending" | "downloading" | "done" | "failed" | "duplicate"
     status = Column(String(20), nullable=False, default="done", index=True)

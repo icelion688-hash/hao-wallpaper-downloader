@@ -84,7 +84,9 @@ class Task(Base):
     def update_progress(self):
         """根据计数更新进度百分比"""
         if self.total_count > 0:
-            done = self.success_count + self.failed_count + self.skip_count
+            # 进度仅按真正完成的下载尝试计算；
+            # 跳过项（重复 / 严格原图跳过）不应占用本轮目标数量。
+            done = self.success_count + self.failed_count
             self.progress = min(100.0, done / self.total_count * 100)
         else:
             self.progress = 0.0

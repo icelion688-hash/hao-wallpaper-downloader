@@ -371,6 +371,111 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-head">
+        <span class="card-icon">🔍</span>
+        <div>
+          <div class="card-title">上传一致性检查</div>
+          <div class="card-desc">对比本地图库记录和图床当前索引，检查哪些图片已经在图床上、但本地没记上，或本地显示已上传但图床已丢失。</div>
+        </div>
+      </div>
+
+      <div class="action-row">
+        <label class="form-label-inline">目录</label>
+        <input class="input input--fill" v-model="uploadAuditDir" placeholder="留空则扫描整个图床" :disabled="uploadAuditLoading || uploadAuditRepairing" />
+        <button class="btn btn--primary" @click="auditUploadConsistency" :disabled="uploadAuditLoading || uploadAuditRepairing || !profileReady">
+          {{ uploadAuditLoading ? '检查中...' : '开始检查' }}
+        </button>
+        <button class="btn" @click="repairUploadAuditIssues" :disabled="uploadAuditLoading || uploadAuditRepairing || !uploadAuditRepairablePayload.length || !profileReady">
+          {{ uploadAuditRepairing ? '修复中...' : ('修复可补建记录 ' + uploadAuditRepairablePayload.length + ' 条') }}
+        </button>
+        <button class="btn" @click="reuploadMissingRemoteAuditItems" :disabled="uploadAuditLoading || uploadAuditRepairing || !uploadAuditRemoteMissingIds.length || !profileReady">
+          {{ uploadAuditRepairing ? '处理中...' : ('重传图床缺失项 ' + uploadAuditRemoteMissingIds.length + ' 条') }}
+        </button>
+      </div>
+      <div class="hint" style="margin:-4px 0 10px">
+        这一步会直接扫描图床当前索引，不只看本地 `imgbed_url`。适合排查“本地数量和图床数量不一致”的真实原因。
+      </div>
+      <div class="inline-msg inline-msg--error" v-if="uploadAuditError">{{ uploadAuditError }}</div>
+
+      <template v-if="uploadAuditResult">
+        <div class="result-grid">
+          <div class="result-cell result-cell--ok">
+            <span class="result-num">{{ uploadAuditResult.consistent_count }}</span>
+            <span class="result-label">已一致</span>
+          </div>
+          <div class="result-cell result-cell--warn">
+            <span class="result-num">{{ uploadAuditResult.repairable_count }}</span>
+            <span class="result-label">可自动修复</span>
+          </div>
+          <div class="result-cell result-cell--muted">
+            <span class="result-num">{{ uploadAuditResult.remote_only_count }}</span>
+            <span class="result-label">远端孤儿文件</span>
+          </div>
+        </div>
+
+        <div class="tag-sync-result">
+          <span class="badge badge--info">本地 {{ uploadAuditResult.total_local }} 张</span>
+          <span class="badge badge--info">图床 {{ uploadAuditResult.total_remote }} 张</span>
+          <span class="badge" v-if="uploadAuditStatusCount('local_record_missing') > 0">缺本地记录 {{ uploadAuditStatusCount('local_record_missing') }}</span>
+          <span class="badge" v-if="uploadAuditStatusCount('path_drift') > 0">路径漂移 {{ uploadAuditStatusCount('path_drift') }}</span>
+          <span class="badge badge--warn" v-if="uploadAuditStatusCount('remote_missing') > 0">图床缺失 {{ uploadAuditStatusCount('remote_missing') }}</span>
+          <span class="badge" v-if="uploadAuditStatusCount('local_only') > 0">仅本地 {{ uploadAuditStatusCount('local_only') }}</span>
+          <span class="badge badge--warn" v-if="uploadAuditStatusCount('multiple_remote_files') > 0">远端重复 {{ uploadAuditStatusCount('multiple_remote_files') }}</span>
+        </div>
+
+        <details class="result-detail-card" v-if="uploadAuditFilteredProblemItems.length || uploadAuditFilteredRemoteOnlyPaths.length">
+          <summary class="result-detail-card__summary">
+            <span>查看检查明细</span>
+            <span class="badge">{{ uploadAuditResult.problem_count + uploadAuditResult.remote_only_count }} 项</span>
+          </summary>
+          <div class="result-detail-card__body">
+            <div class="result-detail-toolbar">
+              <div class="result-detail-toolbar__filters">
+                <button class="btn btn--xs" :class="{ 'btn--primary': uploadAuditView === 'all' }" @click="uploadAuditView = 'all'">全部</button>
+                <button class="btn btn--xs" :class="{ 'btn--primary': uploadAuditView === 'repairable' }" @click="uploadAuditView = 'repairable'">可修复 {{ uploadAuditRepairableItems.length }}</button>
+                <button class="btn btn--xs" :class="{ 'btn--primary': uploadAuditView === 'remote_missing' }" @click="uploadAuditView = 'remote_missing'">图床缺失 {{ uploadAuditStatusCount('remote_missing') }}</button>
+                <button class="btn btn--xs" :class="{ 'btn--primary': uploadAuditView === 'local_only' }" @click="uploadAuditView = 'local_only'">仅本地 {{ uploadAuditStatusCount('local_only') }}</button>
+                <button class="btn btn--xs" :class="{ 'btn--primary': uploadAuditView === 'remote_only' }" @click="uploadAuditView = 'remote_only'">远端孤儿 {{ uploadAuditResult.remote_only_count }}</button>
+              </div>
+              <div class="result-detail-toolbar__actions">
+                <input class="input input--sm result-detail-toolbar__search" v-model="uploadAuditSearch" placeholder="搜索路径 / resource_id / 原因" />
+              </div>
+            </div>
+
+            <div class="result-detail-group" v-if="uploadAuditFilteredProblemItems.length">
+              <div class="result-detail-group__title">本地与图床不一致</div>
+              <div class="result-detail-list">
+                <div class="result-detail-item" v-for="item in uploadAuditFilteredProblemItems" :key="'upload-audit-' + item.wallpaper_id + '-' + item.audit_status">
+                  <div class="result-detail-item__head">
+                    <span class="badge" :class="item.repairable ? 'badge--ok' : 'badge--warn'">{{ uploadAuditStatusLabel(item.audit_status) }}</span>
+                    <span class="result-detail-item__title">{{ item.resource_id || getFileBaseName(item.local_path) }}</span>
+                  </div>
+                  <div class="result-detail-item__path">本地：{{ item.local_path || '未知路径' }}</div>
+                  <div class="result-detail-item__path" v-if="item.recorded_path">记录路径：{{ item.recorded_path }}</div>
+                  <div class="result-detail-item__path" v-if="item.remote_path">图床路径：{{ item.remote_path }}</div>
+                  <div class="result-detail-item__meta">{{ item.reason }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="result-detail-group" v-if="uploadAuditFilteredRemoteOnlyPaths.length">
+              <div class="result-detail-group__title">远端孤儿文件</div>
+              <div class="result-detail-list">
+                <div class="result-detail-item" v-for="item in uploadAuditFilteredRemoteOnlyPaths" :key="'upload-audit-remote-only-' + item">
+                  <div class="result-detail-item__path">{{ item }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="result-detail-empty" v-if="!uploadAuditFilteredProblemItems.length && !uploadAuditFilteredRemoteOnlyPaths.length">
+              当前筛选条件下没有匹配结果。
+            </div>
+          </div>
+        </details>
+      </template>
+    </div>
+
     <div class="card cleanup-card" v-if="cleanupState.sourcePaths.length || cleanupState.sourceDirs.length">
       <div class="card-head">
         <span class="card-icon">🧹</span>
@@ -1289,6 +1394,13 @@ const localStateSyncResult = ref(null)
 const localStateSyncContext = ref('')
 const localStateSyncView = ref('all')
 const localStateSyncSearch = ref('')
+const uploadAuditDir = ref('')
+const uploadAuditLoading = ref(false)
+const uploadAuditRepairing = ref(false)
+const uploadAuditResult = ref(null)
+const uploadAuditError = ref('')
+const uploadAuditView = ref('all')
+const uploadAuditSearch = ref('')
 
 // ── 转移后清理 ──────────────────────────────────────────────────
 const cleanupState = ref(createCleanupState())
@@ -1652,6 +1764,64 @@ const localStateSyncCopyText = computed(() => {
   }
   return sections.join('\n\n')
 })
+const uploadAuditKeyword = computed(() => String(uploadAuditSearch.value || '').trim().toLowerCase())
+const uploadAuditProblemItems = computed(() => (
+  Array.isArray(uploadAuditResult.value?.problem_items) ? uploadAuditResult.value.problem_items : []
+))
+const uploadAuditRepairableItems = computed(() => uploadAuditProblemItems.value.filter((item) => item?.repairable && item?.remote_path))
+const uploadAuditRemoteOnlyPaths = computed(() => (
+  Array.isArray(uploadAuditResult.value?.remote_only_paths) ? uploadAuditResult.value.remote_only_paths : []
+))
+const uploadAuditRemoteMissingItems = computed(() => (
+  uploadAuditProblemItems.value.filter((item) => item?.audit_status === 'remote_missing')
+))
+const uploadAuditRemoteMissingIds = computed(() => (
+  uploadAuditRemoteMissingItems.value
+    .map((item) => Number(item?.wallpaper_id || 0))
+    .filter((id) => id > 0)
+))
+const uploadAuditFilteredProblemItems = computed(() => {
+  const keyword = uploadAuditKeyword.value
+  return uploadAuditProblemItems.value.filter((item) => {
+    if (uploadAuditView.value === 'repairable' && !item?.repairable) return false
+    if (uploadAuditView.value === 'remote_missing' && item?.audit_status !== 'remote_missing') return false
+    if (uploadAuditView.value === 'local_only' && item?.audit_status !== 'local_only') return false
+    if (uploadAuditView.value !== 'all' && !['repairable', 'remote_missing', 'local_only', 'remote_only'].includes(uploadAuditView.value)) {
+      return item?.audit_status === uploadAuditView.value
+    }
+    if (!keyword || uploadAuditView.value === 'remote_only') return true
+    const haystack = [
+      item?.resource_id,
+      item?.local_path,
+      item?.recorded_path,
+      item?.remote_path,
+      item?.reason,
+      item?.audit_status,
+    ].map((value) => String(value || '').toLowerCase()).join(' ')
+    return haystack.includes(keyword)
+  })
+})
+const uploadAuditFilteredRemoteOnlyPaths = computed(() => {
+  if (uploadAuditView.value !== 'all' && uploadAuditView.value !== 'remote_only') return []
+  const keyword = uploadAuditKeyword.value
+  if (!keyword) return uploadAuditRemoteOnlyPaths.value
+  return uploadAuditRemoteOnlyPaths.value.filter((item) => String(item || '').toLowerCase().includes(keyword))
+})
+const uploadAuditRepairablePayload = computed(() => {
+  const seen = new Set()
+  return uploadAuditRepairableItems.value
+    .filter((item) => {
+      const key = String(item?.remote_path || '')
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .map((item) => ({
+      path: item.remote_path,
+      sourcePath: item.recorded_path || item.remote_path,
+      tags: Array.isArray(item.remote_tags) ? item.remote_tags : [],
+    }))
+})
 
 function formatOperationError(err, fallback = '未知错误') {
   const message = String(err?.message || err || '').trim() || fallback
@@ -1662,6 +1832,20 @@ function formatOperationError(err, fallback = '未知错误') {
     return `${message} 这通常是图床 HTTPS 握手或网络兼容问题。`
   }
   return message
+}
+
+function uploadAuditStatusLabel(status) {
+  return {
+    local_record_missing: '缺本地记录',
+    path_drift: '路径漂移',
+    remote_missing: '图床缺失',
+    local_only: '仅本地',
+    multiple_remote_files: '远端重复',
+  }[String(status || '')] || '异常'
+}
+
+function uploadAuditStatusCount(status) {
+  return uploadAuditProblemItems.value.filter((item) => item?.audit_status === status).length
 }
 
 const organizeOverviewFacts = computed(() => ([
@@ -3108,6 +3292,72 @@ async function repairAndSyncTagsFromDB() {
   }
 }
 
+async function auditUploadConsistency() {
+  if (!profileReady.value) return
+  uploadAuditLoading.value = true
+  uploadAuditError.value = ''
+  uploadAuditResult.value = null
+  try {
+    const result = await galleryApi.auditUploadConsistency({
+      profile_key: activeProfile.value.key,
+      dir: uploadAuditDir.value || '',
+    })
+    uploadAuditResult.value = result?.data || result || null
+    uploadAuditView.value = 'all'
+    uploadAuditSearch.value = ''
+    if ((uploadAuditResult.value?.problem_count || 0) === 0 && (uploadAuditResult.value?.remote_only_count || 0) === 0) {
+      globalNotice.value = '上传一致性检查完成：本地记录和图床索引当前一致。'
+    } else {
+      globalNotice.value = `上传一致性检查完成：发现 ${uploadAuditResult.value?.problem_count || 0} 条本地差异，远端孤儿 ${uploadAuditResult.value?.remote_only_count || 0} 条。`
+    }
+    globalError.value = ''
+  } catch (err) {
+    uploadAuditError.value = '上传一致性检查失败：' + formatOperationError(err)
+  } finally {
+    uploadAuditLoading.value = false
+  }
+}
+
+async function repairUploadAuditIssues() {
+  if (!profileReady.value || !uploadAuditRepairablePayload.value.length) return
+  uploadAuditRepairing.value = true
+  uploadAuditError.value = ''
+  try {
+    await syncRemoteStateToLocal(uploadAuditRepairablePayload.value, {
+      syncLocalTags: false,
+      context: '来自上传一致性修复',
+    })
+    await auditUploadConsistency()
+    globalNotice.value = `上传一致性修复完成：已补建/修正 ${uploadAuditRepairablePayload.value.length} 条本地上传记录。`
+  } catch (err) {
+    uploadAuditError.value = '上传一致性修复失败：' + formatOperationError(err)
+  } finally {
+    uploadAuditRepairing.value = false
+  }
+}
+
+async function reuploadMissingRemoteAuditItems() {
+  if (!profileReady.value || !uploadAuditRemoteMissingIds.value.length) return
+  if (!window.confirm(`确认重新上传 ${uploadAuditRemoteMissingIds.value.length} 条图床缺失记录吗？这会调用当前 Profile 重新上传本地文件。`)) return
+  uploadAuditRepairing.value = true
+  uploadAuditError.value = ''
+  try {
+    await galleryApi.batchUpload({
+      profile_key: activeProfile.value.key,
+      upload_format: 'profile',
+      upload_with_tags: true,
+      upload_scope: 'selected',
+      wallpaper_ids: uploadAuditRemoteMissingIds.value,
+    })
+    await auditUploadConsistency()
+    globalNotice.value = `图床缺失项已重新上传 ${uploadAuditRemoteMissingIds.value.length} 条。`
+  } catch (err) {
+    uploadAuditError.value = '重新上传图床缺失项失败：' + formatOperationError(err)
+  } finally {
+    uploadAuditRepairing.value = false
+  }
+}
+
 // ── 文件浏览器 ───────────────────────────────────────────────────
 function onBrowserToggle(event) {
   browserOpen.value = event.target.open
@@ -3459,6 +3709,10 @@ watch(
 watch(activeKey, async () => {
   restoreTemplateLockState(activeKey.value)
   resetRemoteState()
+  uploadAuditResult.value = null
+  uploadAuditError.value = ''
+  uploadAuditView.value = 'all'
+  uploadAuditSearch.value = ''
   if (activeProfile.value?.key && profileReady.value && browserOpen.value) {
     await loadRemoteCapabilities()
     await loadRemoteList()

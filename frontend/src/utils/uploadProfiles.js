@@ -117,6 +117,21 @@ export function normalizeUploadSettings(remote = {}) {
   }
 }
 
+export function getAvailableUploadProfiles(settings = {}) {
+  return (settings.profiles || []).filter(profile => profile?.enabled !== false && String(profile?.api_token || '').trim())
+}
+
+export function resolveAvailableUploadProfileKey(settings = {}, preferredKey = '', fallbackKey = '') {
+  const profiles = settings.profiles || []
+  const availableProfiles = getAvailableUploadProfiles(settings)
+  const availableKeys = new Set(availableProfiles.map(profile => profile.key))
+  const preferred = String(preferredKey || '').trim()
+  const fallback = String(fallbackKey || '').trim()
+  if (preferred && availableKeys.has(preferred)) return preferred
+  if (fallback && availableKeys.has(fallback)) return fallback
+  return availableProfiles[0]?.key || profiles[0]?.key || ''
+}
+
 export function isLosslessUploadProfile(profile) {
   return profile?.image_processing?.format === 'original' || !profile?.image_processing?.enabled
 }

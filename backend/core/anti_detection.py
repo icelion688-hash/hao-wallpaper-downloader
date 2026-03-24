@@ -16,7 +16,7 @@ import os
 import random
 from contextlib import asynccontextmanager
 from datetime import date, datetime
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 
 import httpx
@@ -527,7 +527,11 @@ class HumanBehaviorController:
 
     # ── 节奏控制 ─────────────────────────────────────────────────────────────
 
-    async def post_download_delay(self, success_count: int) -> bool:
+    async def post_download_delay(
+        self,
+        success_count: int,
+        announce: Optional[Callable[[str], None]] = None,
+    ) -> bool:
         """
         每次成功下载后的等待，模拟人查看壁纸的行为节奏。
 
@@ -536,17 +540,23 @@ class HumanBehaviorController:
 
         Returns:
             True  — 正常延迟后继续
-            False — 触发层 4 会话结束模拟，调用方应终止本轮任务（长时间挂起）
+            False — 触发层 4 会话结束模拟，调用方应终止本轮任务，
+                    后续由外层调度安排下一次会话
         """
         # 层 4：会话结束模拟（满 10 张后 5% 概率，仅在活跃时段触发）
-        # 模拟用户关闭标签页、去做别的事，稍后重开的行为
+        # 模拟用户关闭标签页、去做别的事，稍后再开新会话。
+        # 这里不直接 sleep 20–90 分钟，避免单个任务看起来像“卡死”。
         if success_count >= 10 and random.random() < 0.05:
             rest = random.uniform(20 * 60, 90 * 60)  # 20–90 分钟
+            if announce:
+                announce(
+                    f"会话结束模拟触发：建议休息约 {rest / 60:.0f} 分钟，"
+                    "本轮将提前结束"
+                )
             logger.info(
-                "[Human] 层4-会话结束模拟，暂停 %.0f 分钟（模拟用户关闭浏览器）",
+                "[Human] 层4-会话结束模拟，建议结束本轮，预计下次间隔 %.0f 分钟",
                 rest / 60,
             )
-            await asyncio.sleep(rest)
             return False
 
         # 层 2：批次疲劳休息（优先级高于层 3，触发后跳过层 1/3）
@@ -554,6 +564,8 @@ class HumanBehaviorController:
         burst_size = 8 + (success_count % 8)  # 8 ~ 15
         if success_count > 0 and success_count % burst_size == 0:
             rest = random.uniform(60.0, 180.0)
+            if announce:
+                announce(f"批次休息中：预计 {rest:.0f} 秒后继续")
             logger.info("[Human] 已下载 %d 张，批次休息 %.0f 秒", success_count, rest)
             await asyncio.sleep(rest)
             return True
@@ -561,6 +573,8 @@ class HumanBehaviorController:
         # 层 3：随机长休息（~3% 概率，模拟用户去做其他事）
         if random.random() < 0.03:
             rest = random.uniform(300.0, 900.0)
+            if announce:
+                announce(f"随机长休息中：预计 {rest / 60:.0f} 分钟后继续")
             logger.info("[Human] 随机长休息 %.0f 秒（模拟用户离开）", rest)
             await asyncio.sleep(rest)
             return True

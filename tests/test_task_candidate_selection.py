@@ -1,11 +1,16 @@
 import unittest
 
 from backend.api.tasks import (
+    _build_original_cooldown_message,
+    _classify_static_preview_fallback,
+    _determine_original_cooldown_seconds,
     _format_prefilter_summary,
     _get_wallpaper_orientation,
     _has_mixed_static_orientations,
     _resolve_source_scopes,
     _select_diversified_candidates,
+    _should_skip_original_retry,
+    _summarize_original_failure_reason,
 )
 
 
@@ -61,6 +66,36 @@ class TaskCandidateSelectionTests(unittest.TestCase):
             screen_orientation = "all"
 
         self.assertEqual(_resolve_source_scopes(_Cfg()), ["desktop_static", "mobile_static"])
+
+    def test_classify_static_preview_fallback_downgrades_vip_preview(self):
+        self.assertEqual(
+            _classify_static_preview_fallback(account_type="vip", login_valid=True),
+            "downgrade_preview",
+        )
+
+    def test_classify_static_preview_fallback_rejects_invalid_login(self):
+        self.assertEqual(
+            _classify_static_preview_fallback(account_type="vip", login_valid=False),
+            "invalid_login",
+        )
+
+    def test_summarize_original_failure_reason_for_challenge_305(self):
+        self.assertEqual(
+            _summarize_original_failure_reason("challenge 请求失败: HTTP 305"),
+            "altcha challenge 被站点限流(305)",
+        )
+
+    def test_should_skip_original_retry_for_challenge_305(self):
+        self.assertTrue(_should_skip_original_retry("challenge 请求失败: HTTP 305"))
+
+    def test_determine_original_cooldown_seconds_for_rate_limits(self):
+        self.assertEqual(_determine_original_cooldown_seconds("challenge 请求失败: HTTP 305"), 180)
+        self.assertEqual(_determine_original_cooldown_seconds("verify HTTP 305"), 120)
+        self.assertEqual(_determine_original_cooldown_seconds("getCompleteUrl HTTP 305"), 90)
+
+    def test_build_original_cooldown_message_is_human_readable(self):
+        message = _build_original_cooldown_message("challenge 请求失败: HTTP 305", 12.2)
+        self.assertEqual(message, "原图链路冷却中，剩余 13 秒 | altcha challenge 被站点限流(305)")
 
 
 if __name__ == "__main__":

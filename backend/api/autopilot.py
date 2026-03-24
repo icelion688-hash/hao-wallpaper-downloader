@@ -43,6 +43,11 @@ class AutoPilotConfigRequest(BaseModel):
     use_imgbed_upload: bool = False
     static_upload_profile: str = ""
     dynamic_upload_profile: str = ""
+    static_upload_channel: str = ""
+    static_upload_channel_name: str = ""
+    dynamic_upload_channel: str = ""
+    dynamic_upload_channel_name: str = ""
+    strict_original: bool = False
     wallpaper_type: str = "static"
     sort_by: str = "yesterday_hot"
     categories: List[str] = []
