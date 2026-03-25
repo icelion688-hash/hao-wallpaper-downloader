@@ -338,8 +338,15 @@ class HumanBehaviorController:
         self._state["limit_mode"] = self._normalize_limit_mode(
             self._state.get("limit_mode", "auto")
         )
-        self._state["manual_limit"] = self._normalize_manual_limit(
-            self._state.get("manual_limit")
+        manual_limit_min, manual_limit_max = self._normalize_manual_limit_range(
+            self._state.get("manual_limit_min"),
+            self._state.get("manual_limit_max"),
+            fallback_limit=self._state.get("manual_limit"),
+        )
+        self._state["manual_limit_min"] = manual_limit_min
+        self._state["manual_limit_max"] = manual_limit_max
+        self._state["manual_limit"] = (
+            manual_limit_min if manual_limit_min == manual_limit_max else None
         )
 
     def _save(self) -> None:
@@ -365,6 +372,31 @@ class HumanBehaviorController:
         return max(cls.MANUAL_LIMIT_MIN, min(cls.MANUAL_LIMIT_MAX, manual_limit))
 
     @classmethod
+    def _normalize_manual_limit_range(
+        cls,
+        raw_min,
+        raw_max,
+        fallback_limit=None,
+    ) -> tuple[Optional[int], Optional[int]]:
+        normalized_min = cls._normalize_manual_limit(raw_min)
+        normalized_max = cls._normalize_manual_limit(raw_max)
+        fallback = cls._normalize_manual_limit(fallback_limit)
+        if normalized_min is None and normalized_max is None and fallback is not None:
+            normalized_min = fallback
+            normalized_max = fallback
+        elif normalized_min is None and normalized_max is not None:
+            normalized_min = normalized_max
+        elif normalized_max is None and normalized_min is not None:
+            normalized_max = normalized_min
+        if normalized_min is None or normalized_max is None:
+            return None, None
+        return (
+            (normalized_min, normalized_max)
+            if normalized_min <= normalized_max
+            else (normalized_max, normalized_min)
+        )
+
+    @classmethod
     def _auto_limit_for_date(cls, date_str: str) -> int:
         # 哈希种子：同一天结果稳定，不同天差异足够大
         seed = int(hashlib.md5(date_str.encode()).hexdigest()[:8], 16)
@@ -373,16 +405,39 @@ class HumanBehaviorController:
         raw = rng.gauss(45, 12)
         return max(cls.DAILY_MIN, min(cls.DAILY_MAX, int(raw)))
 
+    @classmethod
+    def _manual_limit_for_date(
+        cls,
+        date_str: str,
+        manual_limit_min: Optional[int],
+        manual_limit_max: Optional[int],
+    ) -> Optional[int]:
+        if manual_limit_min is None or manual_limit_max is None:
+            return None
+        if manual_limit_min == manual_limit_max:
+            return manual_limit_min
+        seed_input = f"{date_str}:{manual_limit_min}:{manual_limit_max}"
+        seed = int(hashlib.md5(seed_input.encode()).hexdigest()[:8], 16)
+        rng = random.Random(seed)
+        return rng.randint(manual_limit_min, manual_limit_max)
+
     def _resolve_limit_for_day(
         self,
         date_str: str,
         limit_mode: Optional[str] = None,
         manual_limit: Optional[int] = None,
+        manual_limit_min: Optional[int] = None,
+        manual_limit_max: Optional[int] = None,
     ) -> int:
         mode = self._normalize_limit_mode(limit_mode or self._state.get("limit_mode", "auto"))
-        resolved_manual_limit = self._normalize_manual_limit(
-            manual_limit if manual_limit is not None else self._state.get("manual_limit")
+        normalized_min, normalized_max = self._normalize_manual_limit_range(
+            manual_limit_min if manual_limit_min is not None else self._state.get("manual_limit_min"),
+            manual_limit_max if manual_limit_max is not None else self._state.get("manual_limit_max"),
+            fallback_limit=(
+                manual_limit if manual_limit is not None else self._state.get("manual_limit")
+            ),
         )
+        resolved_manual_limit = self._manual_limit_for_date(date_str, normalized_min, normalized_max)
         if mode == "manual" and resolved_manual_limit is not None:
             return resolved_manual_limit
         return self._auto_limit_for_date(date_str)
@@ -391,19 +446,30 @@ class HumanBehaviorController:
         self,
         limit_mode: str = "auto",
         manual_limit: Optional[int] = None,
+        manual_limit_min: Optional[int] = None,
+        manual_limit_max: Optional[int] = None,
     ) -> None:
         normalized_mode = self._normalize_limit_mode(limit_mode)
-        normalized_manual_limit = self._normalize_manual_limit(manual_limit)
+        normalized_min, normalized_max = self._normalize_manual_limit_range(
+            manual_limit_min,
+            manual_limit_max,
+            fallback_limit=manual_limit,
+        )
+        normalized_manual_limit = normalized_min if normalized_min == normalized_max else None
         today = date.today().isoformat()
         downloaded = max(0, int(self._state.get("downloaded", 0) or 0))
         effective_limit = self._resolve_limit_for_day(
             today,
             limit_mode=normalized_mode,
             manual_limit=normalized_manual_limit,
+            manual_limit_min=normalized_min,
+            manual_limit_max=normalized_max,
         )
         changed = (
             self._state.get("limit_mode") != normalized_mode
             or self._state.get("manual_limit") != normalized_manual_limit
+            or self._state.get("manual_limit_min") != normalized_min
+            or self._state.get("manual_limit_max") != normalized_max
             or self._state.get("date") != today
             or self._state.get("daily_limit") != effective_limit
         )
@@ -412,16 +478,27 @@ class HumanBehaviorController:
                 "date": today,
                 "limit_mode": normalized_mode,
                 "manual_limit": normalized_manual_limit,
+                "manual_limit_min": normalized_min,
+                "manual_limit_max": normalized_max,
                 "daily_limit": effective_limit,
                 "downloaded": downloaded if self._state.get("date") == today else 0,
             }
         )
         if changed:
             self._save()
-            mode_label = "手动" if normalized_mode == "manual" and normalized_manual_limit else "自动"
+            mode_label = "手动" if normalized_mode == "manual" and effective_limit else "自动"
+            if normalized_mode == "manual" and normalized_min and normalized_max:
+                range_label = (
+                    f"{normalized_min} 张"
+                    if normalized_min == normalized_max
+                    else f"{normalized_min}–{normalized_max} 张"
+                )
+            else:
+                range_label = "系统自动"
             logger.info(
-                "[Human] 每日上限策略已更新: %s模式，今日上限 %d 张，已下 %d 张",
+                "[Human] 每日上限策略已更新: %s模式（%s），今日上限 %d 张，已下 %d 张",
                 mode_label,
+                range_label,
                 effective_limit,
                 self._state.get("downloaded", 0),
             )
@@ -462,8 +539,19 @@ class HumanBehaviorController:
         """确保 _state 对应今天，否则重新生成当天的随机上限。"""
         today = date.today().isoformat()
         limit_mode = self._normalize_limit_mode(self._state.get("limit_mode", "auto"))
-        manual_limit = self._normalize_manual_limit(self._state.get("manual_limit"))
-        limit = self._resolve_limit_for_day(today, limit_mode=limit_mode, manual_limit=manual_limit)
+        manual_limit_min, manual_limit_max = self._normalize_manual_limit_range(
+            self._state.get("manual_limit_min"),
+            self._state.get("manual_limit_max"),
+            fallback_limit=self._state.get("manual_limit"),
+        )
+        manual_limit = manual_limit_min if manual_limit_min == manual_limit_max else None
+        limit = self._resolve_limit_for_day(
+            today,
+            limit_mode=limit_mode,
+            manual_limit=manual_limit,
+            manual_limit_min=manual_limit_min,
+            manual_limit_max=manual_limit_max,
+        )
         if self._state.get("date") != today:
             self._state = {
                 "date": today,
@@ -471,9 +559,11 @@ class HumanBehaviorController:
                 "downloaded": 0,
                 "limit_mode": limit_mode,
                 "manual_limit": manual_limit,
+                "manual_limit_min": manual_limit_min,
+                "manual_limit_max": manual_limit_max,
             }
             self._save()
-            mode_label = "手动" if limit_mode == "manual" and manual_limit else "自动"
+            mode_label = "手动" if limit_mode == "manual" and manual_limit_min is not None else "自动"
             logger.info("[Human] 新的一天，今日下载上限: %d 张（%s模式）", limit, mode_label)
         else:
             changed = False
@@ -485,6 +575,12 @@ class HumanBehaviorController:
                 changed = True
             if self._state.get("manual_limit") != manual_limit:
                 self._state["manual_limit"] = manual_limit
+                changed = True
+            if self._state.get("manual_limit_min") != manual_limit_min:
+                self._state["manual_limit_min"] = manual_limit_min
+                changed = True
+            if self._state.get("manual_limit_max") != manual_limit_max:
+                self._state["manual_limit_max"] = manual_limit_max
                 changed = True
             if changed:
                 self._save()
@@ -504,6 +600,16 @@ class HumanBehaviorController:
     def manual_daily_limit(self) -> Optional[int]:
         """手动模式下的用户配置上限"""
         return self._ensure_today().get("manual_limit")
+
+    @property
+    def manual_daily_limit_min(self) -> Optional[int]:
+        """手动模式下的范围下界"""
+        return self._ensure_today().get("manual_limit_min")
+
+    @property
+    def manual_daily_limit_max(self) -> Optional[int]:
+        """手动模式下的范围上界"""
+        return self._ensure_today().get("manual_limit_max")
 
     @property
     def downloaded_today(self) -> int:

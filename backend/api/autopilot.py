@@ -10,7 +10,7 @@ api/autopilot.py — AutoPilot 全自动调度 API
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 router = APIRouter()
@@ -25,6 +25,8 @@ class AutoPilotConfigRequest(BaseModel):
     # ── 每日下载上限 ────────────────────────────────────────────────────────
     daily_limit_mode: str = Field(default="auto", pattern="^(auto|manual)$")
     manual_daily_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    manual_daily_limit_min: Optional[int] = Field(default=None, ge=1, le=500)
+    manual_daily_limit_max: Optional[int] = Field(default=None, ge=1, le=500)
 
     # ── 活跃时段下载模式 ────────────────────────────────────────────────────
     active_session_min: int = Field(default=5,    ge=1, le=200)
@@ -70,6 +72,23 @@ async def get_status(request: Request):
     """返回当前运行状态、配置、今日统计和最近日志"""
     engine = request.app.state.autopilot
     return engine.get_status()
+
+
+@router.get("/history")
+async def get_history(request: Request, limit: int = 8):
+    """返回最近几轮 AutoPilot 会话摘要。"""
+    engine = request.app.state.autopilot
+    return {"sessions": engine.get_recent_sessions(limit=limit)}
+
+
+@router.get("/history/{task_id}/logs")
+async def get_history_logs(task_id: int, request: Request):
+    """返回指定 AutoPilot 会话的持久化日志。"""
+    engine = request.app.state.autopilot
+    logs = engine.get_session_logs(task_id)
+    if not logs:
+        raise HTTPException(404, f"AutoPilot 会话 {task_id} 不存在或暂无日志")
+    return {"task_id": task_id, "logs": logs}
 
 
 @router.post("/start")

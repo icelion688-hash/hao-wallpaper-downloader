@@ -34,6 +34,7 @@ export const tasksApi = {
   list: () => http.get('/tasks'),
   create: (data) => http.post('/tasks', data),
   get: (id) => http.get(`/tasks/${id}`),
+  logHistory: (id) => http.get(`/tasks/${id}/logs/history`),
   rename: (id, name) => http.patch(`/tasks/${id}`, { name }),
   start: (id) => http.post(`/tasks/${id}/start`),
   pause: (id) => http.post(`/tasks/${id}/pause`),
@@ -72,6 +73,8 @@ export const statsApi = {
   overview: () => http.get('/stats/overview'),
   byCategory: () => http.get('/stats/by-category'),
   byDate: (days = 30) => http.get('/stats/by-date', { params: { days } }),
+  uploadCoverage: () => http.get('/stats/upload-coverage'),
+  reuploadMissing: () => http.post('/stats/upload-coverage/reupload'),
 }
 
 export const scheduleApi = {
@@ -112,6 +115,8 @@ export const convertApi = {
 
 export const autopilotApi = {
   status: () => http.get('/autopilot/status'),
+  history: () => http.get('/autopilot/history'),
+  sessionLogs: (taskId) => http.get(`/autopilot/history/${taskId}/logs`),
   start: (data) => http.post('/autopilot/start', data),
   stop: () => http.post('/autopilot/stop'),
   saveConfig: (data) => http.put('/autopilot/config', data),

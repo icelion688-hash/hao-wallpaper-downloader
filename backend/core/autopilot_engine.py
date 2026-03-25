@@ -54,6 +54,8 @@ RUNTIME_WAKE_KEYS = {
     "active_end",
     "daily_limit_mode",
     "manual_daily_limit",
+    "manual_daily_limit_min",
+    "manual_daily_limit_max",
     "inactive_enabled",
     "active_interval_min",
     "active_interval_max",
@@ -126,6 +128,8 @@ class AutoPilotEngine:
             # ── 每日下载上限 ────────────────────────────────────────────────
             "daily_limit_mode": "auto",     # auto=自动生成今日上限，manual=使用手动值
             "manual_daily_limit": None,      # 手动模式下的每日下载上限
+            "manual_daily_limit_min": None,  # 手动模式下的下界
+            "manual_daily_limit_max": None,  # 手动模式下的上界
 
             # ── 活跃时段下载模式 ────────────────────────────────────────────
             "active_session_min": 5,    # 单次最少下载张数
@@ -266,9 +270,39 @@ class AutoPilotEngine:
             "manual" if str(cfg.get("daily_limit_mode", "auto")).strip().lower() == "manual" else "auto"
         )
         manual_daily_limit = cfg.get("manual_daily_limit")
-        cfg["manual_daily_limit"] = (
+        normalized_manual_limit = (
             None if manual_daily_limit in (None, "", 0, "0")
             else max(1, min(500, int(manual_daily_limit)))
+        )
+        manual_daily_limit_min = cfg.get("manual_daily_limit_min")
+        manual_daily_limit_max = cfg.get("manual_daily_limit_max")
+        normalized_manual_limit_min = (
+            None if manual_daily_limit_min in (None, "", 0, "0")
+            else max(1, min(500, int(manual_daily_limit_min)))
+        )
+        normalized_manual_limit_max = (
+            None if manual_daily_limit_max in (None, "", 0, "0")
+            else max(1, min(500, int(manual_daily_limit_max)))
+        )
+        if normalized_manual_limit_min is None and normalized_manual_limit_max is None and normalized_manual_limit is not None:
+            normalized_manual_limit_min = normalized_manual_limit
+            normalized_manual_limit_max = normalized_manual_limit
+        elif normalized_manual_limit_min is None and normalized_manual_limit_max is not None:
+            normalized_manual_limit_min = normalized_manual_limit_max
+        elif normalized_manual_limit_max is None and normalized_manual_limit_min is not None:
+            normalized_manual_limit_max = normalized_manual_limit_min
+        if normalized_manual_limit_min is not None and normalized_manual_limit_max is not None:
+            normalized_manual_limit_min, normalized_manual_limit_max = cls._normalize_pair(
+                normalized_manual_limit_min,
+                normalized_manual_limit_max,
+                1,
+            )
+        cfg["manual_daily_limit_min"] = normalized_manual_limit_min
+        cfg["manual_daily_limit_max"] = normalized_manual_limit_max
+        cfg["manual_daily_limit"] = (
+            normalized_manual_limit_min
+            if normalized_manual_limit_min is not None and normalized_manual_limit_min == normalized_manual_limit_max
+            else None
         )
         cfg["active_session_min"], cfg["active_session_max"] = cls._normalize_pair(
             cfg.get("active_session_min", 5),
@@ -349,6 +383,8 @@ class AutoPilotEngine:
         human_ctrl.apply_daily_limit_config(
             limit_mode=self._config.get("daily_limit_mode", "auto"),
             manual_limit=self._config.get("manual_daily_limit"),
+            manual_limit_min=self._config.get("manual_daily_limit_min"),
+            manual_limit_max=self._config.get("manual_daily_limit_max"),
         )
 
     # ── 状态查询 ─────────────────────────────────────────────────────────────
@@ -372,6 +408,8 @@ class AutoPilotEngine:
                     "remaining": human_ctrl.remaining_today,
                     "limit_mode": human_ctrl.daily_limit_mode,
                     "manual_daily_limit": human_ctrl.manual_daily_limit,
+                    "manual_daily_limit_min": human_ctrl.manual_daily_limit_min,
+                    "manual_daily_limit_max": human_ctrl.manual_daily_limit_max,
                 }
             )
         return {
@@ -398,6 +436,7 @@ class AutoPilotEngine:
             "current_task_id": self._current_task_id,
             "last_session": self._last_session_summary,
             "logs": list(self._logs[-200:]),
+            "recent_sessions": self.get_recent_sessions(limit=8),
         }
 
     @staticmethod
@@ -465,6 +504,51 @@ class AutoPilotEngine:
         except Exception as exc:
             logger.warning("[AutoPilot] 最近一轮摘要回填失败: %s", exc)
             return None
+
+    @classmethod
+    def get_recent_sessions(cls, limit: int = 8) -> list[dict]:
+        try:
+            from backend.models.database import SessionLocal
+            from backend.models.task import Task as TaskModel
+
+            db = SessionLocal()
+            try:
+                tasks = (
+                    db.query(TaskModel)
+                    .filter(TaskModel.name.like("AutoPilot %"))
+                    .order_by(TaskModel.created_at.desc(), TaskModel.id.desc())
+                    .limit(max(1, int(limit)))
+                    .all()
+                )
+                return [cls._build_session_summary_from_task(task) for task in tasks]
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("[AutoPilot] 最近会话列表读取失败: %s", exc)
+            return []
+
+    @staticmethod
+    def get_session_logs(task_id: int) -> list[str]:
+        try:
+            from backend.models.database import SessionLocal
+            from backend.models.task import Task as TaskModel
+
+            db = SessionLocal()
+            try:
+                task = (
+                    db.query(TaskModel)
+                    .filter(TaskModel.id == task_id, TaskModel.name.like("AutoPilot %"))
+                    .first()
+                )
+                if not task:
+                    return []
+                lines = [line.strip() for line in str(task.log_text or "").splitlines() if line.strip()]
+                return lines[-500:]
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("[AutoPilot] 会话日志读取失败 task_id=%s error=%s", task_id, exc)
+            return []
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 

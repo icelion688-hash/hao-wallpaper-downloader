@@ -62,6 +62,11 @@ def _migrate_db():
         "ALTER TABLE accounts ADD COLUMN last_verify_can_original BOOLEAN",
         "ALTER TABLE wallpapers ADD COLUMN video_duration REAL",
         "ALTER TABLE wallpapers ADD COLUMN converted_path VARCHAR(512)",
+        "ALTER TABLE wallpapers ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE wallpapers ADD COLUMN retry_payload TEXT",
+        "ALTER TABLE wallpapers ADD COLUMN last_error TEXT",
+        "ALTER TABLE wallpapers ADD COLUMN next_retry_at DATETIME",
+        "ALTER TABLE wallpapers ADD COLUMN last_attempt_at DATETIME",
     ]
     with engine.connect() as conn:
         for sql in migrations:

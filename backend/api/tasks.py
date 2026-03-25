@@ -21,7 +21,7 @@ import random
 import subprocess
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, AsyncIterator
 
 import httpx
@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from backend.models.database import get_db, SessionLocal
 from backend.models.task import Task
@@ -61,6 +62,33 @@ router = APIRouter()
 # 运行中的任务 {task_id: asyncio.Task}
 _running_tasks: dict[int, asyncio.Task] = {}
 _STATIC_ORIENTATION_SCAN_LIMIT = 400
+_TASK_LOG_MAX_LINES = 500
+_AUTO_RETRY_MAX_ATTEMPTS = 5
+_AUTO_RETRY_FETCH_LIMIT = 50
+
+_RETRY_DELAY_SECONDS = {
+    "network": 180,
+    "original_access": 600,
+    "download_url": 300,
+}
+
+_RETRYABLE_REASON_TOKENS = (
+    "challenge 获取失败",
+    "challenge 请求失败",
+    "verify HTTP",
+    "getCompleteUrl",
+    "原图链路冷却中",
+    "下载超时",
+    "文件不完整",
+    "timed out",
+    "timeout",
+    "network",
+    "连接",
+    "Connection",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "RemoteProtocolError",
+)
 
 
 def _get_convert_queue():
@@ -374,6 +402,79 @@ def _format_prefilter_summary(
     return " | ".join(parts)
 
 
+def _split_task_log_lines(log_text: str, max_lines: int = _TASK_LOG_MAX_LINES) -> list[str]:
+    lines = [line.strip() for line in str(log_text or "").splitlines() if line.strip()]
+    if len(lines) > max_lines:
+        return lines[-max_lines:]
+    return lines
+
+
+def _serialize_retry_payload(item: dict) -> str:
+    payload = {
+        key: value
+        for key, value in (item or {}).items()
+        if not str(key).startswith("_")
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _classify_retry_policy(reason: str, failure_stage: str) -> tuple[bool, str, int]:
+    normalized_reason = str(reason or "").strip()
+    normalized_stage = str(failure_stage or "").strip().lower()
+
+    if not normalized_reason and not normalized_stage:
+        return False, "", 0
+    if "账号登录态失效" in normalized_reason or "无可用账号" in normalized_reason:
+        return False, "", 0
+    if "磁盘剩余空间不足" in normalized_reason or normalized_stage == "filesystem":
+        return False, "", 0
+
+    if (
+        "challenge" in normalized_reason
+        or "verify HTTP" in normalized_reason
+        or "getCompleteUrl" in normalized_reason
+        or "原图链路" in normalized_reason
+        or normalized_stage == "original_access"
+    ):
+        return True, "original_access", _RETRY_DELAY_SECONDS["original_access"]
+
+    if normalized_stage in {"network", "request", "content"}:
+        return True, "network", _RETRY_DELAY_SECONDS["network"]
+
+    if normalized_stage in {"detail", "download_url"} or "无下载地址" in normalized_reason:
+        return True, "download_url", _RETRY_DELAY_SECONDS["download_url"]
+
+    lowered_reason = normalized_reason.lower()
+    if any(token.lower() in lowered_reason for token in _RETRYABLE_REASON_TOKENS):
+        return True, "network", _RETRY_DELAY_SECONDS["network"]
+
+    return False, "", 0
+
+
+def _build_retry_item(record: Wallpaper) -> Optional[dict]:
+    payload = record.retry_item
+    if not payload:
+        return None
+    payload.setdefault("resource_id", record.resource_id)
+    payload.setdefault("title", record.title or "")
+    payload.setdefault("width", record.width)
+    payload.setdefault("height", record.height)
+    payload.setdefault("wallpaper_type", record.wallpaper_type or "static")
+    payload.setdefault("category_name", record.category or "")
+    payload.setdefault("category", record.category or "")
+    payload.setdefault("tags", record.tags or "")
+    payload.setdefault("color_name", record.color_theme or "")
+    payload.setdefault("type_id", record.type_id or "")
+    payload.setdefault("color_id", record.color_id or "")
+    payload.setdefault("source_url", record.source_url or "")
+    payload.setdefault("download_url", record.download_url or "")
+    payload["_from_retry_queue"] = True
+    payload["_retry_count"] = int(record.retry_count or 0)
+    payload["_retry_wallpaper_id"] = record.id
+    payload["_last_error"] = str(record.last_error or "").strip()
+    return payload
+
+
 # ------------------------------------------------------------------ #
 #  Pydantic 模型
 # ------------------------------------------------------------------ #
@@ -404,8 +505,8 @@ class UpdateTaskNameRequest(BaseModel):
     name: str
 
 
-def _task_to_dict(t: Task) -> dict:
-    return {
+def _task_to_dict(t: Task, *, include_logs: bool = False) -> dict:
+    payload = {
         "id": t.id,
         "name": t.name,
         "status": t.status,
@@ -420,6 +521,9 @@ def _task_to_dict(t: Task) -> dict:
         "finished_at": t.finished_at,
         "created_at": t.created_at,
     }
+    if include_logs:
+        payload["log_lines"] = _split_task_log_lines(t.log_text or "")
+    return payload
 
 
 # ------------------------------------------------------------------ #
@@ -470,7 +574,20 @@ async def get_task(task_id: int, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(404, f"任务 {task_id} 不存在")
-    return _task_to_dict(task)
+    return _task_to_dict(task, include_logs=True)
+
+
+@router.get("/{task_id}/logs/history")
+async def get_task_log_history(task_id: int, db: Session = Depends(get_db)):
+    """读取任务持久化日志，支持查看已结束任务。"""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    return {
+        "task_id": task.id,
+        "status": task.status,
+        "logs": _split_task_log_lines(task.log_text or ""),
+    }
 
 
 @router.post("/{task_id}/start")
@@ -654,6 +771,99 @@ async def _execute_task(
             runtime_cfg.update(kwargs)
             task.config = runtime_cfg
             db.commit()
+
+        def schedule_retry(
+            *,
+            item: dict,
+            reason: str,
+            failure_stage: str,
+            detail: Optional[dict] = None,
+            account_id: Optional[int] = None,
+            category_name: str = "",
+        ) -> bool:
+            retryable, retry_group, delay_seconds = _classify_retry_policy(reason, failure_stage)
+            if not retryable:
+                return False
+
+            existing = dedup.get_existing_record(item.get("resource_id", ""))
+            if existing and existing.status in {"done", "duplicate", "downloading"}:
+                return False
+
+            retry_record = existing if existing and existing.status == "failed" else Wallpaper(
+                resource_id=item.get("resource_id", ""),
+            )
+            if retry_record.id is None:
+                db.add(retry_record)
+
+            current_retry_count = int(retry_record.retry_count or 0)
+            next_retry_count = current_retry_count + 1
+            if next_retry_count > _AUTO_RETRY_MAX_ATTEMPTS:
+                retry_record.retry_count = next_retry_count
+                retry_record.last_error = reason
+                retry_record.last_attempt_at = datetime.now()
+                retry_record.next_retry_at = None
+                retry_record.status = "failed"
+                db.commit()
+                return False
+
+            retry_record.account_id = account_id
+            retry_record.title = (detail or {}).get("title") or item.get("title", "")
+            retry_record.file_mb = item.get("file_mb") or retry_record.file_mb
+            retry_record.width = (detail or {}).get("width") or item.get("width")
+            retry_record.height = (detail or {}).get("height") or item.get("height")
+            retry_record.wallpaper_type = item.get("wallpaper_type", "static")
+            retry_record.category = category_name or item.get("category_name") or item.get("category") or retry_record.category
+            retry_record.tags = item.get("tags", "")
+            retry_record.color_theme = item.get("color_name") or retry_record.color_theme
+            retry_record.type_id = item.get("type_id") or retry_record.type_id
+            retry_record.color_id = item.get("color_id") or retry_record.color_id
+            retry_record.favor_count = item.get("favor_count") or retry_record.favor_count
+            retry_record.hot_score = item.get("hot_score") or retry_record.hot_score
+            retry_record.source_url = item.get("source_url", "")
+            retry_record.download_url = (detail or {}).get("download_url") or item.get("download_url") or retry_record.download_url
+            retry_record.retry_payload = _serialize_retry_payload(item)
+            retry_record.retry_count = next_retry_count
+            retry_record.last_error = reason
+            retry_record.last_attempt_at = datetime.now()
+            retry_record.next_retry_at = datetime.now() + timedelta(seconds=delay_seconds)
+            retry_record.status = "failed"
+            db.commit()
+            log(
+                f"已加入自动重试队列: {item.get('resource_id', '')} | "
+                f"{retry_group} | 第 {next_retry_count}/{_AUTO_RETRY_MAX_ATTEMPTS} 次 | "
+                f"{delay_seconds} 秒后重试 | {reason}"
+            )
+            return True
+
+        def load_due_retry_candidates(limit: int) -> list[dict]:
+            if limit <= 0:
+                return []
+            now = datetime.now()
+            rows = (
+                db.query(Wallpaper)
+                .filter(
+                    Wallpaper.status == "failed",
+                    Wallpaper.retry_payload != None,  # noqa: E711
+                    Wallpaper.retry_count < _AUTO_RETRY_MAX_ATTEMPTS,
+                    or_(Wallpaper.next_retry_at == None, Wallpaper.next_retry_at <= now),  # noqa: E711
+                )
+                .order_by(Wallpaper.next_retry_at.asc(), Wallpaper.id.asc())
+                .limit(_AUTO_RETRY_FETCH_LIMIT)
+                .all()
+            )
+
+            items: list[dict] = []
+            for row in rows:
+                item = _build_retry_item(row)
+                if not item:
+                    continue
+                passed, _ = filter_engine.match(item)
+                if not passed:
+                    continue
+                items.append(item)
+                if len(items) >= limit:
+                    break
+            return items
 
         # ── 活跃时段感知 ─────────────────────────────────────────────────────
         if human_ctrl and not human_ctrl.is_active_hour():
@@ -914,12 +1124,27 @@ async def _execute_task(
                 if not resource_id:
                     return
 
+                existing_record = dedup.get_existing_record(resource_id)
+
                 # ID 去重兜底：正常情况已在预筛阶段拦截，这里只防并发/竞态
-                if dedup.is_resource_downloaded(resource_id):
+                if existing_record and existing_record.status in {"done", "downloading", "duplicate"}:
                     task.skip_count += 1
                     task.update_progress()
                     db.commit()
                     log(f"跳过(已存在/兜底): {resource_id}")
+                    return
+
+                if (
+                    existing_record
+                    and existing_record.status == "failed"
+                    and not item.get("_from_retry_queue")
+                    and existing_record.next_retry_at
+                    and existing_record.next_retry_at > datetime.now()
+                ):
+                    log(
+                        f"跳过(等待自动重试窗口): {resource_id} | "
+                        f"{existing_record.next_retry_at.strftime('%H:%M:%S')}"
+                    )
                     return
 
                 # 人性化每日上限：任务执行中途达到上限时停止继续下载
@@ -973,7 +1198,15 @@ async def _execute_task(
                         task.failed_count += 1
                         task.update_progress()
                         db.commit()
-                        log(f"失败(无下载地址): {resource_id}")
+                        _detail_reason = str((detail or {}).get("original_failure_reason") or "无下载地址").strip()
+                        log(f"失败(无下载地址): {resource_id} | {_detail_reason}")
+                        schedule_retry(
+                            item=item,
+                            reason=_detail_reason,
+                            failure_stage="download_url",
+                            detail=detail,
+                            account_id=account.id,
+                        )
                         # getCompleteUrl 未成功，网站未计费，consume_quota=False
                         await pool.release(account, success=False, consume_quota=False)
                         return
@@ -1056,9 +1289,14 @@ async def _execute_task(
                         task.skip_count += 1
                         task.update_progress()
                         db.commit()
-                        log(
-                            f"跳过(严格原图模式，仅接受原图): {resource_id} | "
-                            f"{_summarize_original_failure_reason(_original_failure_reason)}"
+                        _strict_reason = _summarize_original_failure_reason(_original_failure_reason)
+                        log(f"跳过(严格原图模式，仅接受原图): {resource_id} | {_strict_reason}")
+                        schedule_retry(
+                            item=item,
+                            reason=_strict_reason,
+                            failure_stage="original_access",
+                            detail=detail,
+                            account_id=account.id,
                         )
                         await pool.release(account, success=False, consume_quota=False)
                         return
@@ -1086,7 +1324,7 @@ async def _execute_task(
                     _favor_count = item.get("favor_count")
 
                     # 下载文件
-                    local_path = await downloader.download(
+                    download_result = await downloader.download(
                         resource_id=resource_id,
                         download_url=_dl_url,
                         cookie=account.cookie,
@@ -1099,14 +1337,26 @@ async def _execute_task(
                         session_profile=_session_profile,
                     )
 
-                    if not local_path:
+                    if not download_result.success or not download_result.local_path:
                         task.failed_count += 1
                         task.update_progress()
                         db.commit()
-                        log(f"失败(下载失败): {resource_id}")
+                        _download_reason = download_result.failure_reason or "下载失败"
+                        log(f"失败(下载失败): {resource_id} | {_download_reason}")
+                        if download_result.retryable:
+                            schedule_retry(
+                                item=item,
+                                reason=_download_reason,
+                                failure_stage=download_result.failure_stage or "network",
+                                detail=detail,
+                                account_id=account.id,
+                                category_name=_category,
+                            )
                         # getCompleteUrl 已成功时网站已计费，需要消耗本地配额保持同步
                         await pool.release(account, success=False, consume_quota=_is_original_dl)
                         return
+
+                    local_path = download_result.local_path
 
                     # 计算 hash
                     from backend.core.downloader import DOWNLOAD_ROOT
@@ -1255,39 +1505,40 @@ async def _execute_task(
                         _size_match = _ratio < 0.15  # 15% 容差
                     else:
                         _size_match = None
-                    wallpaper = Wallpaper(
-                        resource_id=resource_id,
-                        account_id=account.id,
-                        title=detail.get("title") or item.get("title", ""),
-                        md5=md5,
-                        sha256=sha256,
-                        local_path=local_path,
-                        file_size=_actual_size,
-                        file_mb=_file_mb_str or None,
-                        is_original=_is_original_dl,
-                        width=detail.get("width") or item.get("width"),
-                        height=detail.get("height") or item.get("height"),
-                        wallpaper_type=item.get("wallpaper_type", "static"),
-                        # 分类：使用可读名称（"动漫｜二次元"）作为目录和显示名，回退到标签名
-                        category=_category,
-                        # 分类/色系 UUID：存储原始 API ID，用于精确过滤
-                        type_id=_type_id,
-                        color_id=_color_id,
-                        # 色系可读名（"偏蓝"），供画廊筛选
-                        color_theme=_color_name,
-                        tags=item.get("tags", ""),
-                        hot_score=item.get("hot_score"),
-                        favor_count=_favor_count,
-                        source_url=item.get("source_url", ""),
-                        download_url=detail["download_url"],
-                        video_duration=_video_duration,
-                        imgbed_url=_imgbed_url,
-                        upload_records=_upload_records,
-                        upload_status=_upload_status,
-                        upload_note=_upload_note,
-                        status="done",
-                    )
-                    db.add(wallpaper)
+                    wallpaper = existing_record if existing_record else Wallpaper(resource_id=resource_id)
+                    if wallpaper.id is None:
+                        db.add(wallpaper)
+                    wallpaper.account_id = account.id
+                    wallpaper.title = detail.get("title") or item.get("title", "")
+                    wallpaper.md5 = md5
+                    wallpaper.sha256 = sha256
+                    wallpaper.local_path = local_path
+                    wallpaper.file_size = _actual_size
+                    wallpaper.file_mb = _file_mb_str or None
+                    wallpaper.is_original = _is_original_dl
+                    wallpaper.width = detail.get("width") or item.get("width")
+                    wallpaper.height = detail.get("height") or item.get("height")
+                    wallpaper.wallpaper_type = item.get("wallpaper_type", "static")
+                    wallpaper.category = _category
+                    wallpaper.type_id = _type_id
+                    wallpaper.color_id = _color_id
+                    wallpaper.color_theme = _color_name
+                    wallpaper.tags = item.get("tags", "")
+                    wallpaper.hot_score = item.get("hot_score")
+                    wallpaper.favor_count = _favor_count
+                    wallpaper.source_url = item.get("source_url", "")
+                    wallpaper.download_url = detail["download_url"]
+                    wallpaper.video_duration = _video_duration
+                    wallpaper.imgbed_url = _imgbed_url
+                    wallpaper.upload_records = _upload_records
+                    wallpaper.upload_status = _upload_status
+                    wallpaper.upload_note = _upload_note
+                    wallpaper.status = "done"
+                    wallpaper.retry_count = 0
+                    wallpaper.retry_payload = None
+                    wallpaper.last_error = None
+                    wallpaper.next_retry_at = None
+                    wallpaper.last_attempt_at = datetime.now()
                     db.flush()
 
                     # Hash 去重检查
@@ -1383,6 +1634,12 @@ async def _execute_task(
                     task.update_progress()
                     db.commit()
                     log(f"异常 {resource_id}: {e}")
+                    schedule_retry(
+                        item=item,
+                        reason=str(e) or "未知异常",
+                        failure_stage="network",
+                        account_id=account.id,
+                    )
                     # 仅当已拿到原图签名 URL 时消耗配额（网站已计费）
                     await pool.release(account, success=False, consume_quota=_is_original_dl)
 
@@ -1473,11 +1730,15 @@ async def _execute_task(
                     flush_prefilter_logs()
                     continue
 
-                if dedup.is_resource_downloaded(resource_id):
+                existing_record = dedup.get_existing_record(resource_id)
+                if existing_record and existing_record.status in {"done", "downloading", "duplicate"}:
                     prefilter_existing_count += 1
                     pending_prefilter_existing += 1
                     last_prefilter_existing_resource_id = resource_id
                     flush_prefilter_logs()
+                    continue
+
+                if existing_record and existing_record.status == "failed":
                     continue
 
                 candidate_pool.append(item)
@@ -1528,15 +1789,24 @@ async def _execute_task(
             while task.status == "running" and task.success_count < effective_max:
                 replenish_round += 1
                 needed_count = max(1, effective_max - task.success_count)
-                selected_candidates = []
+                retry_candidates = load_due_retry_candidates(needed_count)
+                selected_candidates = list(retry_candidates)
                 candidate_pool = []
                 last_scanned_page = current_resume_page
                 stopped_early = False
                 wrapped_scan = False
 
+                if retry_candidates:
+                    log(
+                        f"自动重试优先: 本轮先处理 {len(retry_candidates)} 张失败重试资源"
+                    )
+
                 for index, source_scope in enumerate(source_scopes):
+                    if len(selected_candidates) >= needed_count:
+                        break
                     scope_resume_page = current_resume_page if index == 0 else 1
-                    per_scope_limit = needed_count if len(source_scopes) > 1 else None
+                    remaining_needed = max(1, needed_count - len(selected_candidates))
+                    per_scope_limit = remaining_needed if len(source_scopes) > 1 else None
                     fully_scanned = await scan_candidate_range(
                         source_scope=source_scope,
                         start_page=scope_resume_page,
@@ -1573,7 +1843,11 @@ async def _execute_task(
                 current_resume_page = next_resume_page
 
                 if diversify_static_orientations:
-                    selected_candidates = _select_diversified_candidates(candidate_pool, needed_count)
+                    diversified = _select_diversified_candidates(
+                        candidate_pool,
+                        max(0, needed_count - len(selected_candidates)),
+                    )
+                    selected_candidates.extend(diversified)
                     selected_portraits = sum(
                         1 for item in selected_candidates
                         if _get_wallpaper_orientation(item) == "portrait"
@@ -1588,7 +1862,7 @@ async def _execute_task(
                             f"已选横图 {selected_landscapes} 张、竖图 {selected_portraits} 张"
                         )
                 else:
-                    selected_candidates = candidate_pool[:needed_count]
+                    selected_candidates.extend(candidate_pool[:max(0, needed_count - len(selected_candidates))])
 
                 if not selected_candidates:
                     if task.success_count == 0:

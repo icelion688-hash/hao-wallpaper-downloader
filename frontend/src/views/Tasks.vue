@@ -655,12 +655,35 @@ function setLogRef(id, el) {
   else    delete logPanelRefs[id]
 }
 
-function toggleLogs(id) {
+async function loadTaskLogHistory(id) {
+  try {
+    const res = await tasksApi.logHistory(id)
+    taskLogs.value[id] = Array.isArray(res.logs) ? res.logs : []
+    await nextTick()
+    const panel = logPanelRefs[id]
+    const body  = panel?.querySelector('.log-body')
+    if (body) body.scrollTop = body.scrollHeight
+  } catch (e) {
+    try {
+      const detail = await tasksApi.get(id)
+      taskLogs.value[id] = Array.isArray(detail.log_lines) ? detail.log_lines : []
+      await nextTick()
+      const panel = logPanelRefs[id]
+      const body  = panel?.querySelector('.log-body')
+      if (body) body.scrollTop = body.scrollHeight
+    } catch {
+      showToast('err', `加载日志失败: ${e.message}，请重启后端服务后重试`)
+    }
+  }
+}
+
+async function toggleLogs(id) {
   if (openLogId.value === id) {
     openLogId.value = null
   } else {
     openLogId.value = id
     if (!taskLogs.value[id]) taskLogs.value[id] = []
+    await loadTaskLogHistory(id)
     const t = tasks.value.find(x => x.id === id)
     if (t?.status === 'running' && !sseMap[id]) connectSSE(id)
   }

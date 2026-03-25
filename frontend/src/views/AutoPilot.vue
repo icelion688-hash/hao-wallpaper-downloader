@@ -109,14 +109,26 @@
         <div class="card log-card">
           <div class="card-header">
             运行日志
-            <button class="btn btn--sm" @click="logs = []">清空</button>
+            <div class="log-actions">
+              <button class="btn btn--sm" :class="{ 'btn--active': activeLogSource === 'live' }" @click="switchToLiveLogs">当前运行</button>
+              <select class="select log-history-select" v-model="selectedHistoryTaskId" @change="onHistoryTaskChange">
+                <option value="">历史会话日志</option>
+                <option v-for="session in recentSessions" :key="session.task_id" :value="String(session.task_id)">
+                  #{{ session.task_id }} · {{ session.finished_at ? formatSessionTime(session.finished_at) : '进行中' }}
+                </option>
+              </select>
+              <button class="btn btn--sm" @click="clearVisibleLogs">清空</button>
+            </div>
           </div>
           <div class="log-body" ref="logEl">
-            <div v-if="logs.length === 0" class="log-empty">
-              暂无日志，启动后这里会显示会话、等待和异常信息。
+            <div v-if="loadingHistoryLogs" class="log-empty">
+              历史日志加载中...
+            </div>
+            <div v-else-if="visibleLogs.length === 0" class="log-empty">
+              {{ activeLogSource === 'live' ? '暂无日志，启动后这里会显示会话、等待和异常信息。' : '该历史会话暂无日志。' }}
             </div>
             <div
-              v-for="(line, index) in logs"
+              v-for="(line, index) in visibleLogs"
               :key="index"
               class="log-line"
               :class="logLineClass(line)"
@@ -184,15 +196,26 @@
                   </select>
                 </div>
                 <div class="form-row">
-                  <label>手动上限</label>
+                  <label>手动最小值</label>
                   <input
                     v-if="cfg.daily_limit_mode === 'manual'"
                     class="input" type="number" min="1" max="500"
-                    v-model.number="cfg.manual_daily_limit"
+                    v-model.number="cfg.manual_daily_limit_min"
                     placeholder="1-500"
-                    @change="onCfgChange"
+                    @change="onManualDailyLimitRangeChange"
                   />
-                  <div v-else class="inline-note inline-note--muted">自动模式，当前值 {{ dailyLimitDisplay }} 张</div>
+                  <div v-else class="inline-note inline-note--muted">自动模式，沿用系统原先计算，当前值 {{ dailyLimitDisplay }} 张</div>
+                </div>
+                <div class="form-row">
+                  <label>手动最大值</label>
+                  <input
+                    v-if="cfg.daily_limit_mode === 'manual'"
+                    class="input" type="number" min="1" max="500"
+                    v-model.number="cfg.manual_daily_limit_max"
+                    placeholder="1-500"
+                    @change="onManualDailyLimitRangeChange"
+                  />
+                  <div v-else class="inline-note inline-note--muted">系统会在每天开始时生成一个当天固定值</div>
                 </div>
               </div>
               <div class="form-help">{{ dailyLimitHint }}</div>
@@ -661,15 +684,15 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { autopilotApi, galleryApi, settingsApi } from '../api'
 import { applyCompressedUploadProfile, applyLosslessUploadProfile, getAvailableUploadProfiles, isLosslessUploadProfile, normalizeUploadSettings, resolveAvailableUploadProfileKey } from '../utils/uploadProfiles'
 const autoUploadChannelOptions=[{value:'telegram',label:'telegram'},{value:'cfr2',label:'cfr2'},{value:'s3',label:'s3'},{value:'discord',label:'discord'},{value:'huggingface',label:'huggingface'}]
-const createDefaultAutoPilotConfig=()=>({timezone:'Asia/Shanghai',active_start:8,active_end:23,daily_limit_mode:'auto',manual_daily_limit:null,active_session_min:5,active_session_max:15,active_interval_min:1800,active_interval_max:7200,inactive_enabled:false,inactive_session_min:2,inactive_session_max:5,inactive_interval_min:7200,inactive_interval_max:14400,wallpaper_type:'static',screen_orientation:'all',sort_by:'yesterday_hot',min_hot_score:0,vip_only:false,categories:[],color_themes:[],tag_blacklist:[],min_width:null,min_height:null,use_imgbed_upload:false,static_upload_profile:'',dynamic_upload_profile:'',static_upload_channel:'',static_upload_channel_name:'',dynamic_upload_channel:'',dynamic_upload_channel_name:'',strict_original:false,storage_auto_clean:false,storage_max_count:500,storage_strategy:'keep_count',storage_keep_days:30,storage_uploaded_only:true})
+const createDefaultAutoPilotConfig=()=>({timezone:'Asia/Shanghai',active_start:8,active_end:23,daily_limit_mode:'auto',manual_daily_limit:null,manual_daily_limit_min:null,manual_daily_limit_max:null,active_session_min:5,active_session_max:15,active_interval_min:1800,active_interval_max:7200,inactive_enabled:false,inactive_session_min:2,inactive_session_max:5,inactive_interval_min:7200,inactive_interval_max:14400,wallpaper_type:'static',screen_orientation:'all',sort_by:'yesterday_hot',min_hot_score:0,vip_only:false,categories:[],color_themes:[],tag_blacklist:[],min_width:null,min_height:null,use_imgbed_upload:false,static_upload_profile:'',dynamic_upload_profile:'',static_upload_channel:'',static_upload_channel_name:'',dynamic_upload_channel:'',dynamic_upload_channel_name:'',strict_original:false,storage_auto_clean:false,storage_max_count:500,storage_strategy:'keep_count',storage_keep_days:30,storage_uploaded_only:true})
 const createDefaultMediaSettings=()=>({auto_convert:false,max_concurrent:1,video:{enabled:false,output_format:'webp',fps:0,max_frames:0,width:0,max_width:0,quality:100,delete_original:false,timeout_seconds:300,cpu_nice:5},image:{enabled:false,output_format:'webp',quality:100,delete_original:false,timeout_seconds:120,cpu_nice:5}})
 const normalizeMediaSettings=(remote={})=>{const defaults=createDefaultMediaSettings();return{...defaults,...remote,video:{...defaults.video,...(remote.video||{})},image:{...defaults.image,...(remote.image||{})}}}
 const parseCsvInput=value=>value?value.split(',').map(item=>item.trim()).filter(Boolean):[]
 const clampNumber=(value,fallback,min)=>{const numeric=Number(value);if(!Number.isFinite(numeric))return fallback;return Math.max(min,Math.round(numeric))}
 const normalizeRange=(minValue,maxValue,fallbackMin,fallbackMax,minLimit)=>{const safeMin=clampNumber(minValue,fallbackMin,minLimit),safeMax=clampNumber(maxValue,fallbackMax,minLimit);return safeMin<=safeMax?[safeMin,safeMax]:[safeMax,safeMin]}
-const normalizeAutoPilotConfig=remote=>{const merged={...createDefaultAutoPilotConfig(),...(remote||{})};merged.daily_limit_mode=String(merged.daily_limit_mode||'auto').toLowerCase()==='manual'?'manual':'auto';merged.manual_daily_limit=merged.manual_daily_limit?Math.min(500,Math.max(1,Number(merged.manual_daily_limit)||0)):null;[merged.active_session_min,merged.active_session_max]=normalizeRange(merged.active_session_min,merged.active_session_max,5,15,1);[merged.inactive_session_min,merged.inactive_session_max]=normalizeRange(merged.inactive_session_min,merged.inactive_session_max,2,5,1);merged.active_interval_min=clampNumber(merged.active_interval_min,1800,60);merged.active_interval_max=clampNumber(merged.active_interval_max,7200,60);merged.inactive_interval_min=clampNumber(merged.inactive_interval_min,7200,60);merged.inactive_interval_max=clampNumber(merged.inactive_interval_max,14400,60);merged.min_hot_score=clampNumber(merged.min_hot_score,0,0);merged.static_upload_profile=String(merged.static_upload_profile||'').trim();merged.dynamic_upload_profile=String(merged.dynamic_upload_profile||'').trim();merged.static_upload_channel=String(merged.static_upload_channel||'').trim();merged.static_upload_channel_name=String(merged.static_upload_channel_name||'').trim();merged.dynamic_upload_channel=String(merged.dynamic_upload_channel||'').trim();merged.dynamic_upload_channel_name=String(merged.dynamic_upload_channel_name||'').trim();merged.strict_original=Boolean(merged.strict_original);merged.storage_auto_clean=Boolean(merged.storage_auto_clean);merged.storage_max_count=Math.max(1,Math.min(99999,Number(merged.storage_max_count)||500));merged.storage_keep_days=Math.max(1,Math.min(3650,Number(merged.storage_keep_days)||30));merged.storage_uploaded_only=Boolean(merged.storage_uploaded_only!==false);const strategy=String(merged.storage_strategy||'keep_count').toLowerCase();merged.storage_strategy=['keep_count','keep_days','upload_and_delete'].includes(strategy)?strategy:'keep_count';return merged}
+const normalizeAutoPilotConfig=remote=>{const merged={...createDefaultAutoPilotConfig(),...(remote||{})};merged.daily_limit_mode=String(merged.daily_limit_mode||'auto').toLowerCase()==='manual'?'manual':'auto';const legacyManualLimit=merged.manual_daily_limit?Math.min(500,Math.max(1,Number(merged.manual_daily_limit)||0)):null;let manualDailyLimitMin=merged.manual_daily_limit_min?Math.min(500,Math.max(1,Number(merged.manual_daily_limit_min)||0)):null;let manualDailyLimitMax=merged.manual_daily_limit_max?Math.min(500,Math.max(1,Number(merged.manual_daily_limit_max)||0)):null;if(manualDailyLimitMin===null&&manualDailyLimitMax===null&&legacyManualLimit!==null){manualDailyLimitMin=legacyManualLimit;manualDailyLimitMax=legacyManualLimit}else if(manualDailyLimitMin===null&&manualDailyLimitMax!==null){manualDailyLimitMin=manualDailyLimitMax}else if(manualDailyLimitMax===null&&manualDailyLimitMin!==null){manualDailyLimitMax=manualDailyLimitMin}if(manualDailyLimitMin!==null&&manualDailyLimitMax!==null&&manualDailyLimitMin>manualDailyLimitMax){[manualDailyLimitMin,manualDailyLimitMax]=[manualDailyLimitMax,manualDailyLimitMin]}merged.manual_daily_limit_min=manualDailyLimitMin;merged.manual_daily_limit_max=manualDailyLimitMax;merged.manual_daily_limit=manualDailyLimitMin!==null&&manualDailyLimitMin===manualDailyLimitMax?manualDailyLimitMin:null;[merged.active_session_min,merged.active_session_max]=normalizeRange(merged.active_session_min,merged.active_session_max,5,15,1);[merged.inactive_session_min,merged.inactive_session_max]=normalizeRange(merged.inactive_session_min,merged.inactive_session_max,2,5,1);merged.active_interval_min=clampNumber(merged.active_interval_min,1800,60);merged.active_interval_max=clampNumber(merged.active_interval_max,7200,60);merged.inactive_interval_min=clampNumber(merged.inactive_interval_min,7200,60);merged.inactive_interval_max=clampNumber(merged.inactive_interval_max,14400,60);merged.min_hot_score=clampNumber(merged.min_hot_score,0,0);merged.static_upload_profile=String(merged.static_upload_profile||'').trim();merged.dynamic_upload_profile=String(merged.dynamic_upload_profile||'').trim();merged.static_upload_channel=String(merged.static_upload_channel||'').trim();merged.static_upload_channel_name=String(merged.static_upload_channel_name||'').trim();merged.dynamic_upload_channel=String(merged.dynamic_upload_channel||'').trim();merged.dynamic_upload_channel_name=String(merged.dynamic_upload_channel_name||'').trim();merged.strict_original=Boolean(merged.strict_original);merged.storage_auto_clean=Boolean(merged.storage_auto_clean);merged.storage_max_count=Math.max(1,Math.min(99999,Number(merged.storage_max_count)||500));merged.storage_keep_days=Math.max(1,Math.min(3650,Number(merged.storage_keep_days)||30));merged.storage_uploaded_only=Boolean(merged.storage_uploaded_only!==false);const strategy=String(merged.storage_strategy||'keep_count').toLowerCase();merged.storage_strategy=['keep_count','keep_days','upload_and_delete'].includes(strategy)?strategy:'keep_count';return merged}
 const cloneUploadProfiles=profiles=>(profiles||[]).map(profile=>({...profile,image_processing:{...(profile.image_processing||{})},upload_filter:{...(profile.upload_filter||{})}}))
-const status=ref({}),toggling=ref(false),logs=ref([]),logEl=ref(null),savedHint=ref(false),supportedTimezones=ref(['Asia/Shanghai']),cfg=ref(createDefaultAutoPilotConfig()),uploadSettings=ref(normalizeUploadSettings()),mediaSettings=ref(createDefaultMediaSettings()),systemInfo=ref(null),categoriesInput=ref(''),colorsInput=ref(''),blacklistInput=ref(''),activeIntervalMinMin=ref(30),activeIntervalMaxMin=ref(120),inactiveIntervalMinMin=ref(120),inactiveIntervalMaxMin=ref(240),currentHour=ref(new Date().getHours()),storageInfo=ref(null),cleaningUp=ref(false),cleanupPreview=ref(null),activeConfigTab=ref('rhythm')
+const status=ref({}),toggling=ref(false),logs=ref([]),historyLogs=ref([]),logEl=ref(null),savedHint=ref(false),supportedTimezones=ref(['Asia/Shanghai']),cfg=ref(createDefaultAutoPilotConfig()),uploadSettings=ref(normalizeUploadSettings()),mediaSettings=ref(createDefaultMediaSettings()),systemInfo=ref(null),categoriesInput=ref(''),colorsInput=ref(''),blacklistInput=ref(''),activeIntervalMinMin=ref(30),activeIntervalMaxMin=ref(120),inactiveIntervalMinMin=ref(120),inactiveIntervalMaxMin=ref(240),currentHour=ref(new Date().getHours()),storageInfo=ref(null),cleaningUp=ref(false),cleanupPreview=ref(null),activeConfigTab=ref('rhythm'),recentSessions=ref([]),activeLogSource=ref('live'),selectedHistoryTaskId=ref(''),loadingHistoryLogs=ref(false)
 const running=computed(()=>status.value.status==='running')
 const storageRuntime=computed(()=>status.value.storage||null)
 const resolveAutoUploadProfileKey=type=>{const profiles=uploadSettings.value.profiles||[];const fallback=resolveAvailableUploadProfileKey(uploadSettings.value,uploadSettings.value.task_profile,profiles[0]?.key||'');if(type==='dynamic')return resolveAvailableUploadProfileKey(uploadSettings.value,cfg.value.dynamic_upload_profile||cfg.value.static_upload_profile,fallback);return resolveAvailableUploadProfileKey(uploadSettings.value,cfg.value.static_upload_profile||cfg.value.dynamic_upload_profile,fallback)}
@@ -694,10 +717,11 @@ const backendLimitReady=computed(()=>Number.isFinite(Number(status.value.today?.
 const dailyLimitDisplay=computed(()=>backendLimitReady.value?status.value.today.daily_limit:'待刷新')
 const remainingLimitDisplay=computed(()=>backendLimitReady.value?status.value.today.remaining:'待刷新')
 const lastSession=computed(()=>status.value.last_session||null)
+const visibleLogs=computed(()=>activeLogSource.value==='history'?historyLogs.value:logs.value)
 const lastSessionBadgeText=computed(()=>({session_end_simulated:'提前收束',replenish_stopped:'补齐停止',candidate_exhausted:'候选不足',failed:'失败',paused:'已暂停',cancelled:'已取消',completed:'已完成'}[lastSession.value?.reason_type]||'最近一轮'))
 const lastSessionBadgeClass=computed(()=>({session_end_simulated:'session-summary-badge--warn',replenish_stopped:'session-summary-badge--warn',candidate_exhausted:'session-summary-badge--info',failed:'session-summary-badge--err',paused:'session-summary-badge--muted',cancelled:'session-summary-badge--muted',completed:'session-summary-badge--ok'}[lastSession.value?.reason_type]||'session-summary-badge--info'))
 const lastSessionReasonClass=computed(()=>({session_end_simulated:'session-summary-reason--warn',replenish_stopped:'session-summary-reason--warn',failed:'session-summary-reason--err',completed:'session-summary-reason--ok'}[lastSession.value?.reason_type]||''))
-const dailyLimitHint=computed(()=>{const effectiveLimit=status.value.today?.daily_limit;const remaining=status.value.today?.remaining;if(!backendLimitReady.value)return'当前后台还没有返回今日统计数据，通常是刚启动或网络异常。正常运行后会显示自动值和剩余数取值。';if(cfg.value.daily_limit_mode==='manual'){const manualLimit=cfg.value.manual_daily_limit||effectiveLimit||'--';return`手动模式：今天的硬上限，当前有效 ${manualLimit} 张，剩余 ${remaining??'--'} 张。如当天已触达上限，AutoPilot 将停止下载直到翌日。`}return`自动模式：当前有效 ${effectiveLimit} 张，今日剩余 ${remaining??'--'} 张。自动值基于当前账号池的每日配额，实际可用量会随账号变动。`})
+const dailyLimitHint=computed(()=>{const effectiveLimit=status.value.today?.daily_limit;const remaining=status.value.today?.remaining;if(!backendLimitReady.value)return'当前后台还没有返回今日统计数据，通常是刚启动或网络异常。正常运行后会显示自动值和剩余数取值。';if(cfg.value.daily_limit_mode==='manual'){const rangeMin=cfg.value.manual_daily_limit_min??status.value.today?.manual_daily_limit_min??effectiveLimit??'--';const rangeMax=cfg.value.manual_daily_limit_max??status.value.today?.manual_daily_limit_max??effectiveLimit??'--';const rangeText=rangeMin===rangeMax?`${rangeMin}`:`${rangeMin} - ${rangeMax}`;return`手动模式：系统会在每天开始时，从你设置的 ${rangeText} 张范围内随机选出当天上限，并在当天保持固定。当前有效 ${effectiveLimit??'--'} 张，剩余 ${remaining??'--'} 张。`}return`自动模式：沿用系统原先的每日上限逻辑，当前有效 ${effectiveLimit} 张，今日剩余 ${remaining??'--'} 张。自动值会随日期变化，并在同一天保持固定。`})
 const statusTag=computed(()=>!running.value?{cls:'tag--grey',text:'IDLE'}:({session:{cls:'tag--ok',text:'SESSION'},waiting:{cls:'tag--info',text:'WAITING'},sleeping:{cls:'tag--warn',text:'SLEEPING'},daily_limit:{cls:'tag--warn',text:'DAILY LIMIT'},starting:{cls:'tag--info',text:'STARTING'}}[status.value.phase]||{cls:'tag--ok',text:'RUNNING'}))
 const phaseLabel=computed(()=>({session:'正在执行下载会话',waiting:'会话间等待中',sleeping:'等待活跃时段开始',daily_limit:'今日配额已用完，等待明天',starting:'初始化中...'}[status.value.phase]||'运行中'))
 const nextSessionLabel=computed(()=>{if(!running.value)return'—';if(status.value.phase==='session')return'进行中';if(!status.value.next_session_at)return'即将开始';const diff=Math.max(0,Math.floor((new Date(status.value.next_session_at)-Date.now())/1000));if(diff<60)return`${diff}s`;if(diff<3600)return`${Math.floor(diff/60)}min`;return`${Math.floor(diff/3600)}h ${Math.floor((diff%3600)/60)}min`})
@@ -718,7 +742,8 @@ const applyResolutionPreset=(width,height)=>{cfg.value.min_width=width;cfg.value
 const clearResolutionPreset=()=>{cfg.value.min_width=null;cfg.value.min_height=null;onCfgChange()}
 const onActiveIntervalChange=()=>{syncIntervalInputsToConfig();onCfgChange()}
 const onInactiveIntervalChange=()=>{syncIntervalInputsToConfig();onCfgChange()}
-const onDailyLimitModeChange=()=>{if(cfg.value.daily_limit_mode==='manual'&&!cfg.value.manual_daily_limit)cfg.value.manual_daily_limit=status.value.today?.daily_limit||45;onCfgChange()}
+const onManualDailyLimitRangeChange=()=>{cfg.value=normalizeAutoPilotConfig(cfg.value);onCfgChange()}
+const onDailyLimitModeChange=()=>{if(cfg.value.daily_limit_mode==='manual'&&(cfg.value.manual_daily_limit_min===null||cfg.value.manual_daily_limit_max===null)){const fallback=status.value.today?.daily_limit||45;cfg.value.manual_daily_limit_min=cfg.value.manual_daily_limit_min??fallback;cfg.value.manual_daily_limit_max=cfg.value.manual_daily_limit_max??fallback}cfg.value=normalizeAutoPilotConfig(cfg.value);onCfgChange()}
 const setOriginalDownloadPolicy=value=>{cfg.value.strict_original=String(value||'')==='strict_original';onCfgChange()}
 const setAutoUploadProfile=(type,key)=>{if(type==='dynamic')cfg.value.dynamic_upload_profile=String(key||'').trim();else cfg.value.static_upload_profile=String(key||'').trim();onCfgChange()}
 const setAutoUploadChannel=(type,value)=>{if(type==='dynamic')cfg.value.dynamic_upload_channel=String(value||'').trim();else cfg.value.static_upload_channel=String(value||'').trim();onCfgChange()}
@@ -734,8 +759,12 @@ const onCfgChange=()=>{normalizeConfigState();persistAutomationSettings({showHin
 const onCategoriesChange=()=>{cfg.value.categories=parseCsvInput(categoriesInput.value);onCfgChange()}
 const onColorsChange=()=>{cfg.value.color_themes=parseCsvInput(colorsInput.value);onCfgChange()}
 const onBlacklistChange=()=>{cfg.value.tag_blacklist=parseCsvInput(blacklistInput.value);onCfgChange()}
-const poll=async()=>{try{const data=await autopilotApi.status();status.value=data;if(data.supported_timezones?.length)supportedTimezones.value=data.supported_timezones;if(!configLoaded&&data.config){applyConfig(data.config);configLoaded=true}const remoteLogs=data.logs||[];if(remoteLogs.length<logs.value.length){logs.value=remoteLogs}else if(remoteLogs.length>logs.value.length){logs.value.push(...remoteLogs.slice(logs.value.length));await nextTick();scrollLogs()}currentHour.value=new Date().getHours()}catch{}}
-const togglePower=async()=>{toggling.value=true;try{if(running.value){await autopilotApi.stop()}else{logs.value=[];await persistAutomationSettings({showHint:false,silent:false});const startRes=await autopilotApi.start(buildPayload());if(startRes?.config)applyConfig(startRes.config)}await poll()}catch(error){alert('操作失败: '+(error?.message||error))}finally{toggling.value=false}}
+const switchToLiveLogs=async()=>{activeLogSource.value='live';selectedHistoryTaskId.value='';historyLogs.value=[];await nextTick();scrollLogs()}
+const loadHistoryLogs=async taskId=>{if(!taskId)return;loadingHistoryLogs.value=true;try{const res=await autopilotApi.sessionLogs(taskId);historyLogs.value=Array.isArray(res.logs)?res.logs:[];activeLogSource.value='history';await nextTick();scrollLogs()}catch(error){alert('加载历史日志失败: '+(error?.message||error));selectedHistoryTaskId.value='';activeLogSource.value='live'}finally{loadingHistoryLogs.value=false}}
+const onHistoryTaskChange=async()=>{if(!selectedHistoryTaskId.value){await switchToLiveLogs();return}await loadHistoryLogs(Number(selectedHistoryTaskId.value))}
+const clearVisibleLogs=()=>{if(activeLogSource.value==='history')historyLogs.value=[];else logs.value=[]}
+const poll=async()=>{try{const data=await autopilotApi.status();status.value=data;recentSessions.value=Array.isArray(data.recent_sessions)?data.recent_sessions:[];if(data.supported_timezones?.length)supportedTimezones.value=data.supported_timezones;if(!configLoaded&&data.config){applyConfig(data.config);configLoaded=true}if(activeLogSource.value==='live'){const remoteLogs=data.logs||[];if(remoteLogs.length<logs.value.length){logs.value=remoteLogs}else if(remoteLogs.length>logs.value.length){logs.value.push(...remoteLogs.slice(logs.value.length));await nextTick();scrollLogs()}}currentHour.value=new Date().getHours()}catch{}}
+const togglePower=async()=>{toggling.value=true;try{if(running.value){await autopilotApi.stop()}else{logs.value=[];activeLogSource.value='live';selectedHistoryTaskId.value='';historyLogs.value=[];await persistAutomationSettings({showHint:false,silent:false});const startRes=await autopilotApi.start(buildPayload());if(startRes?.config)applyConfig(startRes.config)}await poll()}catch(error){alert('操作失败: '+(error?.message||error))}finally{toggling.value=false}}
 const saveConfig=async()=>{try{await persistAutomationSettings({showHint:true,silent:false})}catch(error){alert('保存配置失败: '+(error?.message||error))}}
 const scrollLogs=()=>{if(logEl.value)logEl.value.scrollTop=logEl.value.scrollHeight}
 const loadStorageStats=async()=>{try{storageInfo.value=await galleryApi.storageStats()}catch{}}
@@ -976,6 +1005,8 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
 
 /* ── 日志 ── */
 .log-card { display: flex; flex-direction: column; }
+.log-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.log-history-select { min-width: 190px; height: 30px; font-size: 12px; }
 .log-body {
   height: 260px;
   overflow-y: auto;

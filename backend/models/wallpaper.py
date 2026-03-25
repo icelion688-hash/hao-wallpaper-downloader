@@ -3,6 +3,8 @@ wallpaper.py — 壁纸记录 ORM 模型
 字段：资源ID、文件hash、本地路径、标签、分辨率等
 """
 
+import json
+
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, BigInteger, Float
 from sqlalchemy.sql import func
 from backend.models.database import Base
@@ -79,6 +81,13 @@ class Wallpaper(Base):
     # 是否被标记为重复文件
     is_duplicate = Column(Boolean, nullable=False, default=False)
 
+    # 自动重试相关状态
+    retry_count = Column(Integer, nullable=False, default=0)
+    retry_payload = Column(Text, nullable=True)
+    last_error = Column(Text, nullable=True)
+    next_retry_at = Column(DateTime, nullable=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+
     # 视频时长（秒，仅 wallpaper_type=dynamic 有效；通过 ffprobe 提取，未安装时为 None）
     video_duration = Column(Float, nullable=True)
 
@@ -113,3 +122,14 @@ class Wallpaper(Base):
         import os
         base, ext = os.path.splitext(self.local_path)
         return f"{base}_thumb{ext}"
+
+    @property
+    def retry_item(self) -> dict:
+        """返回自动重试所需的原始资源载荷。"""
+        if not self.retry_payload:
+            return {}
+        try:
+            data = json.loads(self.retry_payload)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}

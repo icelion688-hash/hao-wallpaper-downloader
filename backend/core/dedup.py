@@ -34,14 +34,19 @@ class DedupManager:
 
     def is_resource_downloaded(self, resource_id: str) -> bool:
         """
-        检查资源 ID 是否已在数据库中（任意状态均算已处理过）
+        检查资源 ID 是否已在数据库中且已完成落库。
+
+        失败记录会保留给自动重试机制，因此不应阻断后续下载。
 
         Returns:
             True = 已存在，跳过下载
         """
         exists = (
             self.db.query(Wallpaper.id)
-            .filter(Wallpaper.resource_id == resource_id)
+            .filter(
+                Wallpaper.resource_id == resource_id,
+                Wallpaper.status.in_(("done", "downloading", "duplicate")),
+            )
             .first()
         )
         return exists is not None

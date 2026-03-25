@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import asyncio
 
+from backend.core.anti_detection import HumanBehaviorController
 from backend.core.autopilot_engine import AutoPilotEngine
 
 
@@ -105,6 +106,31 @@ class AutoPilotConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["static_upload_profile"], "original_lossless")
         self.assertEqual(config["dynamic_upload_profile"], "original_lossless")
 
+    def test_update_config_normalizes_manual_daily_limit_range(self):
+        engine = AutoPilotEngine(data_dir=self.tmpdir)
+
+        config = engine.update_config({
+            "daily_limit_mode": "manual",
+            "manual_daily_limit_min": 88,
+            "manual_daily_limit_max": 30,
+        })
+
+        self.assertEqual(config["manual_daily_limit_min"], 30)
+        self.assertEqual(config["manual_daily_limit_max"], 88)
+        self.assertIsNone(config["manual_daily_limit"])
+
+    def test_update_config_keeps_legacy_manual_daily_limit(self):
+        engine = AutoPilotEngine(data_dir=self.tmpdir)
+
+        config = engine.update_config({
+            "daily_limit_mode": "manual",
+            "manual_daily_limit": 52,
+        })
+
+        self.assertEqual(config["manual_daily_limit"], 52)
+        self.assertEqual(config["manual_daily_limit_min"], 52)
+        self.assertEqual(config["manual_daily_limit_max"], 52)
+
     async def test_update_config_interrupts_waiting_sleep(self):
         engine = AutoPilotEngine(data_dir=self.tmpdir)
         engine._status = "running"
@@ -155,6 +181,50 @@ class AutoPilotConfigTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(status["storage"]["last_cleanup"]["skipped"])
         self.assertIn("跳过", status["storage"]["last_cleanup"]["reason"])
+
+
+class HumanBehaviorControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_manual_daily_limit_range_is_stable_within_same_day(self):
+        controller = HumanBehaviorController(data_dir=self.tmpdir)
+
+        controller.apply_daily_limit_config(
+            limit_mode="manual",
+            manual_limit_min=30,
+            manual_limit_max=45,
+        )
+        first_limit = controller.daily_limit
+
+        controller.apply_daily_limit_config(
+            limit_mode="manual",
+            manual_limit_min=30,
+            manual_limit_max=45,
+        )
+        second_limit = controller.daily_limit
+
+        self.assertGreaterEqual(first_limit, 30)
+        self.assertLessEqual(first_limit, 45)
+        self.assertEqual(first_limit, second_limit)
+        self.assertEqual(controller.manual_daily_limit_min, 30)
+        self.assertEqual(controller.manual_daily_limit_max, 45)
+
+    def test_manual_daily_limit_single_value_maps_to_range(self):
+        controller = HumanBehaviorController(data_dir=self.tmpdir)
+
+        controller.apply_daily_limit_config(
+            limit_mode="manual",
+            manual_limit=33,
+        )
+
+        self.assertEqual(controller.daily_limit, 33)
+        self.assertEqual(controller.manual_daily_limit, 33)
+        self.assertEqual(controller.manual_daily_limit_min, 33)
+        self.assertEqual(controller.manual_daily_limit_max, 33)
 
 
 if __name__ == "__main__":
