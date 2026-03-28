@@ -2,15 +2,32 @@
   <div>
     <!-- 页头 -->
     <div class="page-header">
-      <h1 class="page-title">下载画廊 <small>{{ total }} 张壁纸</small></h1>
+      <div>
+        <h1 class="page-title">下载画廊 <small>{{ viewMode === 'local' ? `${total} 张壁纸` : `${remoteTotal} 个图床文件` }}</small></h1>
+        <div class="view-switch">
+          <button class="btn btn--sm" :class="{ 'btn--primary': viewMode === 'local' }" @click="switchView('local')">本地画廊</button>
+          <button class="btn btn--sm" :class="{ 'btn--primary': viewMode === 'remote' }" @click="switchView('remote')">图床画廊</button>
+          <span class="view-switch__hint" v-if="viewMode === 'remote'">{{ remoteProfileName || remoteProfileKey || '未配置任务默认图床' }}</span>
+        </div>
+      </div>
       <div class="header-actions">
-        <button class="btn" @click="scanDups">扫描重复</button>
-        <button class="btn btn--danger" v-if="dupCount > 0" @click="cleanDups">清理 {{ dupCount }} 个重复</button>
+        <template v-if="viewMode === 'local'">
+          <div class="view-switch">
+            <button class="btn btn--sm" :class="{ 'btn--primary': recordScope === 'current' }" @click="switchRecordScope('current')">当前本地</button>
+            <button class="btn btn--sm" :class="{ 'btn--primary': recordScope === 'all' }" @click="switchRecordScope('all')">历史全部</button>
+          </div>
+          <button class="btn" @click="scanDups">扫描重复</button>
+          <button class="btn btn--danger" v-if="dupCount > 0" @click="cleanDups">清理 {{ dupCount }} 个重复</button>
+        </template>
+        <template v-else>
+          <button class="btn" @click="scanRemoteDups" :disabled="!remoteProfileKey || remoteLoading">扫描图床重复</button>
+          <button class="btn btn--danger" v-if="remoteDupCount > 0" @click="cleanRemoteDups" :disabled="remoteCleaning">清理 {{ remoteDupCount }} 个图床重复</button>
+        </template>
       </div>
     </div>
 
     <!-- 可视化筛选面板 -->
-    <div class="filter-panel">
+    <div class="filter-panel" v-if="viewMode === 'local'">
       <!-- 搜索 + 活跃标签行 -->
       <div class="filter-row filter-row--search">
         <input class="input filter-search" v-model="filters.search" @input="debounceLoad" placeholder="搜索标签…" />
@@ -146,15 +163,35 @@
       </div>
     </div>
 
+    <div class="filter-panel" v-else>
+      <div class="filter-row filter-row--search">
+        <input class="input filter-search" v-model="remoteQuery.search" @input="debounceRemoteLoad" placeholder="搜索图床文件名…" />
+        <input class="input filter-search" v-model="remoteQuery.dir" @input="debounceRemoteLoad" placeholder="目录，例如 wallpaper/static/横图" />
+        <button class="btn btn--sm" @click="loadRemoteGallery" :disabled="remoteLoading || !remoteProfileKey">刷新图床</button>
+        <span class="filter-stats font-mono">{{ remoteTotal }} 个文件</span>
+      </div>
+      <div class="filter-row">
+        <span class="filter-label">说明</span>
+        <span class="remote-filter-hint">
+          当前展示任务默认图床里的远端文件，可直接查看、删除单张文件，以及扫描和清理图床重复文件。
+        </span>
+      </div>
+    </div>
+
     <!-- 重复文件提示 -->
-    <div class="dup-banner" v-if="dupResult">
+    <div class="dup-banner" v-if="viewMode === 'local' && dupResult">
       发现 {{ dupResult.duplicate_groups }} 组共 {{ dupResult.total_duplicates }} 个重复文件
       <button class="btn btn--sm btn--danger" @click="cleanDups" style="margin-left:12px">立即清理</button>
       <button class="btn btn--sm" @click="dupResult = null" style="margin-left:6px">关闭</button>
     </div>
+    <div class="dup-banner" v-if="viewMode === 'remote' && remoteDupResult">
+      发现 {{ remoteDupResult.total_groups }} 组共 {{ remoteDupResult.total_duplicates }} 个图床重复文件
+      <button class="btn btn--sm btn--danger" @click="cleanRemoteDups" style="margin-left:12px">立即清理</button>
+      <button class="btn btn--sm" @click="remoteDupResult = null; remoteDupCount = 0" style="margin-left:6px">关闭</button>
+    </div>
 
     <!-- 批量删除面板 -->
-    <div class="danger-panel card">
+    <div class="danger-panel card" v-if="viewMode === 'local'">
       <div class="danger-panel__head" @click="dangerPanelOpen = !dangerPanelOpen">
         <div class="danger-panel__title">批量删除</div>
         <span class="danger-panel__toggle">{{ dangerPanelOpen ? '▲ 收起' : '▼ 展开' }}</span>
@@ -207,7 +244,7 @@
     </div>
 
     <!-- 选择工具栏 -->
-    <div class="select-toolbar" v-if="wallpapers.length">
+    <div class="select-toolbar" v-if="viewMode === 'local' && wallpapers.length">
       <button class="btn btn--sm" @click="toggleSelectCurrentPage(true)">全选当前页</button>
       <button class="btn btn--sm" @click="toggleSelectCurrentPage(false)">清空选择</button>
       <button class="btn btn--sm" v-if="selectedIds.length" @click="openBatchReclassifyModal">
@@ -281,7 +318,7 @@
     </Teleport>
 
     <!-- 图片网格 -->
-    <div class="page-body">
+    <div class="page-body" v-if="viewMode === 'local'">
       <div v-if="loading" class="empty-state"><div class="empty-icon">◌</div>加载中…</div>
       <div v-else-if="wallpapers.length === 0" class="empty-state"><div class="empty-icon">□</div>暂无下载记录</div>
       <div class="gallery-grid" v-else>
@@ -436,17 +473,82 @@
         <button class="btn btn--sm" @click="page++; loadGallery()" :disabled="page >= totalPages">下一页 →</button>
       </div>
     </div>
+
+    <div class="page-body" v-else>
+      <div v-if="!remoteProfileKey" class="empty-state"><div class="empty-icon">□</div>当前未配置任务默认图床</div>
+      <div v-else-if="remoteLoading" class="empty-state"><div class="empty-icon">◌</div>图床文件加载中…</div>
+      <div v-else-if="remoteFiles.length === 0" class="empty-state"><div class="empty-icon">□</div>当前图床下暂无文件</div>
+      <div class="gallery-grid" v-else>
+        <div class="gallery-item" v-for="file in remoteFiles" :key="file.name">
+          <div class="img-wrapper" :style="remoteMediaAspectStyle(file)">
+            <img
+              v-if="!remoteIsVideo(file)"
+              :src="encodeFileUrl(remoteFileUrl(file))"
+              class="gallery-img"
+              loading="lazy"
+              @error="e => e.currentTarget.style.display='none'"
+            />
+            <video
+              v-else
+              class="gallery-img"
+              :src="encodeFileUrl(remoteFileUrl(file))"
+              preload="metadata"
+              muted loop playsinline
+              @mouseenter="playPreview"
+              @mouseleave="resetPreview"
+            />
+            <div class="img-placeholder" :class="{ 'img-placeholder--hidden': !!remoteFileUrl(file) }">
+              <span>○</span>
+            </div>
+            <div class="img-overlay">
+              <span class="res-badge font-mono">{{ remoteResolution(file) }}</span>
+              <div class="overlay-actions">
+                <a class="btn btn--sm" :href="encodeFileUrl(remoteFileUrl(file))" target="_blank" rel="noreferrer" @click.stop>↗</a>
+                <button class="btn btn--sm btn--danger del-btn" @click.stop="deleteRemoteFile(file)" :disabled="remoteDeleting">删除</button>
+              </div>
+            </div>
+          </div>
+          <div class="gallery-meta">
+            <div class="gallery-tags">
+              <span class="tag tag--grey cat-tag">{{ remoteDirLabel(file) }}</span>
+              <span class="tag tag--ok" v-if="remoteFileType(file)">{{ remoteFileType(file) }}</span>
+            </div>
+            <div class="file-tag-row">
+              <span class="file-tag-row__label">图床文件</span>
+              <div class="file-tag-row__chips">
+                <span class="file-tag-chip">{{ remoteFileName(file) }}</span>
+              </div>
+            </div>
+            <div class="stats-row">
+              <span class="stat" v-if="remoteResolution(file) !== '-'">{{ remoteResolution(file) }}</span>
+              <span class="stat stat--size" v-if="remoteFileSize(file)">{{ remoteFileSize(file) }}</span>
+              <span class="stat">{{ remoteChannel(file) }}</span>
+            </div>
+            <div class="upload-badges">
+              <a class="upload-badge" :href="encodeFileUrl(remoteFileUrl(file))" target="_blank" rel="noreferrer">{{ file.name }}</a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pagination" v-if="remoteTotalPages > 1">
+        <button class="btn btn--sm" @click="remotePage--; loadRemoteGallery()" :disabled="remotePage <= 1">← 上一页</button>
+        <span class="page-info font-mono">{{ remotePage }} / {{ remoteTotalPages }}</span>
+        <button class="btn btn--sm" @click="remotePage++; loadRemoteGallery()" :disabled="remotePage >= remoteTotalPages">下一页 →</button>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { galleryApi, convertApi } from '../api'
+import { galleryApi, convertApi, imgbedApi, settingsApi } from '../api'
 
 // ── 元数据（来自 API，用于色系颜色渲染）──────────
 const metaColorMap = ref({})   // colorName → hex
 
 // ── 列表状态 ──────────────────────────────────────
+const viewMode     = ref('local')
+const recordScope  = ref('current')
 const wallpapers   = ref([])
 const total        = ref(0)
 const page         = ref(1)
@@ -479,9 +581,24 @@ const reclassifyForm = ref({
   tags: '',
   sync_local_metadata: true,
 })
+const uploadSettings = ref(null)
+const remoteProfileKey = ref('')
+const remoteProfileName = ref('')
+const remoteBaseUrl = ref('')
+const remoteFiles = ref([])
+const remoteTotal = ref(0)
+const remotePage = ref(1)
+const remotePageSize = 60
+const remoteLoading = ref(false)
+const remoteDeleting = ref(false)
+const remoteCleaning = ref(false)
+const remoteDupResult = ref(null)
+const remoteDupCount = ref(0)
+const remoteQuery = ref({ search: '', dir: '' })
 
 // ── Computed ──────────────────────────────────────
 const totalPages = computed(() => Math.ceil(total.value / pageSize))
+const remoteTotalPages = computed(() => Math.max(1, Math.ceil(remoteTotal.value / remotePageSize)))
 const activeFilterCount = computed(() =>
   [filters.value.wallpaper_type, filters.value.category, filters.value.color_theme,
    filters.value.screen_orientation, filters.value.min_height,
@@ -557,6 +674,13 @@ function encodeFileUrl(url) {
   return url.split('/').map((seg, i) => i === 0 ? seg : encodeURIComponent(seg)).join('/')
 }
 
+function joinRemoteUrl(baseUrl, remotePath) {
+  const base = String(baseUrl || '').replace(/\/+$/, '')
+  const path = String(remotePath || '').replace(/^\/+/, '')
+  if (!base || !path) return ''
+  return `${base}/file/${path}`
+}
+
 function isVideoUrl(url) {
   const clean = String(url || '').split('?')[0].toLowerCase()
   return ['.mp4', '.webm', '.mov', '.m4v'].some(ext => clean.endsWith(ext))
@@ -564,6 +688,55 @@ function isVideoUrl(url) {
 
 function dynamicPreviewVideoUrl(w) {
   return isVideoUrl(w?.file_url) ? w.file_url : ''
+}
+
+function remoteFileUrl(file) {
+  return joinRemoteUrl(remoteBaseUrl.value, file?.name || '')
+}
+
+function remoteFileMeta(file) {
+  return file?.metadata || {}
+}
+
+function remoteFileName(file) {
+  return String(remoteFileMeta(file).FileName || file?.name?.split('/').pop() || '')
+}
+
+function remoteFileType(file) {
+  const raw = String(remoteFileMeta(file).FileType || '').trim()
+  return raw ? raw.replace(/^image\//, '').toUpperCase() : ''
+}
+
+function remoteFileSize(file) {
+  return formatBytes(Number(remoteFileMeta(file).FileSizeBytes || 0))
+}
+
+function remoteResolution(file) {
+  const width = Number(remoteFileMeta(file).Width || 0)
+  const height = Number(remoteFileMeta(file).Height || 0)
+  return width > 0 && height > 0 ? `${width}x${height}` : '-'
+}
+
+function remoteChannel(file) {
+  return String(remoteFileMeta(file).ChannelName || remoteFileMeta(file).Channel || '').trim()
+}
+
+function remoteDirLabel(file) {
+  const path = String(file?.name || '').trim()
+  const parts = path.split('/').filter(Boolean)
+  parts.pop()
+  return parts.slice(-2).join(' / ') || '图床目录'
+}
+
+function remoteIsVideo(file) {
+  return isVideoUrl(remoteFileUrl(file))
+}
+
+function remoteMediaAspectStyle(file) {
+  const width = Number(remoteFileMeta(file).Width || 0)
+  const height = Number(remoteFileMeta(file).Height || 0)
+  if (width <= 0 || height <= 0) return null
+  return { aspectRatio: `${width} / ${height}` }
 }
 
 function isPortraitWallpaper(w) {
@@ -701,12 +874,22 @@ function clearAllFilters() {
   resetAndLoad()
 }
 
+let remoteDebounceTimer = null
+function debounceRemoteLoad() {
+  clearTimeout(remoteDebounceTimer)
+  remoteDebounceTimer = setTimeout(() => {
+    remotePage.value = 1
+    loadRemoteGallery()
+  }, 350)
+}
+
 // ── 数据加载 ──────────────────────────────────────
 async function loadGallery() {
   loading.value = true
   try {
     const res = await galleryApi.list({
       page: page.value, page_size: pageSize,
+      record_scope: recordScope.value,
       search: filters.value.search          || undefined,
       wallpaper_type: filters.value.wallpaper_type   || undefined,
       category:       filters.value.category          || undefined,
@@ -724,12 +907,12 @@ async function loadGallery() {
 }
 
 async function loadCategories() {
-  const res = await galleryApi.categories()
+  const res = await galleryApi.categories({ record_scope: recordScope.value })
   categories.value = res.categories || []
 }
 
 async function loadColorThemes() {
-  const res = await galleryApi.colorThemes()
+  const res = await galleryApi.colorThemes({ record_scope: recordScope.value })
   colorThemes.value = res.color_themes || []
 }
 
@@ -740,6 +923,55 @@ async function loadMeta() {
     for (const c of (res.colors || [])) map[c.name] = c.hex
     metaColorMap.value = map
   } catch { /* ignore */ }
+}
+
+async function loadUploadSettings() {
+  const settings = await settingsApi.getUploads()
+  uploadSettings.value = settings
+  remoteProfileKey.value = String(settings?.task_profile || '').trim()
+  const profiles = Array.isArray(settings?.profiles) ? settings.profiles : []
+  const profile = profiles.find(item => item.key === remoteProfileKey.value) || null
+  remoteProfileName.value = String(profile?.name || remoteProfileKey.value || '')
+  remoteBaseUrl.value = String(profile?.base_url || '').replace(/\/+$/, '')
+}
+
+async function loadRemoteGallery() {
+  if (!remoteProfileKey.value) {
+    remoteFiles.value = []
+    remoteTotal.value = 0
+    return
+  }
+  remoteLoading.value = true
+  try {
+    const res = await imgbedApi.list(remoteProfileKey.value, {
+      start: Math.max(0, (remotePage.value - 1) * remotePageSize),
+      count: remotePageSize,
+      recursive: true,
+      dir: remoteQuery.value.dir || undefined,
+      search: remoteQuery.value.search || undefined,
+    })
+    const files = Array.isArray(res?.data?.files) ? res.data.files : []
+    remoteFiles.value = files
+    remoteTotal.value = Number(res?.data?.totalCount ?? files.length ?? 0)
+  } finally {
+    remoteLoading.value = false
+  }
+}
+
+async function switchView(mode) {
+  viewMode.value = mode
+  if (mode === 'remote') {
+    if (!uploadSettings.value) await loadUploadSettings()
+    await loadRemoteGallery()
+  }
+}
+
+async function switchRecordScope(scope) {
+  if (recordScope.value === scope) return
+  recordScope.value = scope
+  selectedIds.value = []
+  page.value = 1
+  await Promise.all([loadGallery(), loadCategories(), loadColorThemes()])
 }
 
 // ── 选择 ──────────────────────────────────────────
@@ -886,14 +1118,68 @@ async function cleanDups() {
   await loadGallery()
 }
 
+async function deleteRemoteFile(file) {
+  if (!remoteProfileKey.value || !file?.name) return
+  const ok = await showConfirm('删除图床文件', `将删除远端文件：${file.name}`, '确认删除')
+  if (!ok) return
+  remoteDeleting.value = true
+  try {
+    await imgbedApi.deletePath(remoteProfileKey.value, { path: file.name, folder: false })
+    remoteDupResult.value = null
+    remoteDupCount.value = 0
+    await loadRemoteGallery()
+  } finally {
+    remoteDeleting.value = false
+  }
+}
+
+async function scanRemoteDups() {
+  if (!remoteProfileKey.value) return
+  const res = await imgbedApi.scanDuplicates(remoteProfileKey.value, {
+    dir: remoteQuery.value.dir || '',
+  })
+  remoteDupResult.value = res
+  remoteDupCount.value = Number(res?.total_duplicates || 0)
+}
+
+async function cleanRemoteDups() {
+  if (!remoteProfileKey.value || !remoteDupCount.value) return
+  const ok = await showConfirm(`清理 ${remoteDupCount.value} 个图床重复文件`, '将删除较旧的远端重复文件，此操作不可撤销。', '确认清理')
+  if (!ok) return
+  remoteCleaning.value = true
+  try {
+    const res = await imgbedApi.cleanDuplicates(remoteProfileKey.value, {
+      dir: remoteQuery.value.dir || '',
+    })
+    remoteDupResult.value = null
+    remoteDupCount.value = 0
+    if (res.failed_count > 0) {
+      alert(`图床重复清理完成：成功删除 ${res.deleted_count} 个，失败 ${res.failed_count} 个`)
+    }
+    await loadRemoteGallery()
+  } finally {
+    remoteCleaning.value = false
+  }
+}
+
 // ── 挂载 ──────────────────────────────────────────
 onMounted(() => {
-  Promise.all([loadGallery(), loadCategories(), loadColorThemes(), loadMeta()])
+  Promise.all([loadGallery(), loadCategories(), loadColorThemes(), loadMeta(), loadUploadSettings()])
 })
 </script>
 
 <style scoped>
 .header-actions { display: flex; gap: 8px; }
+.view-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.view-switch__hint {
+  font-size: 12px;
+  color: var(--text-3);
+}
 
 /* ── 筛选面板 ────────────────────────────────── */
 .filter-panel {
@@ -910,6 +1196,7 @@ onMounted(() => {
 
 .filter-search { max-width: 280px; }
 .filter-stats  { font-size: 12px; color: var(--text-3); margin-left: auto; }
+.remote-filter-hint { font-size: 12px; color: var(--text-2); }
 
 .filter-label {
   font-size: 10px; color: var(--text-3);

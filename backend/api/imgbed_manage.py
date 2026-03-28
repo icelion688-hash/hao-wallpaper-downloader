@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import re
+from collections import defaultdict
+
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -7,6 +11,7 @@ from pydantic import BaseModel, Field
 from backend.core.upload_profiles import build_uploader_by_key, get_upload_profile
 
 router = APIRouter()
+_REMOTE_DUPLICATE_PREFIX_RE = re.compile(r"^\d+_+")
 
 
 def _build_profile_uploader(profile_key: str):
@@ -47,6 +52,71 @@ class RemoteBatchTagRequest(BaseModel):
     paths: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     action: str = "set"
+
+
+class RemoteDuplicateRequest(BaseModel):
+    dir: str = ""
+
+
+def _normalize_remote_duplicate_name(path: str, metadata: dict | None = None) -> str:
+    raw_name = str((metadata or {}).get("FileName") or os.path.basename(str(path or "").strip()) or "").strip()
+    if not raw_name:
+        return ""
+    return _REMOTE_DUPLICATE_PREFIX_RE.sub("", raw_name)
+
+
+def _build_remote_duplicate_groups(files: list[dict] | None) -> list[dict]:
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for item in files if isinstance(files, list) else []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("name") or "").strip().strip("/")
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        normalized_name = _normalize_remote_duplicate_name(path, metadata)
+        if not path or not normalized_name:
+            continue
+        size_bytes = int(metadata.get("FileSizeBytes") or 0)
+        width = int(metadata.get("Width") or 0)
+        height = int(metadata.get("Height") or 0)
+        file_type = str(metadata.get("FileType") or "").strip().lower()
+        key = (normalized_name.lower(), size_bytes, width, height, file_type)
+        groups[key].append(
+            {
+                "path": path,
+                "normalized_name": normalized_name,
+                "size_bytes": size_bytes,
+                "width": width,
+                "height": height,
+                "file_type": file_type,
+                "timestamp": int(metadata.get("TimeStamp") or 0),
+                "metadata": metadata,
+            }
+        )
+
+    results = []
+    for items in groups.values():
+        if len(items) <= 1:
+            continue
+        ordered = sorted(items, key=lambda item: (item["timestamp"], item["path"]), reverse=True)
+        primary = ordered[0]
+        duplicates = ordered[1:]
+        results.append(
+            {
+                "identity": {
+                    "normalized_name": primary["normalized_name"],
+                    "size_bytes": primary["size_bytes"],
+                    "width": primary["width"],
+                    "height": primary["height"],
+                    "file_type": primary["file_type"],
+                },
+                "primary": primary,
+                "duplicates": duplicates,
+            }
+        )
+    return sorted(
+        results,
+        key=lambda item: (-len(item["duplicates"]), item["identity"]["normalized_name"]),
+    )
 
 
 @router.get("/{profile_key}/channels")
@@ -238,6 +308,79 @@ async def set_remote_tags_batch(
             "count": len(paths),
             "action": body.action,
             "data": data,
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise _to_http_error(exc)
+    finally:
+        await uploader.aclose()
+
+
+@router.post("/{profile_key}/duplicates/scan")
+async def scan_remote_duplicates(
+    profile_key: str,
+    body: RemoteDuplicateRequest,
+):
+    uploader = _build_profile_uploader(profile_key)
+    try:
+        data = await uploader.list_files(
+            directory=str(body.dir or "").strip("/"),
+            recursive=True,
+            count=-1,
+        )
+        files = data.get("files") if isinstance(data, dict) else []
+        groups = _build_remote_duplicate_groups(files)
+        total_duplicates = sum(len(group["duplicates"]) for group in groups)
+        return {
+            "success": True,
+            "profile_key": profile_key,
+            "dir": str(body.dir or "").strip("/"),
+            "total_groups": len(groups),
+            "total_duplicates": total_duplicates,
+            "groups": groups[:100],
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise _to_http_error(exc)
+    finally:
+        await uploader.aclose()
+
+
+@router.post("/{profile_key}/duplicates/clean")
+async def clean_remote_duplicates(
+    profile_key: str,
+    body: RemoteDuplicateRequest,
+):
+    uploader = _build_profile_uploader(profile_key)
+    try:
+        data = await uploader.list_files(
+            directory=str(body.dir or "").strip("/"),
+            recursive=True,
+            count=-1,
+        )
+        files = data.get("files") if isinstance(data, dict) else []
+        groups = _build_remote_duplicate_groups(files)
+        deleted_paths = []
+        failed_items = []
+
+        for group in groups:
+            for item in group["duplicates"]:
+                path = str(item.get("path") or "").strip("/")
+                if not path:
+                    continue
+                try:
+                    await uploader.delete_remote_path(path, folder=False)
+                    deleted_paths.append(path)
+                except Exception as exc:  # noqa: BLE001
+                    failed_items.append({"path": path, "reason": str(exc)})
+
+        return {
+            "success": not failed_items,
+            "profile_key": profile_key,
+            "dir": str(body.dir or "").strip("/"),
+            "scanned_groups": len(groups),
+            "deleted_count": len(deleted_paths),
+            "failed_count": len(failed_items),
+            "deleted_paths": deleted_paths[:200],
+            "failed_items": failed_items[:100],
         }
     except Exception as exc:  # noqa: BLE001
         raise _to_http_error(exc)

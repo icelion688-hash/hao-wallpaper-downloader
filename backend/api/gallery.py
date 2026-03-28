@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from backend.config import load_config
 from backend.core.dedup import DedupManager
 from backend.core.downloader import DOWNLOAD_ROOT
-from backend.core.upload_profiles import build_uploader_by_key, list_upload_profiles
+from backend.core.upload_profiles import build_uploader_by_key, get_upload_profile, get_upload_settings, list_upload_profiles
 from backend.core.upload_record_helper import (
     UPLOAD_FORMAT_LABELS,
     build_remote_tags,
@@ -34,8 +34,12 @@ from backend.core.upload_record_helper import (
     parse_remote_file_id_from_url,
     parse_upload_records,
     infer_upload_state,
+    iter_valid_upload_records,
+    get_primary_upload_record,
+    reconcile_wallpaper_upload_state,
     sync_remote_record_metadata,
     upsert_upload_registry_record,
+    persist_wallpaper_upload_records_to_registry,
 )
 from backend.models.database import get_db
 from backend.models.upload_registry import UploadRegistry
@@ -43,6 +47,40 @@ from backend.models.wallpaper import Wallpaper
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _resolve_task_profile_only_original() -> bool:
+    uploads = get_upload_settings()
+    profile_key = str(uploads.get("task_profile") or "").strip()
+    profile = get_upload_profile(profile_key) if profile_key else None
+    return bool(((profile or {}).get("upload_filter") or {}).get("only_original", False))
+
+
+def _resolve_task_upload_profile() -> tuple[str, dict | None]:
+    uploads = get_upload_settings()
+    profile_key = str(uploads.get("task_profile") or "").strip()
+    profile = get_upload_profile(profile_key) if profile_key else None
+    return profile_key, profile
+
+
+def _wallpaper_upload_state_matches(
+    wallpaper: Wallpaper,
+    upload_state: Optional[str],
+    *,
+    current_profile_only_original: bool,
+) -> bool:
+    if upload_state not in {"uploaded", "not_uploaded"}:
+        return True
+    inferred_status, _ = infer_upload_state(
+        imgbed_url=wallpaper.imgbed_url,
+        upload_records=wallpaper.upload_records,
+        upload_status=wallpaper.upload_status,
+        upload_note=wallpaper.upload_note,
+        is_original=wallpaper.is_original,
+        current_profile_only_original=current_profile_only_original,
+    )
+    is_uploaded = inferred_status == "uploaded"
+    return is_uploaded if upload_state == "uploaded" else (not is_uploaded)
 
 def _get_convert_queue():
     from backend.core.convert_queue import get_convert_queue
@@ -103,30 +141,20 @@ def _apply_filters(
         q = q.filter(Wallpaper.is_original.is_(True))
     elif original_quality == "preview":
         q = q.filter(Wallpaper.is_original.is_(False))
-    has_uploaded = or_(
-        Wallpaper.upload_status == "uploaded",
-        and_(Wallpaper.imgbed_url.isnot(None), Wallpaper.imgbed_url != ""),
-        and_(
-            Wallpaper.upload_records.isnot(None),
-            Wallpaper.upload_records != "",
-            Wallpaper.upload_records != "{}",
-        ),
-    )
-    if upload_state == "uploaded":
-        q = q.filter(has_uploaded)
-    elif upload_state == "not_uploaded":
-        q = q.filter(~has_uploaded)
     return q
 
 
+def _apply_record_scope(q, record_scope: Optional[str]):
+    normalized = str(record_scope or "current").strip().lower()
+    if normalized == "all":
+        return q
+    if normalized == "cleaned":
+        return q.filter(or_(Wallpaper.local_path.is_(None), Wallpaper.local_path == ""))
+    return q.filter(Wallpaper.local_path.isnot(None), Wallpaper.local_path != "")
+
+
 def _w_to_dict(w: Wallpaper) -> dict:
-    uploads_cfg = load_config().get("uploads", {})
-    task_profile_key = str(uploads_cfg.get("task_profile") or "").strip()
-    only_original = False
-    for profile in uploads_cfg.get("profiles", []):
-        if str(profile.get("key") or "").strip() == task_profile_key:
-            only_original = bool((profile.get("upload_filter") or {}).get("only_original", False))
-            break
+    only_original = _resolve_task_profile_only_original()
     upload_status, upload_note = infer_upload_state(
         imgbed_url=w.imgbed_url,
         upload_records=w.upload_records,
@@ -552,6 +580,7 @@ class BatchUploadRequest(BaseModel):
     screen_orientation: Optional[str] = None
     search: Optional[str] = None
     only_not_uploaded: bool = True
+    force_upload: bool = False
 
 
 class ReclassifyUploadRequest(BaseModel):
@@ -583,6 +612,556 @@ class ApplyRemoteStateRequest(BaseModel):
 class UploadConsistencyAuditRequest(BaseModel):
     profile_key: str
     dir: str = ""
+
+
+def _normalize_remote_entries(raw_remote_files: list[dict] | None) -> list[dict]:
+    remote_entries = []
+    for item in raw_remote_files if isinstance(raw_remote_files, list) else []:
+        if not isinstance(item, dict):
+            continue
+        remote_path = _normalize_match_path(item.get("name"))
+        if not remote_path:
+            continue
+        remote_entries.append(
+            {
+                "path": remote_path,
+                "tags": [str(tag).strip() for tag in (item.get("tags") or []) if str(tag).strip()],
+            }
+        )
+    return remote_entries
+
+
+async def _apply_remote_state_internal(
+    db: Session,
+    *,
+    profile_key: str,
+    base_url: str = "",
+    sync_local_tags: bool = True,
+    items: list[ApplyRemoteStateItem],
+) -> dict:
+    if not profile_key.strip():
+        raise HTTPException(400, "profile_key 不能为空")
+
+    profile = next((item for item in list_upload_profiles() if item.get("key") == profile_key), None)
+    if not profile:
+        raise HTTPException(404, f"上传配置不存在: {profile_key}")
+
+    valid_items = [item for item in items if _normalize_match_path(item.path)]
+    if not valid_items:
+        return {
+            "success": True,
+            "profile_key": profile_key,
+            "updated_count": 0,
+            "local_tags_updated_count": 0,
+            "unmatched_count": 0,
+            "failed_count": 0,
+            "items": [],
+            "failed_items": [],
+            "unmatched": [],
+        }
+
+    wallpapers = (
+        db.query(Wallpaper)
+        .filter(
+            or_(
+                Wallpaper.imgbed_url.isnot(None),
+                Wallpaper.upload_records.isnot(None),
+                Wallpaper.local_path.isnot(None),
+                Wallpaper.converted_path.isnot(None),
+            )
+        )
+        .all()
+    )
+    match_result = _match_remote_wallpapers(
+        [item.path for item in valid_items],
+        wallpapers,
+        base_url=base_url or profile.get("base_url", ""),
+    )
+    wallpaper_map = {wallpaper.id: wallpaper for wallpaper in wallpapers}
+    matched_items = match_result.get("matched", {})
+    failed_items = []
+    success_items = []
+    updated_count = 0
+    local_tags_updated_count = 0
+
+    for item in valid_items:
+        meta = matched_items.get(item.path)
+        if not meta:
+            continue
+
+        wallpaper = wallpaper_map.get(meta.get("id"))
+        if not wallpaper:
+            failed_items.append({"path": item.path, "reason": "本地壁纸记录不存在"})
+            continue
+
+        remote_path = _normalize_match_path(item.path)
+        source_path = _normalize_match_path(item.source_path or item.path)
+        records = parse_upload_records(wallpaper.upload_records)
+        record_key, current_record, error = _pick_upload_record_entry(records, profile_key, source_path or remote_path)
+        remote_tags = (
+            build_remote_tags(
+                width=wallpaper.width,
+                height=wallpaper.height,
+                wallpaper_type=wallpaper.wallpaper_type or "static",
+                category=wallpaper.category or "",
+                color_theme=wallpaper.color_theme or "",
+                tags=extract_local_tags_from_remote(
+                    width=wallpaper.width,
+                    height=wallpaper.height,
+                    wallpaper_type=wallpaper.wallpaper_type or "static",
+                    category=wallpaper.category or "",
+                    color_theme=wallpaper.color_theme or "",
+                    remote_tags=item.tags,
+                ),
+            )
+            if item.tags else [
+                str(tag).strip()
+                for tag in (current_record or {}).get("remote_tags", [])
+                if str(tag).strip()
+            ]
+        )
+        old_url = ""
+        old_remote_path = ""
+        should_update_imgbed_url = False
+
+        if current_record:
+            old_url = str(current_record.get("url") or "").strip()
+            old_remote_path = str(current_record.get("remote_path") or parse_remote_file_id_from_url(old_url) or "").strip("/")
+            new_url = build_remote_file_url(profile.get("base_url", ""), remote_path)
+            current_record["url"] = new_url
+            current_record["remote_path"] = remote_path
+            current_record["remote_tags"] = remote_tags
+            records[record_key] = current_record
+            wallpaper.upload_records = dump_upload_records(records)
+            imgbed_path = _normalize_match_path(parse_remote_file_id_from_url(wallpaper.imgbed_url)) if wallpaper.imgbed_url else ""
+            should_update_imgbed_url = (
+                not wallpaper.imgbed_url
+                or wallpaper.imgbed_url == old_url
+                or imgbed_path == old_remote_path
+                or len(records) == 1
+            )
+            if should_update_imgbed_url:
+                wallpaper.imgbed_url = new_url
+            _update_registry_remote_url(
+                db,
+                wallpaper=wallpaper,
+                profile_key=profile_key,
+                format_key=current_record.get("format_key"),
+                old_url=old_url,
+                new_url=new_url,
+            )
+            updated_count += 1
+        else:
+            new_url = build_remote_file_url(profile.get("base_url", ""), remote_path)
+            format_key = _path_ext_to_upload_format(remote_path)
+            record = build_upload_record(
+                profile_key=profile_key,
+                profile_name=str(profile.get("name") or profile_key),
+                channel=str(profile.get("channel") or ""),
+                url=new_url,
+                format_key=format_key,
+                remote_path=remote_path,
+                remote_tags=remote_tags,
+            )
+            records[build_upload_record_key(profile_key, format_key)] = record
+            wallpaper.upload_records = dump_upload_records(records)
+            if not wallpaper.imgbed_url or len(records) == 1:
+                wallpaper.imgbed_url = new_url
+            upsert_upload_registry_record(
+                db,
+                profile_key=profile_key,
+                format_key=format_key,
+                url=new_url,
+                resource_id=wallpaper.resource_id,
+                sha256=wallpaper.sha256,
+                md5=wallpaper.md5,
+                profile_name=record.get("profile_name") or str(profile.get("name") or profile_key),
+                channel=record.get("channel") or str(profile.get("channel") or ""),
+                uploaded_at=record.get("uploaded_at"),
+            )
+            updated_count += 1
+            if error:
+                logger.info(
+                    "[Gallery] 本地缺少上传记录，已为壁纸 %s 自动补建: %s",
+                    wallpaper.id,
+                    error,
+                )
+
+        wallpaper.upload_status = "uploaded"
+        wallpaper.upload_note = "图床已有文件，已同步本地记录"
+
+        if sync_local_tags and item.tags:
+            local_tags = extract_local_tags_from_remote(
+                width=wallpaper.width,
+                height=wallpaper.height,
+                wallpaper_type=wallpaper.wallpaper_type or "static",
+                category=wallpaper.category or "",
+                color_theme=wallpaper.color_theme or "",
+                remote_tags=remote_tags,
+            )
+            next_local_tags = _join_local_tags(local_tags)
+            if wallpaper.tags != next_local_tags:
+                wallpaper.tags = next_local_tags
+                local_tags_updated_count += 1
+
+        success_items.append(
+            {
+                "wallpaper_id": wallpaper.id,
+                "resource_id": wallpaper.resource_id,
+                "path": remote_path,
+                "source_path": source_path,
+                "remote_tags": remote_tags,
+                "local_tags": wallpaper.tags,
+            }
+        )
+
+    db.commit()
+
+    return {
+        "success": bool(success_items),
+        "profile_key": profile_key,
+        "updated_count": updated_count,
+        "local_tags_updated_count": local_tags_updated_count,
+        "unmatched_count": match_result.get("unmatched_count", 0),
+        "failed_count": len(failed_items),
+        "items": success_items,
+        "failed_items": failed_items,
+        "unmatched": match_result.get("unmatched", []),
+    }
+
+
+async def audit_upload_consistency_for_profile(
+    db: Session,
+    *,
+    profile_key: str,
+    directory: str = "",
+) -> dict:
+    if not profile_key.strip():
+        raise HTTPException(400, "profile_key 不能为空")
+
+    profile = next((item for item in list_upload_profiles() if item.get("key") == profile_key), None)
+    if not profile:
+        raise HTTPException(404, f"上传配置不存在: {profile_key}")
+
+    uploader = build_uploader_by_key(profile_key)
+    if not uploader:
+        raise HTTPException(400, f"上传配置不可用: {profile_key}")
+
+    try:
+        remote_result = await uploader.list_files(
+            directory=str(directory or "").strip("/"),
+            recursive=True,
+            count=-1,
+        )
+    finally:
+        await uploader.aclose()
+
+    raw_remote_files = remote_result.get("files") if isinstance(remote_result, dict) else []
+    remote_entries = _normalize_remote_entries(raw_remote_files)
+
+    wallpapers = (
+        db.query(Wallpaper)
+        .filter(
+            Wallpaper.status == "done",
+            Wallpaper.local_path.isnot(None),
+        )
+        .all()
+    )
+    match_result = _match_remote_wallpapers(
+        [item["path"] for item in remote_entries],
+        wallpapers,
+        base_url=profile.get("base_url", ""),
+    )
+    remote_entry_map = {item["path"]: item for item in remote_entries}
+    remote_matches_by_wallpaper_id: dict[int, list[dict]] = defaultdict(list)
+    for raw_path, meta in (match_result.get("matched") or {}).items():
+        normalized_path = _normalize_match_path(raw_path)
+        remote_item = remote_entry_map.get(normalized_path, {})
+        remote_matches_by_wallpaper_id[int(meta["id"])].append(
+            {
+                "path": normalized_path,
+                "tags": remote_item.get("tags") or [],
+                "matched_by": str(meta.get("matched_by") or ""),
+            }
+        )
+
+    only_original = bool((profile.get("upload_filter") or {}).get("only_original", False))
+    status_counter = Counter()
+    problem_items = []
+    repairable_items = []
+    consistent_count = 0
+
+    for wallpaper in wallpapers:
+        inferred_status, inferred_note = infer_upload_state(
+            imgbed_url=wallpaper.imgbed_url,
+            upload_records=wallpaper.upload_records,
+            upload_status=wallpaper.upload_status,
+            upload_note=wallpaper.upload_note,
+            is_original=wallpaper.is_original,
+            current_profile_only_original=only_original,
+        )
+        records = parse_upload_records(wallpaper.upload_records)
+        record_key, current_record, _ = _pick_upload_record_entry(records, profile_key, "")
+        recorded_path = _normalize_match_path(
+            (current_record or {}).get("remote_path")
+            or parse_remote_file_id_from_url((current_record or {}).get("url"))
+            or ""
+        )
+        imgbed_path = _normalize_match_path(parse_remote_file_id_from_url(wallpaper.imgbed_url) or "")
+        matches = remote_matches_by_wallpaper_id.get(wallpaper.id, [])
+        primary_match = _select_preferred_remote_match(
+            matches,
+            recorded_path=recorded_path,
+            imgbed_path=imgbed_path,
+        )
+
+        audit_status = "consistent"
+        reason = ""
+        repairable = False
+
+        if len(matches) > 1:
+            audit_status = "multiple_remote_files"
+            reason = "图床中存在多个可能匹配该本地图片的文件，暂不自动修复"
+        elif primary_match:
+            remote_path = _normalize_match_path(primary_match.get("path"))
+            if current_record:
+                if recorded_path and recorded_path != remote_path:
+                    audit_status = "path_drift"
+                    reason = "图床文件存在，但本地上传记录仍指向旧路径"
+                    repairable = True
+                elif inferred_status != "uploaded" or not wallpaper.imgbed_url:
+                    audit_status = "local_record_missing"
+                    reason = "图床文件存在，但本地上传状态或图床链接没有同步"
+                    repairable = True
+            else:
+                audit_status = "local_record_missing"
+                reason = "图床文件存在，但本地没有该 Profile 的上传记录"
+                repairable = True
+        elif inferred_status == "uploaded":
+            audit_status = "remote_missing"
+            reason = "本地显示已上传，但图床索引中未找到对应文件"
+        else:
+            audit_status = "local_only"
+            reason = inferred_note or "本地文件尚未上传到图床"
+
+        if audit_status == "consistent":
+            consistent_count += 1
+            continue
+
+        status_counter[audit_status] += 1
+        item = {
+            "wallpaper_id": wallpaper.id,
+            "resource_id": wallpaper.resource_id,
+            "local_path": wallpaper.local_path or "",
+            "upload_status": inferred_status,
+            "upload_note": inferred_note,
+            "record_key": record_key or "",
+            "recorded_path": recorded_path or imgbed_path,
+            "remote_path": primary_match.get("path") if primary_match else "",
+            "remote_tags": primary_match.get("tags") if primary_match else [],
+            "matched_by": primary_match.get("matched_by") if primary_match else "",
+            "audit_status": audit_status,
+            "reason": reason,
+            "repairable": repairable,
+        }
+        problem_items.append(item)
+        if repairable and item["remote_path"]:
+            repairable_items.append(item)
+
+    return {
+        "success": True,
+        "profile_key": profile_key,
+        "dir": str(directory or "").strip("/"),
+        "total_local": len(wallpapers),
+        "total_remote": len(remote_entries),
+        "consistent_count": consistent_count,
+        "problem_count": len(problem_items),
+        "repairable_count": len(repairable_items),
+        "remote_only_count": match_result.get("unmatched_count", 0),
+        "status_breakdown": [
+            {"status": status, "count": count}
+            for status, count in status_counter.most_common()
+        ],
+        "problem_items": problem_items,
+        "repairable_items": repairable_items,
+        "remote_only_paths": match_result.get("unmatched", []),
+    }
+
+
+async def audit_task_upload_consistency(db: Session, *, directory: str = "") -> dict:
+    profile_key, profile = _resolve_task_upload_profile()
+    if not profile_key:
+        raise HTTPException(400, "当前未配置任务默认上传 Profile")
+    if not profile:
+        raise HTTPException(404, f"任务默认上传 Profile 不存在: {profile_key}")
+    return await audit_upload_consistency_for_profile(db, profile_key=profile_key, directory=directory)
+
+
+async def repair_task_upload_consistency(
+    db: Session,
+    *,
+    directory: str = "",
+    sync_local_tags: bool = False,
+) -> dict:
+    audit_result = await audit_task_upload_consistency(db, directory=directory)
+    profile_key = str(audit_result.get("profile_key") or "").strip()
+    repairable_items = []
+    seen_paths: set[str] = set()
+    for item in audit_result.get("repairable_items") or []:
+        remote_path = _normalize_match_path(item.get("remote_path"))
+        if not remote_path or remote_path in seen_paths:
+            continue
+        seen_paths.add(remote_path)
+        repairable_items.append(
+            ApplyRemoteStateItem(
+                path=remote_path,
+                source_path=str(item.get("recorded_path") or remote_path),
+                tags=list(item.get("remote_tags") or []),
+            )
+        )
+
+    repair_result = await _apply_remote_state_internal(
+        db,
+        profile_key=profile_key,
+        sync_local_tags=sync_local_tags,
+        items=repairable_items,
+    )
+    return {
+        "success": True,
+        "profile_key": profile_key,
+        "audit": audit_result,
+        "repair": repair_result,
+    }
+
+
+def _clear_profile_upload_records(
+    db: Session,
+    *,
+    wallpaper: Wallpaper,
+    profile_key: str,
+) -> dict:
+    records = parse_upload_records(wallpaper.upload_records)
+    removed_keys = []
+    removed_urls = []
+
+    for record_key, record in list(records.items()):
+        if not isinstance(record, dict):
+            continue
+        record_profile_key = str(record.get("profile_key") or record_key.split("::", 1)[0] or "").strip()
+        if record_profile_key != profile_key:
+            continue
+        removed_keys.append(record_key)
+        record_url = str(record.get("url") or "").strip()
+        if record_url:
+            removed_urls.append(record_url)
+        records.pop(record_key, None)
+
+    if not removed_keys:
+        return {
+            "removed": False,
+            "removed_keys": [],
+            "removed_urls": [],
+        }
+
+    wallpaper.upload_records = dump_upload_records(records) if records else None
+    primary_record = get_primary_upload_record(records)
+    wallpaper.imgbed_url = str((primary_record or {}).get("url") or "").strip() or None
+    remaining_status, _ = infer_upload_state(
+        imgbed_url=wallpaper.imgbed_url,
+        upload_records=wallpaper.upload_records,
+        upload_status=wallpaper.upload_status,
+        upload_note=wallpaper.upload_note,
+        is_original=wallpaper.is_original,
+        current_profile_only_original=_resolve_task_profile_only_original(),
+    )
+    wallpaper.upload_status = remaining_status
+    wallpaper.upload_note = "图床缺失，等待重新上传"
+
+    if removed_urls:
+        (
+            db.query(UploadRegistry)
+            .filter(
+                UploadRegistry.profile_key == profile_key,
+                UploadRegistry.url.in_(removed_urls),
+            )
+            .delete(synchronize_session=False)
+        )
+
+    return {
+        "removed": True,
+        "removed_keys": removed_keys,
+        "removed_urls": removed_urls,
+    }
+
+
+async def reupload_remote_missing_for_task_profile(
+    db: Session,
+    *,
+    directory: str = "",
+) -> dict:
+    audit_result = await audit_task_upload_consistency(db, directory=directory)
+    profile_key = str(audit_result.get("profile_key") or "").strip()
+    remote_missing_items = [
+        item for item in (audit_result.get("problem_items") or [])
+        if item.get("audit_status") == "remote_missing"
+    ]
+    if not remote_missing_items:
+        return {
+            "success": True,
+            "profile_key": profile_key,
+            "prepared_count": 0,
+            "upload_result": None,
+            "audit": audit_result,
+        }
+
+    wallpaper_map = {
+        wallpaper.id: wallpaper
+        for wallpaper in db.query(Wallpaper).filter(
+            Wallpaper.id.in_([int(item["wallpaper_id"]) for item in remote_missing_items]),
+            Wallpaper.status == "done",
+        ).all()
+    }
+    prepared_ids = []
+    for item in remote_missing_items:
+        wallpaper = wallpaper_map.get(int(item["wallpaper_id"]))
+        if not wallpaper or not wallpaper.local_path:
+            continue
+        local_abs = os.path.join(DOWNLOAD_ROOT, wallpaper.local_path)
+        if not os.path.exists(local_abs):
+            continue
+        removed = _clear_profile_upload_records(db, wallpaper=wallpaper, profile_key=profile_key)
+        if removed.get("removed"):
+            prepared_ids.append(int(wallpaper.id))
+
+    if not prepared_ids:
+        db.commit()
+        return {
+            "success": True,
+            "profile_key": profile_key,
+            "prepared_count": 0,
+            "upload_result": None,
+            "audit": audit_result,
+        }
+
+    db.commit()
+    upload_result = await batch_upload_wallpapers(
+        BatchUploadRequest(
+            profile_key=profile_key,
+            upload_format="profile",
+            upload_with_tags=True,
+            upload_scope="selected",
+            wallpaper_ids=prepared_ids,
+            force_upload=True,
+        ),
+        db,
+    )
+    return {
+        "success": True,
+        "profile_key": profile_key,
+        "prepared_count": len(prepared_ids),
+        "upload_result": upload_result,
+        "audit": audit_result,
+    }
 
 
 def _path_ext_to_upload_format(path: str) -> str:
@@ -692,6 +1271,47 @@ def _wipe_download_root() -> tuple[int, int]:
     return deleted, failed
 
 
+def _cleanup_download_orphans(db: Session) -> tuple[int, int, list[str]]:
+    """
+    清理 downloads/ 下已不再被数据库任何记录引用的残留文件。
+
+    返回:
+      (deleted_files, failed_files, deleted_rel_paths)
+    """
+    if not os.path.isdir(DOWNLOAD_ROOT):
+        return 0, 0, []
+
+    referenced_paths: set[str] = set()
+    rows = db.query(Wallpaper.local_path, Wallpaper.converted_path).all()
+    for local_path, converted_path in rows:
+        for rel_path in (local_path, converted_path):
+            normalized = str(rel_path or "").strip().replace("\\", "/").strip("/")
+            if normalized:
+                referenced_paths.add(normalized)
+
+    deleted = 0
+    failed = 0
+    deleted_rel_paths: list[str] = []
+
+    for root, _, files in os.walk(DOWNLOAD_ROOT):
+        for file_name in files:
+            abs_path = os.path.join(root, file_name)
+            rel_path = os.path.relpath(abs_path, DOWNLOAD_ROOT).replace("\\", "/").strip("/")
+            if not rel_path or rel_path in referenced_paths:
+                continue
+            try:
+                os.remove(abs_path)
+                deleted += 1
+                deleted_rel_paths.append(rel_path)
+            except OSError as exc:
+                logger.warning("[Gallery] 删除本地孤儿文件失败: %s — %s", abs_path, exc)
+                failed += 1
+
+    if deleted or failed:
+        _prune_empty_download_dirs()
+    return deleted, failed, deleted_rel_paths
+
+
 class BatchDeleteRequest(BaseModel):
     scope: str = "selected"          # "selected" | "category" | "all"
     wallpaper_ids: list[int] = Field(default_factory=list)
@@ -715,8 +1335,10 @@ async def list_wallpapers(
     min_height: Optional[int] = None,
     original_quality: Optional[str] = None,
     upload_state: Optional[str] = None,
+    record_scope: str = Query("current", pattern="^(current|all|cleaned)$"),
     db: Session = Depends(get_db),
 ):
+    only_original = _resolve_task_profile_only_original()
     q = _apply_filters(
         db.query(Wallpaper),
         category=category,
@@ -730,31 +1352,55 @@ async def list_wallpapers(
         min_width=min_width,
         min_height=min_height,
         original_quality=original_quality,
-        upload_state=upload_state,
     )
-
-    total = q.count()
-    items = q.order_by(Wallpaper.downloaded_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    q = _apply_record_scope(q, record_scope)
+    ordered_q = q.order_by(Wallpaper.downloaded_at.desc())
+    if upload_state in {"uploaded", "not_uploaded"}:
+        filtered_items = [
+            wallpaper
+            for wallpaper in ordered_q.all()
+            if _wallpaper_upload_state_matches(
+                wallpaper,
+                upload_state,
+                current_profile_only_original=only_original,
+            )
+        ]
+        total = len(filtered_items)
+        start = max(0, (page - 1) * page_size)
+        items = filtered_items[start:start + page_size]
+    else:
+        total = q.count()
+        items = ordered_q.offset((page - 1) * page_size).limit(page_size).all()
 
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
+        "record_scope": record_scope,
         "wallpapers": [_w_to_dict(w) for w in items],
     }
 
 
 @router.get("/categories")
-async def list_categories(db: Session = Depends(get_db)):
+async def list_categories(
+    record_scope: str = Query("current", pattern="^(current|all|cleaned)$"),
+    db: Session = Depends(get_db),
+):
     """返回 DB 中已有壁纸按 category 字段分组的统计（用于画廊筛选芯片）"""
-    rows = (
+    q = (
         db.query(Wallpaper.category, func.count(Wallpaper.id).label("cnt"))
         .filter(Wallpaper.status == "done", Wallpaper.category.isnot(None), Wallpaper.category != "")
-        .group_by(Wallpaper.category)
+    )
+    q = _apply_record_scope(q, record_scope)
+    rows = (
+        q.group_by(Wallpaper.category)
         .order_by(func.count(Wallpaper.id).desc())
         .all()
     )
-    return {"categories": [{"name": row[0], "count": row[1]} for row in rows if row[0]]}
+    return {
+        "record_scope": record_scope,
+        "categories": [{"name": row[0], "count": row[1]} for row in rows if row[0]],
+    }
 
 
 @router.get("/categories-by-type")
@@ -777,16 +1423,25 @@ async def list_categories_by_type(db: Session = Depends(get_db)):
 
 
 @router.get("/color-themes")
-async def list_color_themes(db: Session = Depends(get_db)):
+async def list_color_themes(
+    record_scope: str = Query("current", pattern="^(current|all|cleaned)$"),
+    db: Session = Depends(get_db),
+):
     """返回 DB 中已有壁纸按色系名称分组的统计"""
-    rows = (
+    q = (
         db.query(Wallpaper.color_theme, func.count(Wallpaper.id).label("cnt"))
         .filter(Wallpaper.status == "done", Wallpaper.color_theme.isnot(None), Wallpaper.color_theme != "")
-        .group_by(Wallpaper.color_theme)
+    )
+    q = _apply_record_scope(q, record_scope)
+    rows = (
+        q.group_by(Wallpaper.color_theme)
         .order_by(func.count(Wallpaper.id).desc())
         .all()
     )
-    return {"color_themes": [{"name": row[0], "count": row[1]} for row in rows if row[0]]}
+    return {
+        "record_scope": record_scope,
+        "color_themes": [{"name": row[0], "count": row[1]} for row in rows if row[0]],
+    }
 
 
 @router.get("/wallpaper-meta")
@@ -865,13 +1520,13 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
         records = parse_upload_records(wallpaper.upload_records)
         record_key = build_upload_record_key(body.profile_key, upload_format)
         existing_self = get_upload_record(records, body.profile_key, upload_format) or {}
-        if existing_self.get("url"):
+        if existing_self.get("url") and not body.force_upload:
             wallpaper.upload_status = "uploaded"
             wallpaper.upload_note = f"该 Profile 的 {format_label} 已上传"
             skipped_items.append({"id": wallpaper.id, "reason": f"该 Profile 的 {format_label} 已上传"})
             continue
 
-        reusable_record = find_reusable_upload_record(
+        reusable_record = None if body.force_upload else find_reusable_upload_record(
             db,
             profile_key=body.profile_key,
             sha256=wallpaper.sha256,
@@ -1034,195 +1689,13 @@ async def batch_upload_wallpapers(body: BatchUploadRequest, db: Session = Depend
 
 @router.post("/apply-remote-state")
 async def apply_remote_state(body: ApplyRemoteStateRequest, db: Session = Depends(get_db)):
-    if not body.profile_key.strip():
-        raise HTTPException(400, "profile_key 不能为空")
-
-    profile = next((item for item in list_upload_profiles() if item.get("key") == body.profile_key), None)
-    if not profile:
-        raise HTTPException(404, f"上传配置不存在: {body.profile_key}")
-
-    items = [item for item in body.items if _normalize_match_path(item.path)]
-    if not items:
-        return {
-            "success": True,
-            "profile_key": body.profile_key,
-            "updated_count": 0,
-            "local_tags_updated_count": 0,
-            "unmatched_count": 0,
-            "failed_count": 0,
-            "items": [],
-            "failed_items": [],
-            "unmatched": [],
-        }
-
-    wallpapers = (
-        db.query(Wallpaper)
-        .filter(
-            or_(
-                Wallpaper.imgbed_url.isnot(None),
-                Wallpaper.upload_records.isnot(None),
-                Wallpaper.local_path.isnot(None),
-                Wallpaper.converted_path.isnot(None),
-            )
-        )
-        .all()
+    return await _apply_remote_state_internal(
+        db,
+        profile_key=body.profile_key,
+        base_url=body.base_url,
+        sync_local_tags=body.sync_local_tags,
+        items=body.items,
     )
-    match_result = _match_remote_wallpapers(
-        [item.path for item in items],
-        wallpapers,
-        base_url=body.base_url or profile.get("base_url", ""),
-    )
-    wallpaper_map = {wallpaper.id: wallpaper for wallpaper in wallpapers}
-    matched_items = match_result.get("matched", {})
-    failed_items = []
-    success_items = []
-    updated_count = 0
-    local_tags_updated_count = 0
-
-    for item in items:
-        meta = matched_items.get(item.path)
-        if not meta:
-            continue
-
-        wallpaper = wallpaper_map.get(meta.get("id"))
-        if not wallpaper:
-            failed_items.append({"path": item.path, "reason": "本地壁纸记录不存在"})
-            continue
-
-        remote_path = _normalize_match_path(item.path)
-        source_path = _normalize_match_path(item.source_path or item.path)
-        records = parse_upload_records(wallpaper.upload_records)
-        record_key, current_record, error = _pick_upload_record_entry(records, body.profile_key, source_path or remote_path)
-        remote_tags = (
-            build_remote_tags(
-                width=wallpaper.width,
-                height=wallpaper.height,
-                wallpaper_type=wallpaper.wallpaper_type or "static",
-                category=wallpaper.category or "",
-                color_theme=wallpaper.color_theme or "",
-                tags=extract_local_tags_from_remote(
-                    width=wallpaper.width,
-                    height=wallpaper.height,
-                    wallpaper_type=wallpaper.wallpaper_type or "static",
-                    category=wallpaper.category or "",
-                    color_theme=wallpaper.color_theme or "",
-                    remote_tags=item.tags,
-                ),
-            )
-            if item.tags else [
-                str(tag).strip()
-                for tag in (current_record or {}).get("remote_tags", [])
-                if str(tag).strip()
-            ]
-        )
-        old_url = ""
-        old_remote_path = ""
-        should_update_imgbed_url = False
-
-        if current_record:
-            old_url = str(current_record.get("url") or "").strip()
-            old_remote_path = str(current_record.get("remote_path") or parse_remote_file_id_from_url(old_url) or "").strip("/")
-            new_url = build_remote_file_url(profile.get("base_url", ""), remote_path)
-            current_record["url"] = new_url
-            current_record["remote_path"] = remote_path
-            current_record["remote_tags"] = remote_tags
-            records[record_key] = current_record
-            wallpaper.upload_records = dump_upload_records(records)
-            imgbed_path = _normalize_match_path(parse_remote_file_id_from_url(wallpaper.imgbed_url)) if wallpaper.imgbed_url else ""
-            should_update_imgbed_url = (
-                not wallpaper.imgbed_url
-                or wallpaper.imgbed_url == old_url
-                or imgbed_path == old_remote_path
-                or len(records) == 1
-            )
-            if should_update_imgbed_url:
-                wallpaper.imgbed_url = new_url
-            _update_registry_remote_url(
-                db,
-                wallpaper=wallpaper,
-                profile_key=body.profile_key,
-                format_key=current_record.get("format_key"),
-                old_url=old_url,
-                new_url=new_url,
-            )
-            updated_count += 1
-        else:
-            new_url = build_remote_file_url(profile.get("base_url", ""), remote_path)
-            format_key = _path_ext_to_upload_format(remote_path)
-            record = build_upload_record(
-                profile_key=body.profile_key,
-                profile_name=str(profile.get("name") or body.profile_key),
-                channel=str(profile.get("channel") or ""),
-                url=new_url,
-                format_key=format_key,
-                remote_path=remote_path,
-                remote_tags=remote_tags,
-            )
-            records[build_upload_record_key(body.profile_key, format_key)] = record
-            wallpaper.upload_records = dump_upload_records(records)
-            if not wallpaper.imgbed_url or len(records) == 1:
-                wallpaper.imgbed_url = new_url
-            upsert_upload_registry_record(
-                db,
-                profile_key=body.profile_key,
-                format_key=format_key,
-                url=new_url,
-                resource_id=wallpaper.resource_id,
-                sha256=wallpaper.sha256,
-                md5=wallpaper.md5,
-                profile_name=record.get("profile_name") or str(profile.get("name") or body.profile_key),
-                channel=record.get("channel") or str(profile.get("channel") or ""),
-                uploaded_at=record.get("uploaded_at"),
-            )
-            updated_count += 1
-            if error:
-                logger.info(
-                    "[Gallery] 本地缺少上传记录，已为壁纸 %s 自动补建: %s",
-                    wallpaper.id,
-                    error,
-                )
-
-        wallpaper.upload_status = "uploaded"
-        wallpaper.upload_note = "图床已有文件，已同步本地记录"
-
-        if body.sync_local_tags and item.tags:
-            local_tags = extract_local_tags_from_remote(
-                width=wallpaper.width,
-                height=wallpaper.height,
-                wallpaper_type=wallpaper.wallpaper_type or "static",
-                category=wallpaper.category or "",
-                color_theme=wallpaper.color_theme or "",
-                remote_tags=remote_tags,
-            )
-            next_local_tags = _join_local_tags(local_tags)
-            if wallpaper.tags != next_local_tags:
-                wallpaper.tags = next_local_tags
-                local_tags_updated_count += 1
-
-        success_items.append(
-            {
-                "wallpaper_id": wallpaper.id,
-                "resource_id": wallpaper.resource_id,
-                "path": remote_path,
-                "source_path": source_path,
-                "remote_tags": remote_tags,
-                "local_tags": wallpaper.tags,
-            }
-        )
-
-    db.commit()
-
-    return {
-        "success": bool(success_items),
-        "profile_key": body.profile_key,
-        "updated_count": updated_count,
-        "local_tags_updated_count": local_tags_updated_count,
-        "unmatched_count": match_result.get("unmatched_count", 0),
-        "failed_count": len(failed_items),
-        "items": success_items,
-        "failed_items": failed_items,
-        "unmatched": match_result.get("unmatched", []),
-    }
 
 
 @router.post("/{wallpaper_id}/reclassify-upload")
@@ -1644,168 +2117,11 @@ async def reconcile_remote_records(body: ReconcileRemoteRecordsRequest, db: Sess
 
 @router.post("/audit-upload-consistency")
 async def audit_upload_consistency(body: UploadConsistencyAuditRequest, db: Session = Depends(get_db)):
-    if not body.profile_key.strip():
-        raise HTTPException(400, "profile_key 不能为空")
-
-    profile = next((item for item in list_upload_profiles() if item.get("key") == body.profile_key), None)
-    if not profile:
-        raise HTTPException(404, f"上传配置不存在: {body.profile_key}")
-
-    uploader = build_uploader_by_key(body.profile_key)
-    if not uploader:
-        raise HTTPException(400, f"上传配置不可用: {body.profile_key}")
-
-    try:
-        remote_result = await uploader.list_files(
-            directory=str(body.dir or "").strip("/"),
-            recursive=True,
-            count=-1,
-        )
-    finally:
-        await uploader.aclose()
-
-    raw_remote_files = remote_result.get("files") if isinstance(remote_result, dict) else []
-    remote_entries = []
-    for item in raw_remote_files if isinstance(raw_remote_files, list) else []:
-        if not isinstance(item, dict):
-            continue
-        remote_path = _normalize_match_path(item.get("name"))
-        if not remote_path:
-            continue
-        remote_entries.append(
-            {
-                "path": remote_path,
-                "tags": [str(tag).strip() for tag in (item.get("tags") or []) if str(tag).strip()],
-            }
-        )
-
-    wallpapers = (
-        db.query(Wallpaper)
-        .filter(
-            Wallpaper.status == "done",
-            Wallpaper.local_path.isnot(None),
-        )
-        .all()
+    return await audit_upload_consistency_for_profile(
+        db,
+        profile_key=body.profile_key,
+        directory=body.dir,
     )
-    match_result = _match_remote_wallpapers(
-        [item["path"] for item in remote_entries],
-        wallpapers,
-        base_url=profile.get("base_url", ""),
-    )
-    remote_entry_map = {item["path"]: item for item in remote_entries}
-    remote_matches_by_wallpaper_id: dict[int, list[dict]] = defaultdict(list)
-    for raw_path, meta in (match_result.get("matched") or {}).items():
-        normalized_path = _normalize_match_path(raw_path)
-        remote_item = remote_entry_map.get(normalized_path, {})
-        remote_matches_by_wallpaper_id[int(meta["id"])].append(
-            {
-                "path": normalized_path,
-                "tags": remote_item.get("tags") or [],
-                "matched_by": str(meta.get("matched_by") or ""),
-            }
-        )
-
-    only_original = bool((profile.get("upload_filter") or {}).get("only_original", False))
-    status_counter = Counter()
-    problem_items = []
-    repairable_items = []
-    consistent_count = 0
-
-    for wallpaper in wallpapers:
-        inferred_status, inferred_note = infer_upload_state(
-            imgbed_url=wallpaper.imgbed_url,
-            upload_records=wallpaper.upload_records,
-            upload_status=wallpaper.upload_status,
-            upload_note=wallpaper.upload_note,
-            is_original=wallpaper.is_original,
-            current_profile_only_original=only_original,
-        )
-        records = parse_upload_records(wallpaper.upload_records)
-        record_key, current_record, _ = _pick_upload_record_entry(records, body.profile_key, "")
-        recorded_path = _normalize_match_path(
-            (current_record or {}).get("remote_path")
-            or parse_remote_file_id_from_url((current_record or {}).get("url"))
-            or ""
-        )
-        imgbed_path = _normalize_match_path(parse_remote_file_id_from_url(wallpaper.imgbed_url) or "")
-        matches = remote_matches_by_wallpaper_id.get(wallpaper.id, [])
-        primary_match = _select_preferred_remote_match(
-            matches,
-            recorded_path=recorded_path,
-            imgbed_path=imgbed_path,
-        )
-
-        audit_status = "consistent"
-        reason = ""
-        repairable = False
-
-        if len(matches) > 1:
-            audit_status = "multiple_remote_files"
-            reason = "图床中存在多个可能匹配该本地图片的文件，暂不自动修复"
-        elif primary_match:
-            remote_path = _normalize_match_path(primary_match.get("path"))
-            if current_record:
-                if recorded_path and recorded_path != remote_path:
-                    audit_status = "path_drift"
-                    reason = "图床文件存在，但本地上传记录仍指向旧路径"
-                    repairable = True
-                elif inferred_status != "uploaded" or not wallpaper.imgbed_url:
-                    audit_status = "local_record_missing"
-                    reason = "图床文件存在，但本地上传状态或图床链接没有同步"
-                    repairable = True
-            else:
-                audit_status = "local_record_missing"
-                reason = "图床文件存在，但本地没有该 Profile 的上传记录"
-                repairable = True
-        elif inferred_status == "uploaded":
-            audit_status = "remote_missing"
-            reason = "本地显示已上传，但图床索引中未找到对应文件"
-        else:
-            audit_status = "local_only"
-            reason = inferred_note or "本地文件尚未上传到图床"
-
-        if audit_status == "consistent":
-            consistent_count += 1
-            continue
-
-        status_counter[audit_status] += 1
-        item = {
-            "wallpaper_id": wallpaper.id,
-            "resource_id": wallpaper.resource_id,
-            "local_path": wallpaper.local_path or "",
-            "upload_status": inferred_status,
-            "upload_note": inferred_note,
-            "record_key": record_key or "",
-            "recorded_path": recorded_path or imgbed_path,
-            "remote_path": primary_match.get("path") if primary_match else "",
-            "remote_tags": primary_match.get("tags") if primary_match else [],
-            "matched_by": primary_match.get("matched_by") if primary_match else "",
-            "audit_status": audit_status,
-            "reason": reason,
-            "repairable": repairable,
-        }
-        problem_items.append(item)
-        if repairable and item["remote_path"]:
-            repairable_items.append(item)
-
-    return {
-        "success": True,
-        "profile_key": body.profile_key,
-        "dir": str(body.dir or "").strip("/"),
-        "total_local": len(wallpapers),
-        "total_remote": len(remote_entries),
-        "consistent_count": consistent_count,
-        "problem_count": len(problem_items),
-        "repairable_count": len(repairable_items),
-        "remote_only_count": match_result.get("unmatched_count", 0),
-        "status_breakdown": [
-            {"status": status, "count": count}
-            for status, count in status_counter.most_common()
-        ],
-        "problem_items": problem_items,
-        "repairable_items": repairable_items,
-        "remote_only_paths": match_result.get("unmatched", []),
-    }
 
 
 # ── 本地存储滚动清仓（删除已上传的旧文件，释放磁盘空间）──────────────────
@@ -1826,24 +2142,40 @@ def _build_cleanup_reason(
     max_count: int,
     keep_days: int,
     uploaded_only: bool,
+    skipped_not_uploaded: int = 0,
 ) -> str:
-    scope = "已上传到图床的本地文件" if uploaded_only else "本地文件"
     if total_eligible <= 0:
-        return f"当前没有符合条件的{scope}"
+        return "当前没有本地文件"
     if delete_count > 0:
+        base = ""
         if strategy == "keep_count":
-            return f"将保留最新 {max_count} 张，其余符合条件的{scope}会被清理"
-        if strategy == "keep_days":
-            return f"将清理最近 {keep_days} 天之外的{scope}"
-        if strategy == "upload_and_delete":
-            return f"将清理当前所有符合条件的{scope}"
-        return "已找到符合条件的清理目标"
+            base = f"本地共 {total_eligible} 张，将保留最新 {max_count} 张，清理 {delete_count} 张"
+        elif strategy == "keep_days":
+            base = f"将清理 {keep_days} 天前下载的 {delete_count} 张"
+        elif strategy == "upload_and_delete":
+            base = f"将清理当前全部 {delete_count} 张已上传的本地文件"
+        else:
+            base = f"将清理 {delete_count} 张"
+        if skipped_not_uploaded > 0:
+            base += f"（另有 {skipped_not_uploaded} 张未上传暂跳过）"
+        return base
+    # delete_count == 0
     if strategy == "keep_count":
-        return f"当前符合条件的{scope}数量未超过保留上限 {max_count} 张"
+        if total_eligible <= max_count:
+            return f"本地共 {total_eligible} 张，未超过保留上限 {max_count} 张"
+        # 超额但都没上传
+        if skipped_not_uploaded > 0:
+            return (
+                f"本地共 {total_eligible} 张已超过上限 {max_count} 张，"
+                f"但超额的 {skipped_not_uploaded} 张均未上传到图床，暂不删除"
+            )
+        return f"本地共 {total_eligible} 张，未超过保留上限 {max_count} 张"
     if strategy == "keep_days":
-        return f"最近 {keep_days} 天之外没有符合条件的{scope}"
+        if skipped_not_uploaded > 0:
+            return f"{keep_days} 天前有 {skipped_not_uploaded} 张文件但均未上传到图床，暂不删除"
+        return f"最近 {keep_days} 天之外没有可清理的本地文件"
     if strategy == "upload_and_delete":
-        return f"当前没有可立即删除的{scope}"
+        return "当前没有已上传到图床的本地文件可清理"
     return "当前没有符合条件的清理目标"
 
 
@@ -1858,32 +2190,49 @@ def _do_cleanup_local(
 ) -> dict:
     """
     内部清仓逻辑，供 REST 端点和 AutoPilot 引擎直接调用。
+
+    关键设计原则：
+    - "超额"判断始终基于全部本地文件（uploaded_only 不影响计数边界）
+    - uploaded_only 只控制超额部分"是否允许删除"，防止误删未上传文件
+    - 这样 keep_count=500 时，本地文件总量才会真正收敛到 ≤500
     """
     from datetime import timezone as _tz, timedelta as _td
     import datetime as _dt
 
-    base_q = db.query(Wallpaper).filter(
+    # 全量本地文件（不受 uploaded_only 过滤）——用于计算总量和确定超额范围
+    all_local_q = db.query(Wallpaper).filter(
         Wallpaper.status == "done",
         Wallpaper.local_path.isnot(None),
+        Wallpaper.local_path != "",
     )
-    if uploaded_only:
-        base_q = base_q.filter(Wallpaper.imgbed_url.isnot(None))
 
-    total_eligible = base_q.count()
+    total_eligible = all_local_q.count()
 
     if strategy == "keep_count":
-        # 保留最新 max_count 张，删除更老的
+        # 超额判断：基于全部本地文件，保留最新 max_count 张
         to_keep_ids = {
             row.id
-            for row in base_q.order_by(Wallpaper.downloaded_at.desc()).limit(max_count).all()
+            for row in all_local_q.order_by(Wallpaper.downloaded_at.desc()).limit(max_count).all()
         }
-        to_delete = base_q.filter(~Wallpaper.id.in_(to_keep_ids)).all() if to_keep_ids else base_q.all()
+        excess_q = all_local_q.filter(~Wallpaper.id.in_(to_keep_ids)) if to_keep_ids else all_local_q
+        # uploaded_only 只决定超额部分中哪些可以被删
+        if uploaded_only:
+            to_delete = excess_q.filter(Wallpaper.imgbed_url.isnot(None)).all()
+        else:
+            to_delete = excess_q.all()
+        skipped_not_uploaded = excess_q.count() - len(to_delete) if uploaded_only else 0
     elif strategy == "keep_days":
         cutoff = _dt.datetime.now(_tz.utc).replace(tzinfo=None) - _td(days=keep_days)
-        to_delete = base_q.filter(Wallpaper.downloaded_at < cutoff).all()
+        excess_q = all_local_q.filter(Wallpaper.downloaded_at < cutoff)
+        if uploaded_only:
+            to_delete = excess_q.filter(Wallpaper.imgbed_url.isnot(None)).all()
+        else:
+            to_delete = excess_q.all()
+        skipped_not_uploaded = excess_q.count() - len(to_delete) if uploaded_only else 0
     elif strategy == "upload_and_delete":
-        # 删除所有已上传的本地文件
-        to_delete = base_q.all() if uploaded_only else base_q.filter(Wallpaper.imgbed_url.isnot(None)).all()
+        # 删除所有已上传的本地文件（此策略语义本身即针对已上传，忽略 uploaded_only）
+        to_delete = all_local_q.filter(Wallpaper.imgbed_url.isnot(None)).all()
+        skipped_not_uploaded = 0
     else:
         return {"error": f"未知策略: {strategy}", "deleted": 0, "remaining": total_eligible}
 
@@ -1901,9 +2250,16 @@ def _do_cleanup_local(
 
     if not dry_run and to_delete:
         db.commit()
-        _prune_empty_download_dirs()
 
-    remaining = base_q.count() if not dry_run else total_eligible - len(to_delete)
+    orphan_cleaned = 0
+    orphan_failed = 0
+    orphan_paths: list[str] = []
+    if not dry_run:
+        orphan_cleaned, orphan_failed, orphan_paths = _cleanup_download_orphans(db)
+        file_fail_count += orphan_failed
+
+    # remaining 基于全量本地文件，反映真实磁盘占用
+    remaining = all_local_q.count() if not dry_run else total_eligible - len(to_delete)
     reason = _build_cleanup_reason(
         strategy=strategy,
         total_eligible=total_eligible,
@@ -1911,6 +2267,7 @@ def _do_cleanup_local(
         max_count=max_count,
         keep_days=keep_days,
         uploaded_only=uploaded_only,
+        skipped_not_uploaded=skipped_not_uploaded,
     )
 
     return {
@@ -1919,13 +2276,17 @@ def _do_cleanup_local(
         "dry_run": dry_run,
         "total_eligible": total_eligible,
         "deleted": len(to_delete),
+        "skipped_not_uploaded": skipped_not_uploaded,
         "file_fail_count": file_fail_count,
+        "orphan_cleaned": orphan_cleaned,
+        "orphan_failed": orphan_failed,
         "remaining": remaining,
         "reason": reason,
         "uploaded_only": uploaded_only,
         "max_count": max_count,
         "keep_days": keep_days,
         "deleted_paths": deleted_paths[:50],  # 前 50 条路径用于展示
+        "orphan_paths": orphan_paths[:50],
     }
 
 
@@ -1953,17 +2314,12 @@ async def cleanup_local_files(body: CleanupLocalRequest, db: Session = Depends(g
 @router.get("/storage-stats")
 async def get_storage_stats(db: Session = Depends(get_db)):
     """返回本地存储状态统计，用于 AutoPilot 存储管理面板。"""
-    uploads_cfg = load_config().get("uploads", {})
-    task_profile_key = str(uploads_cfg.get("task_profile") or "").strip()
-    only_original = False
-    for profile in uploads_cfg.get("profiles", []):
-        if str(profile.get("key") or "").strip() == task_profile_key:
-            only_original = bool((profile.get("upload_filter") or {}).get("only_original", False))
-            break
+    only_original = _resolve_task_profile_only_original()
 
     rows = db.query(Wallpaper).filter(
         Wallpaper.status == "done",
         Wallpaper.local_path.isnot(None),
+        Wallpaper.local_path != "",
     ).all()
     total_local = len(rows)
     uploaded_local = 0
@@ -1986,9 +2342,19 @@ async def get_storage_stats(db: Session = Depends(get_db)):
             breakdown[upload_status] += 1
             if upload_note:
                 reason_counter[upload_note] += 1
-    total_uploaded = db.query(Wallpaper).filter(
-        Wallpaper.imgbed_url.isnot(None),
-    ).count()
+    total_uploaded = 0
+    all_done_rows = db.query(Wallpaper).filter(Wallpaper.status == "done").all()
+    for wallpaper in all_done_rows:
+        upload_status, _ = infer_upload_state(
+            imgbed_url=wallpaper.imgbed_url,
+            upload_records=wallpaper.upload_records,
+            upload_status=wallpaper.upload_status,
+            upload_note=wallpaper.upload_note,
+            is_original=wallpaper.is_original,
+            current_profile_only_original=only_original,
+        )
+        if upload_status == "uploaded":
+            total_uploaded += 1
 
     return {
         "total_local": total_local,
@@ -2003,6 +2369,61 @@ async def get_storage_stats(db: Session = Depends(get_db)):
             {"reason": reason, "count": count}
             for reason, count in reason_counter.most_common(5)
         ],
+    }
+
+
+@router.post("/upload-state/reconcile")
+async def reconcile_upload_state(db: Session = Depends(get_db)):
+    """按 upload_records / imgbed_url 回填上传状态，统一图库与统计口径。"""
+    only_original = _resolve_task_profile_only_original()
+    wallpapers = db.query(Wallpaper).filter(Wallpaper.status == "done").all()
+
+    checked_count = len(wallpapers)
+    changed_count = 0
+    status_fixed = 0
+    imgbed_fixed = 0
+    note_fixed = 0
+    registry_synced = 0
+    sample_items: list[dict] = []
+
+    for wallpaper in wallpapers:
+        result = reconcile_wallpaper_upload_state(
+            wallpaper,
+            current_profile_only_original=only_original,
+        )
+        changed_fields = result.get("changed_fields") or []
+        if not changed_fields:
+            continue
+
+        changed_count += 1
+        if "upload_status" in changed_fields:
+            status_fixed += 1
+        if "imgbed_url" in changed_fields:
+            imgbed_fixed += 1
+        if "upload_note" in changed_fields:
+            note_fixed += 1
+        if result.get("status") == "uploaded" and iter_valid_upload_records(wallpaper.upload_records):
+            registry_synced += persist_wallpaper_upload_records_to_registry(db, wallpaper)
+        if len(sample_items) < 20:
+            sample_items.append({
+                "id": wallpaper.id,
+                "resource_id": wallpaper.resource_id,
+                "local_path": wallpaper.local_path or "",
+                "status": result.get("status"),
+                "changed_fields": changed_fields,
+            })
+
+    db.commit()
+
+    return {
+        "success": True,
+        "checked_count": checked_count,
+        "changed_count": changed_count,
+        "status_fixed": status_fixed,
+        "imgbed_fixed": imgbed_fixed,
+        "note_fixed": note_fixed,
+        "registry_synced": registry_synced,
+        "sample_items": sample_items,
     }
 
 

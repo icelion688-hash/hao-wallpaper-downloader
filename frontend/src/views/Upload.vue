@@ -31,6 +31,24 @@
                 </option>
               </select>
             </div>
+            <div class="form-row">
+              <label>自动巡检</label>
+              <label class="check-label">
+                <input type="checkbox" v-model="settings.upload_guard.enabled" />
+                启用图库与本地上传数据的定时巡检
+              </label>
+            </div>
+            <div class="form-row">
+              <label>巡检间隔（分钟）</label>
+              <input class="input" type="number" min="5" max="1440" v-model.number="settings.upload_guard.interval_minutes" />
+            </div>
+            <div class="form-row">
+              <label>首次延迟（分钟）</label>
+              <input class="input" type="number" min="0" max="1440" v-model.number="settings.upload_guard.initial_delay_minutes" />
+            </div>
+          </div>
+          <div class="section-tip">
+            自动巡检会按这里的间隔，定时检查图床索引与本地上传记录是否一致，并自动补传本地未上传或远端已缺失的图片。
           </div>
         </div>
       </div>
@@ -530,7 +548,16 @@ const remoteQuery = ref({
   channel: '',
 })
 
-const settings = ref({ task_profile: 'compressed_webp', gallery_default_format: 'profile', profiles: [] })
+const settings = ref({
+  task_profile: 'compressed_webp',
+  gallery_default_format: 'profile',
+  upload_guard: {
+    enabled: true,
+    interval_minutes: 30,
+    initial_delay_minutes: 3,
+  },
+  profiles: [],
+})
 
 const activeProfile = computed(() => settings.value.profiles.find((item) => item.key === activeKey.value) || null)
 const canManageRemote = computed(() => Boolean(activeProfile.value?.enabled && activeProfile.value?.api_token && activeProfile.value?.base_url))
@@ -676,6 +703,11 @@ async function saveSettings() {
     const res = await settingsApi.setUploads({
       task_profile: settings.value.task_profile,
       gallery_default_format: normalizeUploadFormat(settings.value.gallery_default_format),
+      upload_guard: {
+        enabled: settings.value.upload_guard.enabled !== false,
+        interval_minutes: Math.min(1440, Math.max(5, Number(settings.value.upload_guard.interval_minutes) || 30)),
+        initial_delay_minutes: Math.min(1440, Math.max(0, Number(settings.value.upload_guard.initial_delay_minutes) || 0)),
+      },
       profiles: settings.value.profiles.map((profile) => ({
         ...profile,
         image_processing: { ...profile.image_processing },
@@ -863,6 +895,13 @@ onMounted(async () => {
 
 .section-body {
   padding: 18px;
+}
+
+.section-tip {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
 }
 
 .profile-layout {

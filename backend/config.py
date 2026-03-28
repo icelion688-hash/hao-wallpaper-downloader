@@ -98,6 +98,10 @@ def _normalize_upload_profiles(cfg: dict) -> None:
     uploads["gallery_default_format"] = str(
         uploads.get("gallery_default_format", "profile") or "profile"
     ).lower()
+    upload_guard = uploads.setdefault("upload_guard", {})
+    upload_guard["enabled"] = bool(upload_guard.get("enabled", True))
+    upload_guard["interval_minutes"] = max(5, min(1440, int(upload_guard.get("interval_minutes", 30) or 30)))
+    upload_guard["initial_delay_minutes"] = max(0, min(1440, int(upload_guard.get("initial_delay_minutes", 3) or 0)))
 
     # 兼容旧字段，始终同步为任务默认图床
     task_profile = next((p for p in normalized if p["key"] == uploads["task_profile"]), normalized[0])
@@ -222,6 +226,11 @@ def _default_config() -> dict:
         "uploads": {
             "task_profile": "compressed_webp",
             "gallery_default_format": "profile",
+            "upload_guard": {
+                "enabled": True,
+                "interval_minutes": 30,
+                "initial_delay_minutes": 3,
+            },
             "profiles": _default_upload_profiles(),
         },
         "sync": {

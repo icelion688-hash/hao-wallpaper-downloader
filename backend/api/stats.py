@@ -1,35 +1,30 @@
 """
 api/stats.py — 系统监控统计 API
 """
+import asyncio
 from datetime import datetime, timedelta
 import os
 from collections import Counter
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func
 
 from backend.core.downloader import DOWNLOAD_ROOT
 from backend.core.upload_profiles import get_upload_profile, get_upload_settings, is_upload_profile_available
 from backend.core.upload_record_helper import infer_upload_state
+from backend.api.gallery import (
+    audit_task_upload_consistency,
+    repair_task_upload_consistency,
+    reupload_remote_missing_for_task_profile,
+)
 from backend.models.database import get_db
 from backend.models.wallpaper import Wallpaper
 from backend.models.task import Task
 from backend.models.account import Account
 
 router = APIRouter()
-
-
-def _uploaded_wallpaper_filter():
-    return or_(
-        Wallpaper.upload_status == "uploaded",
-        and_(Wallpaper.imgbed_url.isnot(None), Wallpaper.imgbed_url != ""),
-        and_(
-            Wallpaper.upload_records.isnot(None),
-            Wallpaper.upload_records != "",
-            Wallpaper.upload_records != "{}",
-        ),
-    )
+_UPLOAD_COVERAGE_MUTATION_LOCK = asyncio.Lock()
 
 
 def _local_wallpaper_filter():
@@ -65,6 +60,7 @@ def _build_upload_coverage(db: Session) -> dict:
     broken_local_file_count = 0
     reason_counter = Counter()
     category_counter = Counter()
+    uploaded_category_counter = Counter()
     pending_items: list[dict] = []
     repairable_ids: list[int] = []
 
@@ -87,6 +83,7 @@ def _build_upload_coverage(db: Session) -> dict:
 
         if inferred_status == "uploaded":
             historical_uploaded_count += 1
+            uploaded_category_counter[wallpaper.category or "未分类"] += 1
             if has_local_record:
                 uploaded_count += 1
             continue
@@ -150,14 +147,76 @@ def _build_upload_coverage(db: Session) -> dict:
             {"category": category, "count": count}
             for category, count in category_counter.most_common(8)
         ],
+        "uploaded_categories": [
+            {"category": category, "count": count}
+            for category, count in uploaded_category_counter.most_common()
+        ],
         "pending_items": pending_items[:100],
         "repairable_ids": repairable_ids,
     }
 
 
+async def run_upload_coverage_maintenance(db: Session) -> dict:
+    async with _UPLOAD_COVERAGE_MUTATION_LOCK:
+        coverage_before = _build_upload_coverage(db)
+        audit_before = await audit_task_upload_consistency(db)
+
+        if audit_before.get("repairable_count"):
+            repair_result = await repair_task_upload_consistency(db, sync_local_tags=False)
+        else:
+            repair_result = {
+                "success": True,
+                "profile_key": audit_before.get("profile_key"),
+                "audit": audit_before,
+                "repair": {
+                    "success": True,
+                    "profile_key": audit_before.get("profile_key"),
+                    "updated_count": 0,
+                    "local_tags_updated_count": 0,
+                    "unmatched_count": 0,
+                    "failed_count": 0,
+                    "items": [],
+                    "failed_items": [],
+                    "unmatched": [],
+                },
+            }
+
+        if any(item.get("audit_status") == "remote_missing" for item in (audit_before.get("problem_items") or [])):
+            remote_missing_reupload = await reupload_remote_missing_for_task_profile(db)
+        else:
+            remote_missing_reupload = {
+                "success": True,
+                "profile_key": audit_before.get("profile_key"),
+                "prepared_count": 0,
+                "upload_result": None,
+                "audit": audit_before,
+            }
+
+        if coverage_before.get("repairable_count"):
+            reupload_result = await _reupload_missing_wallpapers_internal(db, coverage=coverage_before)
+        else:
+            reupload_result = {
+                "success": True,
+                "message": "当前没有可补传的未上传图片",
+                "reupload_total": 0,
+                "result": None,
+                "coverage": coverage_before,
+            }
+
+        return {
+            "success": True,
+            "audit_before": audit_before,
+            "repair_result": repair_result,
+            "remote_missing_reupload": remote_missing_reupload,
+            "reupload_result": reupload_result,
+            "coverage_after": _build_upload_coverage(db),
+        }
+
+
 @router.get("/overview")
 async def get_overview(db: Session = Depends(get_db)):
     """系统总览统计"""
+    coverage = _build_upload_coverage(db)
     historical_downloaded = (
         db.query(func.count(Wallpaper.id))
         .filter(Wallpaper.status == "done")
@@ -174,11 +233,7 @@ async def get_overview(db: Session = Depends(get_db)):
         .scalar()
         or 0
     )
-    uploaded_gallery_count = (
-        db.query(func.count(Wallpaper.id))
-        .filter(Wallpaper.status == "done", _uploaded_wallpaper_filter())
-        .scalar()
-    )
+    uploaded_gallery_count = int(coverage.get("historical_uploaded_count") or 0)
     total_accounts = db.query(func.count(Account.id)).scalar()
     active_accounts = db.query(func.count(Account.id)).filter(Account.is_active == True).scalar()  # noqa
     total_tasks = db.query(func.count(Task.id)).scalar()
@@ -203,18 +258,13 @@ async def get_overview(db: Session = Depends(get_db)):
 @router.get("/by-category")
 async def stats_by_category(db: Session = Depends(get_db)):
     """按分类统计已上传到图库的数量。"""
-    rows = (
-        db.query(Wallpaper.category, func.count(Wallpaper.id))
-        .filter(Wallpaper.status == "done", _uploaded_wallpaper_filter())
-        .group_by(Wallpaper.category)
-        .order_by(func.count(Wallpaper.id).desc())
-        .all()
-    )
-    total_uploaded = sum(row[1] for row in rows)
+    coverage = _build_upload_coverage(db)
+    rows = coverage.get("uploaded_categories") or []
+    total_uploaded = sum(int(row.get("count") or 0) for row in rows)
     return {
         "source": "uploaded_gallery",
         "total_uploaded": total_uploaded,
-        "categories": [{"category": r[0] or "未分类", "count": r[1]} for r in rows],
+        "categories": rows,
     }
 
 
@@ -248,10 +298,35 @@ async def get_upload_coverage(db: Session = Depends(get_db)):
     return _build_upload_coverage(db)
 
 
-@router.post("/upload-coverage/reupload")
-async def reupload_missing_wallpapers(db: Session = Depends(get_db)):
-    """使用任务默认 Profile 补传当前未上传且本地文件仍存在的图片。"""
-    coverage = _build_upload_coverage(db)
+@router.post("/upload-coverage/compare-remote")
+async def compare_remote_upload_coverage(db: Session = Depends(get_db)):
+    """扫描任务默认图床索引，返回远端图库和本地上传记录的差异。"""
+    audit = await audit_task_upload_consistency(db)
+    return {
+        "success": True,
+        "audit": audit,
+        "coverage": _build_upload_coverage(db),
+    }
+
+
+@router.get("/upload-coverage/guard-status")
+async def get_upload_guard_status(request: Request):
+    guard = getattr(request.app.state, "upload_guard", None)
+    if not guard:
+        return {
+            "enabled": False,
+            "running": False,
+            "interval_seconds": 0,
+            "last_run_at": None,
+            "last_status": "disabled",
+            "last_error": "",
+            "last_summary": None,
+        }
+    return guard.get_status()
+
+
+async def _reupload_missing_wallpapers_internal(db: Session, *, coverage: dict | None = None) -> dict:
+    coverage = coverage or _build_upload_coverage(db)
     profile_key = str(coverage.get("profile_key") or "").strip()
     if not profile_key:
         raise HTTPException(400, "当前未配置任务默认上传 Profile")
@@ -289,3 +364,10 @@ async def reupload_missing_wallpapers(db: Session = Depends(get_db)):
         "result": result,
         "coverage": refreshed,
     }
+
+
+@router.post("/upload-coverage/reupload")
+async def reupload_missing_wallpapers(db: Session = Depends(get_db)):
+    """使用任务默认 Profile 补传当前未上传且本地文件仍存在的图片。"""
+    async with _UPLOAD_COVERAGE_MUTATION_LOCK:
+        return await _reupload_missing_wallpapers_internal(db)

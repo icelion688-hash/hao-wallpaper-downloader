@@ -45,9 +45,9 @@ export const tasksApi = {
 
 export const galleryApi = {
   list: (params) => http.get('/gallery', { params }),
-  categories: () => http.get('/gallery/categories'),
+  categories: (params) => http.get('/gallery/categories', { params }),
   categoriesByType: () => http.get('/gallery/categories-by-type'),
-  colorThemes: () => http.get('/gallery/color-themes'),
+  colorThemes: (params) => http.get('/gallery/color-themes', { params }),
   wallpaperMeta: () => http.get('/gallery/wallpaper-meta'),
   uploadProfiles: () => http.get('/gallery/upload-profiles'),
   batchUpload: (data) => http.post('/gallery/upload', data),
@@ -74,7 +74,10 @@ export const statsApi = {
   byCategory: () => http.get('/stats/by-category'),
   byDate: (days = 30) => http.get('/stats/by-date', { params: { days } }),
   uploadCoverage: () => http.get('/stats/upload-coverage'),
+  compareRemoteCoverage: () => http.post('/stats/upload-coverage/compare-remote'),
+  uploadGuardStatus: () => http.get('/stats/upload-coverage/guard-status'),
   reuploadMissing: () => http.post('/stats/upload-coverage/reupload'),
+  reconcileUploadState: () => http.post('/gallery/upload-state/reconcile'),
 }
 
 export const scheduleApi = {
@@ -98,6 +101,8 @@ export const imgbedApi = {
   channels: (profileKey) => http.get(`/imgbed/${profileKey}/channels`),
   capabilities: (profileKey) => http.get(`/imgbed/${profileKey}/capabilities`),
   list: (profileKey, params) => http.get(`/imgbed/${profileKey}/list`, { params }),
+  scanDuplicates: (profileKey, data) => http.post(`/imgbed/${profileKey}/duplicates/scan`, data),
+  cleanDuplicates: (profileKey, data) => http.post(`/imgbed/${profileKey}/duplicates/clean`, data),
   indexInfo: (profileKey, params) => http.get(`/imgbed/${profileKey}/index-info`, { params }),
   rebuildIndex: (profileKey, params) => http.post(`/imgbed/${profileKey}/rebuild-index`, null, { params }),
   deletePath: (profileKey, params) => http.delete(`/imgbed/${profileKey}/delete`, { params }),

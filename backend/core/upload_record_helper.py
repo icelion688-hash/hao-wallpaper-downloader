@@ -68,6 +68,35 @@ def dump_upload_records(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def iter_valid_upload_records(value: Optional[str] | dict) -> list[tuple[str, dict]]:
+    records = value if isinstance(value, dict) else parse_upload_records(value)
+    items: list[tuple[str, dict]] = []
+    for raw_key, record in (records or {}).items():
+        if not isinstance(record, dict):
+            continue
+        url = str(record.get("url") or "").strip()
+        if not url:
+            continue
+        items.append((str(raw_key), record))
+    return items
+
+
+def get_primary_upload_record(value: Optional[str] | dict) -> Optional[dict]:
+    items = iter_valid_upload_records(value)
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0][1]
+
+    def _sort_key(item: tuple[str, dict]) -> tuple[str, str]:
+        record = item[1]
+        uploaded_at = str(record.get("uploaded_at") or "")
+        profile_key = str(record.get("profile_key") or item[0])
+        return (uploaded_at, profile_key)
+
+    return sorted(items, key=_sort_key, reverse=True)[0][1]
+
+
 def infer_upload_state(
     *,
     imgbed_url: Optional[str],
@@ -79,14 +108,70 @@ def infer_upload_state(
 ) -> tuple[str, str]:
     explicit_status = str(upload_status or "").strip()
     explicit_note = str(upload_note or "").strip()
-    has_remote = bool(str(imgbed_url or "").strip()) or bool(parse_upload_records(upload_records))
+    has_remote = bool(str(imgbed_url or "").strip()) or bool(iter_valid_upload_records(upload_records))
     if has_remote:
         return "uploaded", explicit_note
-    if explicit_status:
+    if explicit_status and explicit_status != "uploaded":
         return explicit_status, explicit_note
     if current_profile_only_original and is_original is False:
         return "skipped", "当前文件是预览图，当前图床配置仅上传原图"
-    return "pending", explicit_note or "未上传到图床"
+    fallback_note = explicit_note if explicit_status and explicit_status != "uploaded" else ""
+    return "pending", fallback_note or "未上传到图床"
+
+
+def reconcile_wallpaper_upload_state(
+    wallpaper: Wallpaper,
+    *,
+    current_profile_only_original: bool = False,
+) -> dict:
+    primary_record = get_primary_upload_record(wallpaper.upload_records)
+    primary_url = str(wallpaper.imgbed_url or "").strip() or str((primary_record or {}).get("url") or "").strip()
+    previous_status = str(wallpaper.upload_status or "").strip()
+    previous_note = str(wallpaper.upload_note or "").strip()
+
+    inferred_status, inferred_note = infer_upload_state(
+        imgbed_url=primary_url,
+        upload_records=wallpaper.upload_records,
+        upload_status=wallpaper.upload_status,
+        upload_note=wallpaper.upload_note,
+        is_original=wallpaper.is_original,
+        current_profile_only_original=current_profile_only_original,
+    )
+
+    changed_fields: list[str] = []
+    if primary_url and str(wallpaper.imgbed_url or "").strip() != primary_url:
+        wallpaper.imgbed_url = primary_url
+        changed_fields.append("imgbed_url")
+
+    desired_status = inferred_status
+    if str(wallpaper.upload_status or "").strip() != desired_status:
+        wallpaper.upload_status = desired_status
+        changed_fields.append("upload_status")
+
+    desired_note = previous_note
+    if inferred_status == "uploaded":
+        if (
+            not previous_note
+            or previous_status != "uploaded"
+            or "失败" in previous_note
+            or "跳过" in previous_note
+            or previous_note == "未上传到图床"
+        ):
+            desired_note = "已同步上传记录"
+    else:
+        desired_note = inferred_note or previous_note
+
+    if desired_note != previous_note:
+        wallpaper.upload_note = desired_note
+        changed_fields.append("upload_note")
+
+    return {
+        "changed": bool(changed_fields),
+        "changed_fields": changed_fields,
+        "status": inferred_status,
+        "note": desired_note,
+        "primary_url": primary_url,
+    }
 
 
 def build_remote_file_url(base_url: str, remote_path: str) -> str:

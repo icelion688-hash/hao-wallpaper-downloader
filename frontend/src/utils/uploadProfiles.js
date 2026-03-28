@@ -113,6 +113,11 @@ export function normalizeUploadSettings(remote = {}) {
   return {
     task_profile: remote.task_profile || profiles[0]?.key || fallbackProfiles[0].key,
     gallery_default_format: normalizeUploadFormat(remote.gallery_default_format),
+    upload_guard: {
+      enabled: remote.upload_guard?.enabled !== false,
+      interval_minutes: Math.min(1440, Math.max(5, Number(remote.upload_guard?.interval_minutes) || 30)),
+      initial_delay_minutes: Math.min(1440, Math.max(0, Number(remote.upload_guard?.initial_delay_minutes) || 3)),
+    },
     profiles,
   }
 }

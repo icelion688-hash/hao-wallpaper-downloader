@@ -23,6 +23,7 @@ from backend.core.captcha_solver import AltchaSolver
 from backend.core.convert_queue import init_convert_queue
 from backend.core.filters import FilterConfig
 from backend.core.imgbed_uploader import ImgbedUploader
+from backend.core.upload_guard import UploadConsistencyGuard
 from backend.core.upload_profiles import build_task_uploader
 from backend.models.database import SessionLocal, init_db
 from backend.models.task import Task
@@ -97,6 +98,7 @@ captcha_solver: AltchaSolver | None = None
 imgbed_uploader: ImgbedUploader | None = None
 human_behavior: HumanBehaviorController | None = None
 autopilot_engine: AutoPilotEngine | None = None
+upload_guard: UploadConsistencyGuard | None = None
 _reset_task: asyncio.Task | None = None
 _scheduler_task: asyncio.Task | None = None
 _convert_queue = None
@@ -165,7 +167,7 @@ async def _scheduler_loop(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global anti_detection, account_pool, captcha_solver, imgbed_uploader, human_behavior, autopilot_engine, _reset_task, _scheduler_task, _convert_queue
+    global anti_detection, account_pool, captcha_solver, imgbed_uploader, human_behavior, autopilot_engine, upload_guard, _reset_task, _scheduler_task, _convert_queue
 
     logger.info("=== HaoWallpaper Downloader 启动 ===")
     init_db()
@@ -217,6 +219,14 @@ async def lifespan(app: FastAPI):
     app.state.human_ctrl = human_behavior
     app.state.autopilot = autopilot_engine
     app.state.db = db
+    upload_guard_cfg = ((cfg.get("uploads") or {}).get("upload_guard") or {})
+    upload_guard = UploadConsistencyGuard(
+        session_factory=SessionLocal,
+        enabled=bool(upload_guard_cfg.get("enabled", True)),
+        interval_seconds=max(5, int(upload_guard_cfg.get("interval_minutes", 30) or 30)) * 60,
+        initial_delay_seconds=max(0, int(upload_guard_cfg.get("initial_delay_minutes", 3) or 0)) * 60,
+    )
+    app.state.upload_guard = upload_guard
     autopilot_engine.bind_app_state(app.state)
 
     _reset_task = asyncio.create_task(account_pool.daily_reset_loop())
@@ -225,10 +235,12 @@ async def lifespan(app: FastAPI):
     # 格式转换队列（后台 worker）
     _convert_queue = init_convert_queue()
     _convert_queue.start()
+    await upload_guard.start()
 
     logger.info("后台任务已启动：每日配额重置")
     logger.info("定时调度器已启动（每 30 秒检查一次）")
     logger.info("格式转换队列已启动")
+    logger.info("上传覆盖率巡检已启动")
 
     yield
 
@@ -238,6 +250,8 @@ async def lifespan(app: FastAPI):
         _scheduler_task.cancel()
     if _convert_queue:
         await _convert_queue.stop()
+    if upload_guard:
+        await upload_guard.stop()
     if autopilot_engine:
         await autopilot_engine.stop()
     if imgbed_uploader:

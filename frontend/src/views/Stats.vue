@@ -44,7 +44,12 @@
         <div class="card-header card-header--actions">
           <span>上传覆盖率</span>
           <div class="coverage-actions">
-            <button class="btn btn--sm" @click="refreshCoverage">重新比对</button>
+            <button class="btn btn--sm" @click="compareRemoteCoverage" :disabled="comparingRemote">
+              {{ comparingRemote ? '比对中...' : '重新比对' }}
+            </button>
+            <button class="btn btn--sm" @click="reconcileUploadState" :disabled="reconciling">
+              {{ reconciling ? '校准中...' : '校准图库上传数据' }}
+            </button>
             <button class="btn btn--sm" :class="{ 'btn--active': showRepairableOnly }" @click="showRepairableOnly = !showRepairableOnly">
               {{ showRepairableOnly ? '显示全部未上传' : '仅看可补传' }}
             </button>
@@ -101,10 +106,37 @@
           <span v-if="uploadCoverage.broken_local_file_count">，另有 {{ uploadCoverage.broken_local_file_count.toLocaleString() }} 张记录存在但本地文件已丢失</span>
           <span v-if="uploadCoverage.no_local_record_count">，{{ uploadCoverage.no_local_record_count.toLocaleString() }} 张历史记录已被清理，本轮无法自动补传</span>。
         </div>
+        <div class="coverage-note" v-if="guardStatus">
+          自动巡检：
+          <span>{{ guardStatus.running ? '已启用' : '未启用' }}</span>
+          <span v-if="guardStatus.interval_seconds">，每 {{ Math.round(guardStatus.interval_seconds / 60) }} 分钟检查一次</span>
+          <span v-if="guardStatus.last_run_at">，最近一次 {{ formatFullDateTime(guardStatus.last_run_at) }}</span>
+          <span v-if="guardStatus.last_status === 'error' && guardStatus.last_error">，上次失败：{{ guardStatus.last_error }}</span>
+        </div>
         <div class="coverage-note" v-if="!uploadCoverage.profile_available">
           当前默认上传 Profile 不可用，请先在“图床上传”页确认 `task_profile` 已启用且 Token 有效。
         </div>
+        <div class="coverage-note" v-if="remoteAuditSummary">{{ remoteAuditSummary }}</div>
+        <div class="coverage-note" v-if="reconcileSummary">{{ reconcileSummary }}</div>
         <div class="coverage-note" v-if="reuploadSummary">{{ reuploadSummary }}</div>
+        <div class="coverage-remote-grid" v-if="remoteAudit">
+          <div class="coverage-item">
+            <div class="coverage-num">{{ Number(remoteAudit.total_remote || 0).toLocaleString() }}</div>
+            <div class="coverage-lbl">远端图库文件</div>
+          </div>
+          <div class="coverage-item">
+            <div class="coverage-num">{{ Number(remoteAudit.consistent_count || 0).toLocaleString() }}</div>
+            <div class="coverage-lbl">远端一致</div>
+          </div>
+          <div class="coverage-item">
+            <div class="coverage-num coverage-num--warn">{{ Number(remoteAudit.problem_count || 0).toLocaleString() }}</div>
+            <div class="coverage-lbl">远端差异</div>
+          </div>
+          <div class="coverage-item">
+            <div class="coverage-num coverage-num--warn">{{ Number(remoteAudit.remote_only_count || 0).toLocaleString() }}</div>
+            <div class="coverage-lbl">远端孤儿</div>
+          </div>
+        </div>
         <div class="coverage-panels">
           <div class="coverage-reasons" v-if="uploadCoverage.reason_breakdown?.length">
             <div class="coverage-reasons__title">未上传原因</div>
@@ -231,7 +263,13 @@ const categorySource = ref('')
 const uploadedCategoryTotal = ref(0)
 const uploadCoverage = ref(null)
 const reuploading = ref(false)
+const reconciling = ref(false)
+const comparingRemote = ref(false)
+const reconcileSummary = ref('')
 const reuploadSummary = ref('')
+const remoteAudit = ref(null)
+const remoteAuditSummary = ref('')
+const guardStatus = ref(null)
 const showRepairableOnly = ref(true)
 const toast = ref(null)
 const uploadProgress = ref({
@@ -319,11 +357,12 @@ function renderCategory(data) {
 }
 
 async function loadAll() {
-  const [ov, cat, daily, coverage] = await Promise.all([
+  const [ov, cat, daily, coverage, guard] = await Promise.all([
     statsApi.overview(),
     statsApi.byCategory(),
     statsApi.byDate(30),
     statsApi.uploadCoverage(),
+    statsApi.uploadGuardStatus(),
   ])
 
   overview.value = ov
@@ -331,6 +370,7 @@ async function loadAll() {
   categorySource.value = cat.source || ''
   uploadedCategoryTotal.value = Number(cat.total_uploaded || 0)
   uploadCoverage.value = coverage
+  guardStatus.value = guard
 
   await nextTick()
   renderTrend(daily.daily)
@@ -339,6 +379,55 @@ async function loadAll() {
 
 async function refreshCoverage() {
   uploadCoverage.value = await statsApi.uploadCoverage()
+  guardStatus.value = await statsApi.uploadGuardStatus()
+}
+
+async function compareRemoteCoverage() {
+  if (comparingRemote.value) return
+  comparingRemote.value = true
+  remoteAuditSummary.value = ''
+  startProgress(100, '正在比对远端图库', '系统正在扫描任务默认图床并核对本地上传记录。')
+  try {
+    const res = await statsApi.compareRemoteCoverage()
+    remoteAudit.value = res?.audit || null
+    uploadCoverage.value = res?.coverage || uploadCoverage.value
+    guardStatus.value = await statsApi.uploadGuardStatus()
+    const audit = remoteAudit.value || {}
+    remoteAuditSummary.value = `远端比对完成：图库文件 ${Number(audit.total_remote || 0)} 条，本地差异 ${Number(audit.problem_count || 0)} 条，远端孤儿 ${Number(audit.remote_only_count || 0)} 条，可自动修复 ${Number(audit.repairable_count || 0)} 条。`
+    await finishProgress(100, '远端比对完成', remoteAuditSummary.value, 1200)
+    if (Number(audit.problem_count || 0) > 0 || Number(audit.remote_only_count || 0) > 0) {
+      showToast('warn', remoteAuditSummary.value, 4200)
+    } else {
+      showToast('ok', '远端图库与本地上传记录当前一致。')
+    }
+  } catch (error) {
+    await finishProgress(100, '远端比对失败', `失败原因：${error.message}`, 1800)
+    remoteAuditSummary.value = `远端比对失败：${error.message}`
+    showToast('err', `远端比对失败：${error.message}`)
+  } finally {
+    comparingRemote.value = false
+  }
+}
+
+async function reconcileUploadState() {
+  if (reconciling.value) return
+  reconciling.value = true
+  reconcileSummary.value = ''
+  try {
+    const res = await statsApi.reconcileUploadState()
+    reconcileSummary.value = `校准完成：检查 ${res.checked_count || 0} 条，修正 ${res.changed_count || 0} 条，补齐状态 ${res.status_fixed || 0} 条，补齐图床链接 ${res.imgbed_fixed || 0} 条。`
+    if (Number(res.changed_count || 0) > 0) {
+      showToast('ok', `图库上传数据已校准，共修正 ${res.changed_count || 0} 条。`)
+    } else {
+      showToast('info', '当前图库上传数据已经是最新状态。')
+    }
+    await loadAll()
+  } catch (error) {
+    reconcileSummary.value = `校准失败：${error.message}`
+    showToast('err', `校准失败：${error.message}`)
+  } finally {
+    reconciling.value = false
+  }
 }
 
 function resizeCharts() {
@@ -366,13 +455,13 @@ function stopProgress() {
   progressTimer = null
 }
 
-function startProgress(total) {
+function startProgress(total, label = '正在补传未上传图片', note = '') {
   stopProgress()
   uploadProgress.value = {
     visible: true,
     percent: 6,
-    label: '正在补传未上传图片',
-    note: `本次准备处理 ${total} 张图片，请稍候。`,
+    label,
+    note: note || `本次准备处理 ${total} 张图片，请稍候。`,
   }
   progressTimer = setInterval(() => {
     const current = Number(uploadProgress.value.percent || 0)
@@ -432,6 +521,20 @@ function formatDateTime(value) {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+  })
+}
+
+function formatFullDateTime(value) {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
   })
 }
 
@@ -597,6 +700,13 @@ onBeforeUnmount(() => {
 }
 
 .coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  padding: 0 18px 16px;
+}
+
+.coverage-remote-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 12px;
@@ -789,6 +899,10 @@ onBeforeUnmount(() => {
     grid-template-columns: repeat(2, 1fr);
   }
 
+  .coverage-remote-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
   .charts-row {
     grid-template-columns: 1fr;
   }
@@ -804,6 +918,10 @@ onBeforeUnmount(() => {
   }
 
   .coverage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .coverage-remote-grid {
     grid-template-columns: 1fr;
   }
 }

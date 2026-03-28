@@ -1,6 +1,7 @@
 import unittest
 
-from backend.core.upload_record_helper import infer_upload_state
+from backend.core.upload_record_helper import infer_upload_state, reconcile_wallpaper_upload_state
+from backend.models.wallpaper import Wallpaper
 
 
 class UploadStateTests(unittest.TestCase):
@@ -31,6 +32,33 @@ class UploadStateTests(unittest.TestCase):
         )
         self.assertEqual(status, 'pending')
         self.assertEqual(note, '未上传到图床')
+
+    def test_invalid_upload_records_are_not_treated_as_uploaded(self):
+        status, note = infer_upload_state(
+            imgbed_url=None,
+            upload_records='{"broken":{"remote_path":"bg/pc/demo.webp"}}',
+            upload_status='failed',
+            upload_note='图床上传失败',
+        )
+        self.assertEqual(status, 'failed')
+        self.assertEqual(note, '图床上传失败')
+
+    def test_reconcile_upload_state_fills_imgbed_url_from_records(self):
+        wallpaper = Wallpaper(
+            resource_id='demo-1',
+            status='done',
+            upload_status='failed',
+            upload_note='图床上传失败',
+            upload_records='{"original_lossless":{"profile_key":"original_lossless","url":"https://img.example.com/file/demo.webp"}}',
+            imgbed_url=None,
+        )
+
+        result = reconcile_wallpaper_upload_state(wallpaper)
+
+        self.assertTrue(result['changed'])
+        self.assertEqual(wallpaper.upload_status, 'uploaded')
+        self.assertEqual(wallpaper.imgbed_url, 'https://img.example.com/file/demo.webp')
+        self.assertEqual(wallpaper.upload_note, '已同步上传记录')
 
 
 if __name__ == '__main__':

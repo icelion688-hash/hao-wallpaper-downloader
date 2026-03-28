@@ -386,7 +386,7 @@ html, body, #app {
   gap: 16px;
 }
 
-.page-title { font-size: 20px; font-weight: 700; letter-spacing: -.01em; }
+.page-title { font-size: 20px; font-weight: 700; letter-spacing: -.01em; line-height: 1.35; }
 .page-title small { font-size: 12px; font-weight: 400; color: var(--text-2); margin-left: 8px; font-family: var(--font-ui); }
 .page-body { padding: 24px 32px; }
 
@@ -429,6 +429,7 @@ html, body, #app {
   color: var(--text-2);
   letter-spacing: .05em;
   text-transform: uppercase;
+  line-height: 1.5;
 }
 
 .table { width: 100%; border-collapse: collapse; }
@@ -445,6 +446,7 @@ html, body, #app {
   font-size: 11px;
   font-family: var(--font-ui);
   letter-spacing: .03em;
+  line-height: 1.4;
 }
 
 .tag--vip     { background: rgba(245,166,35,.15); color: var(--orange); }

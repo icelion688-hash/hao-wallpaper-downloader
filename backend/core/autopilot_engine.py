@@ -692,7 +692,7 @@ class AutoPilotEngine:
 
                 # ── 会话间等待 ───────────────────────────────────────────────
                 interval = random.uniform(int_min, int_max)
-                self._next_session_at = datetime.now() + timedelta(seconds=interval)
+                self._next_session_at = _now_in_tz(self._config["timezone"]) + timedelta(seconds=interval)
                 self._phase = "waiting"
                 self._log(
                     f"[{mode_cn}] 下次会话约 {interval / 60:.0f} 分钟后 "
@@ -725,11 +725,12 @@ class AutoPilotEngine:
         result: Optional[dict] = None,
     ) -> None:
         self._storage_cleanup_state = {
-            "ran_at": datetime.now().isoformat(),
+            "ran_at": _now_in_tz(self._config.get("timezone", "Asia/Shanghai")).isoformat(),
             "trigger": trigger,
             "skipped": skipped,
             "reason": reason,
             "deleted": int((result or {}).get("deleted") or 0),
+            "orphan_cleaned": int((result or {}).get("orphan_cleaned") or 0),
             "remaining": (result or {}).get("remaining"),
             "total_eligible": int((result or {}).get("total_eligible") or 0),
             "file_fail_count": int((result or {}).get("file_fail_count") or 0),
@@ -764,6 +765,7 @@ class AutoPilotEngine:
 
             result = await asyncio.get_event_loop().run_in_executor(None, _cleanup)
             deleted = result.get("deleted", 0)
+            orphan_cleaned = result.get("orphan_cleaned", 0)
             remaining = result.get("remaining", 0)
             reason = str(result.get("reason") or "").strip()
             self._record_storage_cleanup_state(
@@ -772,12 +774,15 @@ class AutoPilotEngine:
                 reason=reason or "自动清理已执行",
                 result=result,
             )
-            if deleted > 0:
-                self._log(
+            if deleted > 0 or orphan_cleaned > 0:
+                message = (
                     f"[存储] 自动清仓完成 — 删除 {deleted} 张本地文件，"
                     f"剩余 {remaining} 张（策略: {strategy}，"
                     f"{'仅已上传' if uploaded_only else '全部'}）"
                 )
+                if orphan_cleaned > 0:
+                    message += f"，并清理 {orphan_cleaned} 个残留文件"
+                self._log(message)
             else:
                 self._log(f"[存储] 自动清理未删除文件 — {reason or '当前没有符合条件的文件'}")
         except Exception as exc:
@@ -829,7 +834,7 @@ class AutoPilotEngine:
         try:
             mode_label = "活跃" if self._mode == "active" else "非活跃"
             task = TaskModel(
-                name=f"AutoPilot [{mode_label}] {datetime.now().strftime('%m-%d %H:%M')}",
+                name=f"AutoPilot [{mode_label}] {_now_in_tz(self._config.get('timezone', 'Asia/Shanghai')).strftime('%m-%d %H:%M')}",
                 status="running",
                 total_count=count,
                 started_at=datetime.now(),
@@ -905,14 +910,14 @@ class AutoPilotEngine:
     # ── 内部工具 ─────────────────────────────────────────────────────────────
 
     def _log(self, msg: str) -> None:
-        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        entry = f"[{_now_in_tz(self._config.get('timezone', 'Asia/Shanghai')).strftime('%H:%M:%S')}] {msg}"
         self._logs.append(entry)
         if len(self._logs) > 500:
             self._logs = self._logs[-500:]
         logger.info("[AutoPilot] %s", msg)
 
     def _refresh_today(self) -> None:
-        today = date.today().isoformat()
+        today = _now_in_tz(self._config.get("timezone", "Asia/Shanghai")).date().isoformat()
         if self._today_date != today:
             self._today_date = today
             self._today_sessions = 0

@@ -645,15 +645,17 @@
                   </div>
                   <div class="cleanup-last-result__reason">{{ lastCleanup.reason }}</div>
                   <div class="cleanup-last-result__stats">
-                    <span>命中 {{ lastCleanup.total_eligible ?? 0 }}</span>
-                    <span>删除 {{ lastCleanup.deleted ?? 0 }}</span>
+                    <span>本地总量 {{ lastCleanup.total_eligible ?? 0 }}</span>
+                    <span>已删除 {{ lastCleanup.deleted ?? 0 }}</span>
+                    <span v-if="lastCleanup.skipped_not_uploaded" class="text-warn">跳过未上传 {{ lastCleanup.skipped_not_uploaded }}</span>
                     <span>剩余 {{ lastCleanup.remaining ?? '--' }}</span>
                     <span v-if="lastCleanup.file_fail_count">文件异常 {{ lastCleanup.file_fail_count }}</span>
                   </div>
                 </div>
                 <div v-if="cleanupPreview" class="cleanup-preview">
-                  <div class="cleanup-preview__row"><span>符合条件</span><strong>{{ cleanupPreview.total_eligible }}</strong></div>
+                  <div class="cleanup-preview__row"><span>本地总量</span><strong>{{ cleanupPreview.total_eligible }}</strong></div>
                   <div class="cleanup-preview__row"><span>将删除</span><strong class="text-red">{{ cleanupPreview.deleted }}</strong></div>
+                  <div v-if="cleanupPreview.skipped_not_uploaded" class="cleanup-preview__row"><span>跳过（未上传）</span><strong class="text-warn">{{ cleanupPreview.skipped_not_uploaded }}</strong></div>
                   <div class="cleanup-preview__row"><span>清理后剩余</span><strong>{{ cleanupPreview.remaining }}</strong></div>
                   <div v-if="cleanupPreview.reason" class="cleanup-preview__reason">{{ cleanupPreview.reason }}</div>
                   <div class="cleanup-preview__paths" v-if="cleanupPreview.deleted_paths?.length">
@@ -750,8 +752,11 @@ const setAutoUploadChannel=(type,value)=>{if(type==='dynamic')cfg.value.dynamic_
 const setAutoUploadChannelName=(type,value)=>{if(type==='dynamic')cfg.value.dynamic_upload_channel_name=String(value||'').trim();else cfg.value.static_upload_channel_name=String(value||'').trim();onCfgChange()}
 const applyAutoUploadLossless=type=>{const profile=getAutoUploadProfile(type);if(!profile)return;applyLosslessUploadProfile(profile);onCfgChange()}
 const applyAutoUploadCompressed=type=>{const profile=getAutoUploadProfile(type);if(!profile)return;applyCompressedUploadProfile(profile);onCfgChange()}
-const formatCleanupTime=value=>{if(!value)return'刚刚';const date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('zh-CN',{hour12:false})}
-const formatSessionTime=value=>{if(!value)return'--';const date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('zh-CN',{hour12:false})}
+const currentTimezone=computed(()=>String(status.value.current_tz_name||cfg.value.timezone||'Asia/Shanghai'))
+const parseBackendDate=value=>{if(!value)return null;const text=String(value).trim();if(!text)return null;const normalized=/([zZ]|[+-]\\d{2}:?\\d{2})$/.test(text)?text:`${text}Z`;const date=new Date(normalized);return Number.isNaN(date.getTime())?null:date}
+const formatInTimezone=(value,{fallback='--',includeSeconds=true}={})=>{const date=parseBackendDate(value);if(!date)return fallback;try{return new Intl.DateTimeFormat('zh-CN',{timeZone:currentTimezone.value,hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',...(includeSeconds?{second:'2-digit'}:{})}).format(date)}catch{return String(value)}}
+const formatCleanupTime=value=>formatInTimezone(value,{fallback:'刚刚'})
+const formatSessionTime=value=>formatInTimezone(value,{fallback:'--'})
 const showSavedHint=()=>{savedHint.value=true;clearTimeout(savedHintTimer);savedHintTimer=setTimeout(()=>{savedHint.value=false},2000)}
 const loadAutomationSettings=async()=>{const [uploadsResult,mediaResult,systemInfoResult]=await Promise.allSettled([settingsApi.getUploads(),settingsApi.getMediaConvert(),settingsApi.getSystemInfo()]);uploadSettings.value=uploadsResult.status==='fulfilled'?normalizeUploadSettings(uploadsResult.value):normalizeUploadSettings();ensureAutoUploadProfileSelections();mediaSettings.value=mediaResult.status==='fulfilled'?normalizeMediaSettings(mediaResult.value):createDefaultMediaSettings();if(systemInfoResult.status==='fulfilled')systemInfo.value=systemInfoResult.value}
 const persistAutomationSettings=async({showHint=true,silent=false}={})=>{try{const [configRes,uploadRes,mediaRes]=await Promise.all([autopilotApi.saveConfig(buildPayload()),settingsApi.setUploads(buildUploadSettingsPayload()),settingsApi.setMediaConvert(buildMediaSettingsPayload())]);if(configRes?.config)applyConfig(configRes.config);if(uploadRes?.uploads)uploadSettings.value=normalizeUploadSettings(uploadRes.uploads);if(mediaRes?.media_convert)mediaSettings.value=normalizeMediaSettings(mediaRes.media_convert);if(showHint)showSavedHint()}catch(error){if(!silent)throw error}}
@@ -763,7 +768,7 @@ const switchToLiveLogs=async()=>{activeLogSource.value='live';selectedHistoryTas
 const loadHistoryLogs=async taskId=>{if(!taskId)return;loadingHistoryLogs.value=true;try{const res=await autopilotApi.sessionLogs(taskId);historyLogs.value=Array.isArray(res.logs)?res.logs:[];activeLogSource.value='history';await nextTick();scrollLogs()}catch(error){alert('加载历史日志失败: '+(error?.message||error));selectedHistoryTaskId.value='';activeLogSource.value='live'}finally{loadingHistoryLogs.value=false}}
 const onHistoryTaskChange=async()=>{if(!selectedHistoryTaskId.value){await switchToLiveLogs();return}await loadHistoryLogs(Number(selectedHistoryTaskId.value))}
 const clearVisibleLogs=()=>{if(activeLogSource.value==='history')historyLogs.value=[];else logs.value=[]}
-const poll=async()=>{try{const data=await autopilotApi.status();status.value=data;recentSessions.value=Array.isArray(data.recent_sessions)?data.recent_sessions:[];if(data.supported_timezones?.length)supportedTimezones.value=data.supported_timezones;if(!configLoaded&&data.config){applyConfig(data.config);configLoaded=true}if(activeLogSource.value==='live'){const remoteLogs=data.logs||[];if(remoteLogs.length<logs.value.length){logs.value=remoteLogs}else if(remoteLogs.length>logs.value.length){logs.value.push(...remoteLogs.slice(logs.value.length));await nextTick();scrollLogs()}}currentHour.value=new Date().getHours()}catch{}}
+const poll=async()=>{try{const data=await autopilotApi.status();status.value=data;recentSessions.value=Array.isArray(data.recent_sessions)?data.recent_sessions:[];if(data.supported_timezones?.length)supportedTimezones.value=data.supported_timezones;if(!configLoaded&&data.config){applyConfig(data.config);configLoaded=true}if(activeLogSource.value==='live'){const remoteLogs=data.logs||[];if(remoteLogs.length<logs.value.length){logs.value=remoteLogs}else if(remoteLogs.length>logs.value.length){logs.value.push(...remoteLogs.slice(logs.value.length));await nextTick();scrollLogs()}}const tzHour=Number(String(data.current_tz_time||'').split(':')[0]);currentHour.value=Number.isFinite(tzHour)?tzHour:new Date().getHours()}catch{}}
 const togglePower=async()=>{toggling.value=true;try{if(running.value){await autopilotApi.stop()}else{logs.value=[];activeLogSource.value='live';selectedHistoryTaskId.value='';historyLogs.value=[];await persistAutomationSettings({showHint:false,silent:false});const startRes=await autopilotApi.start(buildPayload());if(startRes?.config)applyConfig(startRes.config)}await poll()}catch(error){alert('操作失败: '+(error?.message||error))}finally{toggling.value=false}}
 const saveConfig=async()=>{try{await persistAutomationSettings({showHint:true,silent:false})}catch(error){alert('保存配置失败: '+(error?.message||error))}}
 const scrollLogs=()=>{if(logEl.value)logEl.value.scrollTop=logEl.value.scrollHeight}
@@ -780,7 +785,7 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
 /* ── 布局 ── */
 .ap-body {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: 380px minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -788,11 +793,18 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
   display: flex;
   flex-direction: column;
   gap: 12px;
-  position: sticky;
-  top: 16px;
+  position: static;
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
 }
 .ap-config {
   min-width: 0;
+}
+
+.ap-status > .card,
+.ap-status > .power-card {
+  overflow: visible;
 }
 
 .session-summary-card {
@@ -1004,11 +1016,34 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
 .legend-dot--now      { background: var(--accent); }
 
 /* ── 日志 ── */
-.log-card { display: flex; flex-direction: column; }
-.log-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
-.log-history-select { min-width: 190px; height: 30px; font-size: 12px; }
+.log-card { display: flex; flex-direction: column; min-height: 420px; }
+.log-card :deep(.card-header) {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.log-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.log-history-select {
+  min-width: 220px;
+  max-width: 100%;
+  height: 30px;
+  font-size: 12px;
+  flex: 1 1 220px;
+}
 .log-body {
-  height: 260px;
+  min-height: 320px;
+  max-height: min(52vh, 560px);
+  flex: 1;
   overflow-y: auto;
   padding: 10px 14px;
   font-family: var(--font-mono, monospace);
@@ -1419,7 +1454,7 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
 /* 响应式 */
 @media (max-width: 1100px) {
   .ap-body { grid-template-columns: 1fr; }
-  .ap-status { position: static; }
+  .ap-status { position: static; max-height: none; overflow: visible; padding-right: 0; }
   .cfg-grid-3 { grid-template-columns: 1fr 1fr; }
   .upload-strategy-grid { grid-template-columns: 1fr; }
 }
@@ -1427,5 +1462,8 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(savedHintTimer)})
   .cfg-grid, .cfg-grid-3 { grid-template-columns: 1fr; }
   .cfg-tabs { overflow-x: auto; }
   .header-right { flex-direction: column; align-items: flex-end; gap: 6px; }
+  .log-actions { margin-left: 0; justify-content: flex-start; width: 100%; }
+  .log-history-select { min-width: 0; width: 100%; flex-basis: 100%; }
+  .log-body { min-height: 260px; max-height: 420px; }
 }
 </style>

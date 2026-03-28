@@ -50,9 +50,16 @@ class UploadProfilePayload(BaseModel):
     image_processing: ImageProcessingPayload = ImageProcessingPayload()
 
 
+class UploadGuardPayload(BaseModel):
+    enabled: bool = True
+    interval_minutes: int = Field(default=30, ge=5, le=1440)
+    initial_delay_minutes: int = Field(default=3, ge=0, le=1440)
+
+
 class UploadSettingsPayload(BaseModel):
     task_profile: str
     gallery_default_format: str = "profile"
+    upload_guard: UploadGuardPayload = UploadGuardPayload()
     profiles: List[UploadProfilePayload]
 
 
@@ -102,6 +109,14 @@ async def get_upload_settings():
 async def save_upload_settings(body: UploadSettingsPayload, request: Request):
     cfg = update_config({"uploads": body.model_dump()})
     request.app.state.imgbed = build_task_uploader()
+    guard = getattr(request.app.state, "upload_guard", None)
+    if guard:
+        guard_cfg = ((cfg.get("uploads") or {}).get("upload_guard") or {})
+        await guard.apply_settings(
+            enabled=bool(guard_cfg.get("enabled", True)),
+            interval_seconds=max(5, int(guard_cfg.get("interval_minutes", 30) or 30)) * 60,
+            initial_delay_seconds=max(0, int(guard_cfg.get("initial_delay_minutes", 3) or 0)) * 60,
+        )
     return {"success": True, "uploads": cfg.get("uploads", {})}
 
 

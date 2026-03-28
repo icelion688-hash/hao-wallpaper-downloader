@@ -17,6 +17,11 @@ sync:
 
 uploads:
   task_profile: "compressed_webp"
+  gallery_default_format: "profile"
+  upload_guard:
+    enabled: true
+    interval_minutes: 30
+    initial_delay_minutes: 3
   profiles:
     - key: "compressed_webp"
       name: "压缩图床"

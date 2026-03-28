@@ -185,6 +185,64 @@ class ImgbedManageApiTests(unittest.TestCase):
         self.assertEqual(self.fake_uploader.calls[4][0], "set_remote_tags")
         self.assertEqual(self.fake_uploader.calls[6][0], "set_remote_tags_batch")
 
+    def test_scan_remote_duplicates_groups_same_file_identity(self):
+        async def _list_files(**kwargs):
+            self.fake_uploader.calls.append(("list_files", kwargs))
+            return {
+                "files": [
+                    {
+                        "name": "wallpaper/static/横图/未定义/1774530830796_励志_奋斗_7680x4320.png",
+                        "metadata": {"FileName": "励志_奋斗_7680x4320.png", "FileSizeBytes": 20235346, "Width": 7680, "Height": 4320, "FileType": "image/png", "TimeStamp": 1774530830796},
+                    },
+                    {
+                        "name": "wallpaper/static/横图/未定义/1774530684599_励志_奋斗_7680x4320.png",
+                        "metadata": {"FileName": "励志_奋斗_7680x4320.png", "FileSizeBytes": 20235346, "Width": 7680, "Height": 4320, "FileType": "image/png", "TimeStamp": 1774530684599},
+                    },
+                ]
+            }
+
+        self.fake_uploader.list_files = _list_files
+
+        response = self.client.post(
+            "/api/imgbed/compressed_webp/duplicates/scan",
+            json={"dir": ""},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total_groups"], 1)
+        self.assertEqual(payload["total_duplicates"], 1)
+        self.assertEqual(payload["groups"][0]["duplicates"][0]["path"], "wallpaper/static/横图/未定义/1774530684599_励志_奋斗_7680x4320.png")
+
+    def test_clean_remote_duplicates_deletes_secondary_items(self):
+        async def _list_files(**kwargs):
+            self.fake_uploader.calls.append(("list_files", kwargs))
+            return {
+                "files": [
+                    {
+                        "name": "wallpaper/static/横图/未定义/1774530830796_励志_奋斗_7680x4320.png",
+                        "metadata": {"FileName": "励志_奋斗_7680x4320.png", "FileSizeBytes": 20235346, "Width": 7680, "Height": 4320, "FileType": "image/png", "TimeStamp": 1774530830796},
+                    },
+                    {
+                        "name": "wallpaper/static/横图/未定义/1774530684599_励志_奋斗_7680x4320.png",
+                        "metadata": {"FileName": "励志_奋斗_7680x4320.png", "FileSizeBytes": 20235346, "Width": 7680, "Height": 4320, "FileType": "image/png", "TimeStamp": 1774530684599},
+                    },
+                ]
+            }
+
+        self.fake_uploader.list_files = _list_files
+
+        response = self.client.post(
+            "/api/imgbed/compressed_webp/duplicates/clean",
+            json={"dir": ""},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["deleted_count"], 1)
+        delete_calls = [call for call in self.fake_uploader.calls if call[0] == "delete_remote_path"]
+        self.assertEqual(delete_calls[0][1]["path"], "wallpaper/static/横图/未定义/1774530684599_励志_奋斗_7680x4320.png")
+
 
 if __name__ == "__main__":
     unittest.main()
